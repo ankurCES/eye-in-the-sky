@@ -6,7 +6,11 @@ venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
-build/
+# NOTE: scoped to the python side on purpose. God's Eye View uses build/ as a
+# SOURCE directory (build/vite.js is imported by vite.config.js), so a bare
+# `build/` rule silently drops it and the UI then fails to start with
+# "Could not resolve ../../build/vite.js".
+godseye/build/
 dist/
 *.whl
 *.tar.gz
