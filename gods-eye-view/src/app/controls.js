@@ -44,11 +44,13 @@ export function createApplicationControls({
   // UAV Mission Control panel: theater + mission selection, MCP-gated launch.
   // Read-only God's Eye; the bridge /control proxy is the only command path.
   const uavBridgeUrl = () =>
-    (typeof localStorage !== 'undefined' && localStorage.getItem('gev.uav.base')) ||
+    (typeof localStorage !== 'undefined' &&
+      localStorage.getItem('gev.uav.base')) ||
     import.meta.env?.VITE_UAV_BRIDGE_URL ||
     'http://localhost:8790';
   const uavBridgeToken = () =>
-    (typeof localStorage !== 'undefined' && localStorage.getItem('gev.uav.token')) ||
+    (typeof localStorage !== 'undefined' &&
+      localStorage.getItem('gev.uav.token')) ||
     import.meta.env?.VITE_UAV_BRIDGE_TOKEN ||
     'dev-token';
   const uavLayer = catalog?.get?.('uav');
@@ -58,6 +60,7 @@ export function createApplicationControls({
     token: uavBridgeToken,
     viewer,
     Cesium,
+
     onTheater: ([lat, lon, alt]) => {
       viewer.camera.flyTo({
         destination: Cesium.Cartesian3.fromDegrees(
@@ -93,6 +96,33 @@ export function createApplicationControls({
     },
   }).mount();
   defer(() => uavMissionPanel.destroy());
+
+  // Open the mission panel when the operator switches the UAV layer on from the
+  // layer rail. Without this the green "UAV (AirSim)" toggle enables the layer
+  // and nothing visible happens: the mission controls live in a separate panel
+  // that mounts collapsed, so there is no way to fly anything until the
+  // operator finds it and expands it by hand.
+  //
+  // Hooked onto the layer's own enable()/disable() rather than polling a data
+  // manager: `styleManager._dataManager` does not exist (verified at runtime --
+  // the optional chaining elsewhere in this file hides that), so any
+  // isEnabled('uav') probe silently answers null forever.
+  if (uavLayer && typeof uavLayer.enable === 'function') {
+    const layerEnable = uavLayer.enable.bind(uavLayer);
+    uavLayer.enable = async (...args) => {
+      const result = await layerEnable(...args);
+      // Never let a panel problem break enabling the layer itself.
+      try {
+        uavMissionPanel.expand?.();
+      } catch {
+        /* the layer is what matters here */
+      }
+      return result;
+    };
+    defer(() => {
+      uavLayer.enable = layerEnable;
+    });
+  }
 
   // If no share link state, do default fly-to Austin
   if (!styleManager.hasShareState) {

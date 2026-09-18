@@ -30,10 +30,20 @@ MCP_PORT="${MCP_PORT:-8791}"
 UI_PORT="${UI_PORT:-4173}"
 TOKEN="${TOKEN:-dev-token}"
 
-# airsim client: <repo>/airsim/PythonClient (sibling of godseye/), else venv pip
-AIRSIM_CLIENT="$ROOT/../airsim/PythonClient"
-[ -d "$AIRSIM_CLIENT/airsim" ] || AIRSIM_CLIENT=""
-export PYTHONPATH="$ROOT/mcp${AIRSIM_CLIENT:+:$AIRSIM_CLIENT}${PYTHONPATH:+:$PYTHONPATH}"
+# AirSim client: override, else sibling checkout, else the pinned copy that
+# scripts/setup.sh fetches. One resolver shared with demo_laptop.sh so the two
+# cannot drift (they did: setup.sh vendored into .godseye/vendor while these
+# scripts looked only at ../airsim, so a fresh clone installed it and then
+# could not find it).
+GS_ROOT="$ROOT"
+# shellcheck source=scripts/_airsim_client.sh
+. "$ROOT/scripts/_airsim_client.sh"
+if ! resolve_airsim_client; then
+    airsim_missing_help
+    exit 1
+fi
+echo "[start] airsim client: $AIRSIM_CLIENT"
+export PYTHONPATH="$ROOT/mcp:$AIRSIM_CLIENT${PYTHONPATH:+:$PYTHONPATH}"
 
 PY="$ROOT/.venv/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3)"

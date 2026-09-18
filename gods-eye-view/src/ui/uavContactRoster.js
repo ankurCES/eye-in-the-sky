@@ -35,7 +35,7 @@ const CONFIDENCE_RANK = Object.freeze({
 });
 
 const ROSTER_CSS = `
-.uav-roster{margin-top:12px;padding-top:10px;border-top:1px solid #173a30;
+.uav-roster{pointer-events:auto;margin-top:12px;padding-top:10px;border-top:1px solid #173a30;
   font:10px/1.45 "SF Mono",Menlo,monospace;color:#9fd9c8}
 .uav-roster .uav-roster-head{display:flex;align-items:center;gap:6px;
   color:#1de9b6;letter-spacing:.12em;text-transform:uppercase;margin-bottom:6px}

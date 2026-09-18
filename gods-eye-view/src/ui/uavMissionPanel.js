@@ -103,6 +103,15 @@ const CSS = `
   font-size:10px;color:#9fd9c8;white-space:pre-wrap}
 #uav-mission-panel .err{color:#ff7a7a}
 #uav-mission-panel .coord{font-size:10px;color:#8fe9cf;margin-top:4px;min-height:12px}
+/* The rail (#left-panel-stack) is pointer-events:none so the globe stays
+   draggable behind it, and style.css re-enables clicks only for an explicit
+   ALLOWLIST of panel ids (#data-panel, #cctv-panel, #global-context-panel,
+   #scene-panel). This panel is not on that list, so without this rule every
+   click — the theater select, LAUNCH, even the expand caret — fell straight
+   through to the Cesium canvas and the panel was completely inert.
+   Set here rather than in style.css so the panel stays self-contained: an
+   inherited pointer-events value always loses to one declared on the element. */
+#uav-mission-panel{pointer-events:auto}
 #uav-mission-panel.collapsed .uav-body{display:none}
 #uav-mission-panel .is-hidden{display:none}
 `;
@@ -385,12 +394,19 @@ export function createUavMissionPanel({
     collapseBtn.setAttribute('aria-expanded', String(!collapsed));
     collapseBtn.title = collapsed ? 'Expand panel' : 'Collapse panel';
   }
-  collapseBtn.addEventListener('click', () =>
-    setCollapsed(!hasClass(panel, 'collapsed')),
-  );
+  // True once the operator has collapsed the panel THEMSELVES. Enabling the
+  // UAV layer auto-expands this panel (see syncLayerEnabled), but that must
+  // never fight someone who deliberately closed it.
+  let operatorCollapsed = false;
+  function toggleCollapsed() {
+    const next = !hasClass(panel, 'collapsed');
+    operatorCollapsed = next;
+    setCollapsed(next);
+  }
+  collapseBtn.addEventListener('click', toggleCollapsed);
   header.addEventListener('click', (e) => {
     if (e.target === collapseBtn) return;
-    setCollapsed(!hasClass(panel, 'collapsed'));
+    toggleCollapsed();
   });
   setCollapsed(true);
 
@@ -1045,6 +1061,18 @@ export function createUavMissionPanel({
     tick,
     /** Force one theater-adoption pass — used by tests and by manual refresh. */
     adoptRunningTheater,
+    /** Open the panel. Clears the operator's manual-collapse latch. */
+    expand() {
+      operatorCollapsed = false;
+      setCollapsed(false);
+    },
+    /** Close the panel, as if the operator had. */
+    collapse() {
+      operatorCollapsed = true;
+      setCollapsed(true);
+    },
+    /** True when the body is showing. */
+    isExpanded: () => !hasClass(panel, 'collapsed'),
     _panel: panel,
     _running: runningEl,
     _hud: hud,

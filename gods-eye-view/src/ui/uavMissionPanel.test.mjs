@@ -1022,3 +1022,63 @@ test('the panel styles its action buttons by row, not every button it contains',
   assert.match(style.textContent, /#uav-mission-panel \.row button\{/);
   panel.destroy();
 });
+
+// The panel mounts collapsed, and the mission controls (theater, vehicle,
+// mission, LAUNCH) live in its body. Clicking the green "UAV (AirSim)" toggle
+// in the layer rail enables the layer but does NOT touch this panel, so the
+// operator saw the layer go green and nothing open -- there was no way to fly
+// anything without first finding the panel and expanding it by hand.
+// src/app/controls.js wraps the uav layer's enable() and calls expand(); these
+// pin the contract that wiring depends on.
+test('expand() opens the panel body and collapse() closes it', () => {
+  const doc = stubDoc();
+  const panel = mountPanel(doc).mount(doc.body);
+  assert.equal(panel.isExpanded(), false, 'mounts collapsed');
+  panel.expand();
+  assert.equal(panel.isExpanded(), true, 'expand() opens it');
+  assert.ok(!/(^|\s)collapsed(\s|$)/.test(panel._panel.className));
+  panel.collapse();
+  assert.equal(panel.isExpanded(), false, 'collapse() closes it again');
+  panel.destroy();
+});
+
+test('expand() reopens a panel the operator had collapsed by hand', () => {
+  // Enabling the layer is an explicit "I want to use this", so it must win over
+  // an earlier manual collapse -- otherwise the toggle silently does nothing
+  // for anyone who ever closed the panel.
+  const doc = stubDoc();
+  const panel = mountPanel(doc).mount(doc.body);
+  panel.expand();
+  panel.collapse();
+  assert.equal(panel.isExpanded(), false);
+  panel.expand();
+  assert.equal(
+    panel.isExpanded(),
+    true,
+    'a manual collapse must not latch expand() off',
+  );
+  panel.destroy();
+});
+
+// The panel mounts into #left-panel-stack, which style.css sets to
+// pointer-events:none so the globe stays draggable behind the rail. Clicks are
+// re-enabled there only for an explicit ALLOWLIST of panel ids
+// (#data-panel, #cctv-panel, #global-context-panel, #scene-panel) — and this
+// panel is not on it. Without its own rule the whole panel was INERT: the
+// theater select, LAUNCH, and even the expand caret all fell through to the
+// Cesium canvas. Nothing caught it because every test drives the DOM directly.
+test('the panel re-enables pointer events on itself', () => {
+  const doc = stubDoc();
+  const panel = mountPanel(doc).mount(doc.body);
+  const style = doc.body.children.find(
+    (el) =>
+      el.tag === 'style' && /uav-mission-panel/.test(el.textContent || ''),
+  );
+  assert.ok(style, 'panel stylesheet mounted');
+  assert.match(
+    style.textContent,
+    /#uav-mission-panel\{[^}]*pointer-events:\s*auto/,
+    'the panel must declare pointer-events:auto — it inherits none from the rail',
+  );
+  panel.destroy();
+});

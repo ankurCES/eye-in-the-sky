@@ -62,11 +62,17 @@ command -v curl >/dev/null 2>&1 || die "curl is required to poll the health endp
 [ -x "$ROOT/start.sh" ] || die "missing $ROOT/start.sh — this script boots the stack through it"
 [ -f "$ROOT/scripts/demo_mission.py" ] || die "missing $ROOT/scripts/demo_mission.py — that is the mission driver"
 
-AIRSIM_CLIENT="$ROOT/../airsim/PythonClient"
-[ -d "$AIRSIM_CLIENT/airsim" ] || AIRSIM_CLIENT=""
-export PYTHONPATH="$ROOT/mcp${AIRSIM_CLIENT:+:$AIRSIM_CLIENT}${PYTHONPATH:+:$PYTHONPATH}"
+GS_ROOT="$ROOT"
+# shellcheck source=_airsim_client.sh
+. "$ROOT/scripts/_airsim_client.sh"
+if ! resolve_airsim_client; then
+    airsim_missing_help
+    die "the AirSim PythonClient is missing — run ./scripts/setup.sh from the repository root"
+fi
+echo "[demo_laptop] airsim client: $AIRSIM_CLIENT"
+export PYTHONPATH="$ROOT/mcp:$AIRSIM_CLIENT${PYTHONPATH:+:$PYTHONPATH}"
 
-"$PY" - <<'PYCHECK' || die "python dependencies are missing. Install them: .venv/bin/pip install -e '.[dev]' (and put the AirSim PythonClient on PYTHONPATH)"
+"$PY" - <<'PYCHECK' || die "python dependencies are missing — run ./scripts/setup.sh from the repository root"
 import sys
 missing = []
 for mod in ("airsim", "httpx2", "mcp.client.streamable_http", "godseye_uav.theaters",
