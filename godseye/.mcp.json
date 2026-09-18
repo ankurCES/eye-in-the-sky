@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "godseye-uav": {
+      "type": "http",
+      "url": "http://127.0.0.1:8791/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GODSEYE_MCP_TOKEN:-dev-token}"
+      }
+    }
+  }
+}

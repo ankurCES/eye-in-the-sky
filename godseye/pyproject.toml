@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "godseye-uav"
+version = "0.1.0"
+description = "godSeye agentic UAV mission simulation: AirSim bridge + MCP server"
+requires-python = ">=3.11"
+dependencies = [
+    # AirSim msgpack-rpc transport.  msgpack is PINNED <1.0 on purpose, and the
+    # reason is msgpack-rpc-python ITSELF, not any call of ours:
+    # msgpackrpc/transport/tcp.py:13 hardcodes `msgpack.Unpacker(encoding=...)`,
+    # and msgpack 1.0 DELETED the `encoding` argument.  Verified on a clean venv
+    # with msgpack 1.2.2: `msgpackrpc.Client(addr, unpack_encoding="utf-8")`
+    # CONSTRUCTS FINE, and the first actual RPC dies with
+    #   TypeError: __init__() got an unexpected keyword argument 'encoding'
+    # raised from inside the transport when it builds its Unpacker.
+    #
+    # Two consequences worth stating, because getting them backwards is how this
+    # pin gets removed by someone "cleaning up":
+    #   * The failure is at FIRST USE, not at client construction -- an import
+    #     smoke test will not catch it.
+    #   * It fires even with NO encoding kwarg from us: `encodings[1]` defaults
+    #     to None and `Unpacker(encoding=None)` raises the same TypeError.  So
+    #     dropping `unpack_encoding="utf-8"` from rpc_patch.make_client does NOT
+    #     lift this pin; only replacing msgpack-rpc-python would.
+    "msgpack-rpc-python==0.4.1",
+    "msgpack>=0.6,<1.0",
+    # msgpack-rpc-python pulls tornado<5, and tornado 4.5's netutil falls back to
+    # backports.ssl_match_hostname on any interpreter without ssl.match_hostname
+    # -- removed in CPython 3.12, hence the marker. Undeclared, `import
+    # msgpackrpc` dies with "No module named 'backports'" on 3.12+ (verified in a
+    # clean venv), so this is a hard runtime dependency of the AirSim transport,
+    # not a nicety. The CI workflow used to hand-install it at the job level,
+    # which is the same fact stated in the wrong place.
+    "backports.ssl_match_hostname>=3.7 ; python_version >= '3.12'",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic>=2.6",
+    "mcp>=1.6",
+    # bridge.py imports anyio DIRECTLY (not via fastapi).  It happens to arrive
+    # as a transitive of starlette and of mcp today, which is exactly why it was
+    # never noticed -- but "some other package currently happens to pull it" is
+    # not a dependency declaration, and it is the same shape as the msgpack and
+    # backports.ssl_match_hostname holes above.  Declare what we import.
+    "anyio>=4.0",
+
+    # --- EGM96 geoid (T1) -------------------------------------------------
+    # godseye_uav.geo.canonical_altitude() is THE datum conversion point and it
+    # RAISES GeoidUnavailableError rather than degrade silently.  That makes an
+    # undeclared geoid source an install-time hard stop, not a wrong answer, so
+    # both sources geo.py tries are declared here as real runtime dependencies.
+    #
+    #   1. PRIMARY  -- the shipped NGA 15' grid data/us_nga_egm96_15.tif read
+    #      through PROJ vgridshift.  The grid ships as package data (see
+    #      [tool.setuptools.package-data] below) and pyproj is what reads it.
+    #      Without BOTH halves a clean `pip install .` cannot compute N.
+    #   2. BACKUP   -- the pure-Python `egm96` reader of the same model.  geo.py
+    #      falls through to it (loudly, at WARNING) when the grid fails, and
+    #      tests/test_geo.py cross-checks the two sources against each other, so
+    #      it is a real dependency of the shipped behaviour and not an extra.
+    "pyproj>=3.6",
+    "egm96>=0.3",
+]
+
+[project.optional-dependencies]
+# httpx AND httpx2 are both real: tests/test_bridge.py drives the FastAPI bridge
+# with `httpx`, while tests/test_server.py, tests/test_launch.py and
+# scripts/demo_mission.py drive the Streamable-HTTP MCP endpoint with `httpx2`
+# (the client `mcp>=2` speaks).  Declaring only `httpx` -- while the two largest
+# airsim-importing modules in the suite import `httpx2` -- leaves the suite
+# resting on mcp's transitive pin: resolve `mcp` at its declared 1.6 floor and
+# test_server/test_launch die at import, 20 minutes into the run.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "httpx>=0.27",
+    "httpx2>=2.5",
+]
+
+[tool.setuptools.packages.find]
+where = ["mcp"]
+
+# The EGM96 grid MUST land in the wheel.  geo.GEOID_GRID_PATH resolves it
+# relative to the installed godseye_uav/ package, so a wheel built without this
+# entry installs a package whose primary geoid source is a missing file.
+[tool.setuptools.package-data]
+godseye_uav = ["data/*.tif"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["mcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

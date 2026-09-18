@@ -1,0 +1,4 @@
+interface:
+  display_name: "godSeye UAV"
+  short_description: "Fly ISR drone missions in the godSeye simulation via MCP"
+  default_prompt: "Use $godseye-uav to plan and fly an ISR reconnaissance mission, then report SALUTE/INTREP."

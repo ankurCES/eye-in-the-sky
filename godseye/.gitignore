@@ -1,0 +1,12 @@
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+
+# Runtime state written by the stack itself. `launch.py --db` defaults to
+# .godseye/store, demo_laptop.sh writes .godseye/logs, and the tests write
+# .godseye/test-store-<port>: a run of ./start.sh must not show up as a dozen
+# untracked JSONL files.
+.godseye/

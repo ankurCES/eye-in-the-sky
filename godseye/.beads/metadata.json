@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "godseye",
+  "project_id": "0664309b-6060-4ca0-8062-42dfacefcdf1"
+}

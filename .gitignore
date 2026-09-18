@@ -1,0 +1,83 @@
+# ---------------------------------------------------------------------------
+# Python environment & build output
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.whl
+*.tar.gz
+
+# ---------------------------------------------------------------------------
+# Test / lint / type caches and coverage
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ---------------------------------------------------------------------------
+# Node (God's Eye View)
+# ---------------------------------------------------------------------------
+node_modules/
+.vite/
+
+# ---------------------------------------------------------------------------
+# Runtime state written by the stack itself. `launch.py --db` defaults to
+# .godseye/store, demo_laptop.sh writes .godseye/logs, and the tests write
+# .godseye/test-store-<port>. scripts/setup.sh also vendors the pinned AirSim
+# client into .godseye/vendor/. None of it belongs in the repo.
+# ---------------------------------------------------------------------------
+.godseye/
+
+# God's Eye View runtime caches. .gev-cache holds ODbL Overpass responses
+# (share-alike encumbered) and is regenerable; .gev-logs is session state.
+.gev-cache/
+.gev-logs/
+
+# ---------------------------------------------------------------------------
+# Beads / Dolt. The issue history (.beads/issues.jsonl) IS committed; the local
+# database is not.
+# ---------------------------------------------------------------------------
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+.beads/embeddeddolt/
+.beads/export-state.json
+.beads/last-touched
+.beads/.local_version
+.beads/*.lock
+.beads/bd.sock*
+
+# ---------------------------------------------------------------------------
+# Secrets — never commit a real environment file
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# OS / editor cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# ---------------------------------------------------------------------------
+# Stray artifact from a SQLite ":memory:" DSN being used as a path.
+# ---------------------------------------------------------------------------
+:memory:/

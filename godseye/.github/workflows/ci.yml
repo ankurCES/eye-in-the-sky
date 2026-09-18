@@ -1,0 +1,19 @@
+name: godseye-ci
+on: [push, pull_request]
+jobs:
+  ue-free-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip setuptools wheel
+          .venv/bin/pip install -e ".[dev]" pyproj numpy "msgpack==0.6.2" backports.ssl_match_hostname
+      - name: gates
+        run: |
+          export PYTHONPATH="mcp:$PWD/../airsim/PythonClient"
+          .venv/bin/python -m pytest tests/test_geo.py tests/test_geo_gate.py -q

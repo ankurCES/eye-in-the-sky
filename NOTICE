@@ -1,0 +1,9 @@
+eye-in-the-sky
+Copyright 2026 Ankur Nair
+
+This product includes software developed as the godSeye agentic UAV ISR
+mission simulation, licensed under the Apache License, Version 2.0.
+
+It also bundles and derives from third-party software and data under their
+own licences. See THIRD_PARTY_NOTICES.md for the full list, the required
+copyright notices, and the redistribution conditions that follow them.
