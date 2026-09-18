@@ -54,7 +54,6 @@ export function createApplicationControls({
     import.meta.env?.VITE_UAV_BRIDGE_TOKEN ||
     'dev-token';
   const uavLayer = catalog?.get?.('uav');
-  const dataManager = styleManager._dataManager;
   const uavMissionPanel = createUavMissionPanel({
     bridgeUrl: uavBridgeUrl,
     token: uavBridgeToken,
@@ -71,28 +70,18 @@ export function createApplicationControls({
         duration: 2.5,
       });
     },
+    // MUST report whether the cockpit ACTUALLY entered. uavMissionPanel arms a
+    // bounded retry when a mission launches and disarms it the instant this
+    // returns true, so an optimistic "return true" here means the view never
+    // switches: the UAV entity is created by the layer's poll loop, so the
+    // first attempt right after LAUNCH normally fails, and that first failure
+    // is precisely the case the retry exists for. track() still records the
+    // intent, so a later attempt finds the entity already selected.
     onEnterCockpit: (reference) => {
-      if (!uavLayer?.track) return false;
       const cockpit = styleManager._cockpitCoordinator?.cockpitView;
-      if (!cockpit?.enter) return false;
-      const trackAndEnter = () => {
-        uavLayer.track(reference);
-        return cockpit.enter() === true;
-      };
-      // Enable the UAV AirSim layer so it is live, then track + enter cockpit.
-      const enabled = dataManager?.isEnabled?.('uav');
-      if (enabled === false && dataManager?.setEnabled) {
-        // Kick off enable; the poll loop starts populating entities.
-        Promise.resolve(dataManager.setEnabled('uav', true)).catch(() => {});
-      }
-      if (trackAndEnter()) return true;
-      // Entity may not exist yet (poll race / just enabled): track() already
-      // recorded the intent, so retry once after the next poll tick.
-      setTimeout(() => {
-        uavLayer.track(reference);
-        cockpit.enter?.();
-      }, 1500);
-      return true;
+      if (!uavLayer?.track || !cockpit?.enter) return false;
+      uavLayer.track(reference);
+      return cockpit.enter() === true;
     },
   }).mount();
   defer(() => uavMissionPanel.destroy());

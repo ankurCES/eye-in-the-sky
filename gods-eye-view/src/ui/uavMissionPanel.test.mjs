@@ -1139,3 +1139,78 @@ test('the drawer carries a mission-views surface', () => {
   assert.equal(rows[0].lead, 'Drone1');
   panel.destroy();
 });
+
+test('a launched mission only stops chasing the cockpit once it really enters', () => {
+  const doc = stubDoc();
+  // The real onEnterCockpit fails until the UAV layer's poll loop has created
+  // the Cesium entity, which is never true at LAUNCH+0. A callback that
+  // reports success optimistically disarms the retry on that first failure and
+  // the view never switches -- the bug this test exists for.
+  const calls = [];
+  let result = false;
+  const panel = mountPanel(doc, {
+    onEnterCockpit: (ref) => {
+      calls.push(ref);
+      return result;
+    },
+  }).mount(doc.body);
+
+  panel.armCockpitFollow('Drone1');
+  assert.equal(panel.isCockpitFollowArmed(), true);
+
+  // No position fix yet: do not even attempt an entry.
+  panel._followLaunchedMission([{ reference: 'Drone1' }]);
+  assert.deepEqual(calls, [], 'no entry attempt before the drone has a fix');
+  assert.equal(panel.isCockpitFollowArmed(), true);
+
+  const withFix = [
+    { reference: 'Drone1', position: { latitude: 47.6, longitude: -122.1 } },
+  ];
+  panel._followLaunchedMission(withFix);
+  assert.deepEqual(calls, ['Drone1'], 'attempts once there is a fix');
+  assert.equal(
+    panel.isCockpitFollowArmed(),
+    true,
+    'a failed entry must keep the retry armed',
+  );
+
+  // Anything that is not a literal `true` is a failure, including the
+  // undefined a callback returns when it forgets to report at all. Treating
+  // "not false" as success is what made this break in the first place.
+  result = undefined;
+  panel._followLaunchedMission(withFix);
+  assert.equal(calls.length, 2);
+  assert.equal(
+    panel.isCockpitFollowArmed(),
+    true,
+    'a non-boolean answer is not success',
+  );
+
+  result = true;
+  panel._followLaunchedMission(withFix);
+  assert.equal(calls.length, 3);
+  assert.equal(panel.isCockpitFollowArmed(), false, 'a real entry disarms it');
+  panel.destroy();
+});
+
+test('the cockpit chase gives up loudly instead of retrying forever', () => {
+  const doc = stubDoc();
+  let calls = 0;
+  const panel = mountPanel(doc, {
+    onEnterCockpit: () => {
+      calls += 1;
+      return false;
+    },
+  }).mount(doc.body);
+
+  const withFix = [
+    { reference: 'Drone1', position: { latitude: 1, longitude: 2 } },
+  ];
+  panel.armCockpitFollow('Drone1');
+  for (let i = 0; i < 200 && panel.isCockpitFollowArmed(); i += 1) {
+    panel._followLaunchedMission(withFix);
+  }
+  assert.equal(panel.isCockpitFollowArmed(), false, 'bounded, not infinite');
+  assert.ok(calls <= 40, `gave up after ${calls} attempts`);
+  panel.destroy();
+});

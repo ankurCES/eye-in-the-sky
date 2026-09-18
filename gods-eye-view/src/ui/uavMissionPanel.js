@@ -357,12 +357,16 @@ export function createUavMissionPanel({
       // readout and command in this panel refers to the drone being watched.
       if ([...vehicleSel.options].some((o) => o.value === row.lead))
         vehicleSel.value = row.lead;
-      const ok = onEnterCockpit?.(row.lead);
-      setStatus(
-        ok === false
-          ? `mission view: ${row.lead} is not trackable yet`
-          : `mission view: ${row.kind} — FPV on ${row.lead}`,
-      );
+      if (onEnterCockpit?.(row.lead) === false) {
+        // Not trackable this instant (entity not rendered yet, or no fix).
+        // Arm the same follow the launch path uses rather than giving up.
+        armCockpitFollow(row.lead);
+        setStatus(
+          `mission view: waiting for ${row.lead} to report a position…`,
+        );
+      } else {
+        setStatus(`mission view: ${row.kind} — FPV on ${row.lead}`);
+      }
     },
   });
 
@@ -622,6 +626,63 @@ export function createUavMissionPanel({
     return { lat, lon, radius_m: t?.orbitRadiusM ?? 150, alt_m: 120 };
   }
 
+  // Auto-cockpit on launch.
+  //
+  // Submitting a mission used to leave the camera wherever it was; the operator
+  // had to find the Cockpit button afterwards. Entering immediately does NOT
+  // work either: cockpitTrackingController.enter() bails on
+  // `!info || !entity?.position`, and at the moment a mission is accepted the
+  // drone may not have been rendered yet (layer just enabled, poll race) or may
+  // still be on the ground with no fix. So we ARM a follow and let the tick
+  // loop enter as soon as the drone actually has a position -- "switch to
+  // cockpit based on the drone position", rather than a blind cut.
+  const COCKPIT_FOLLOW_TRIES = 30; // ~30 s at the 1 s tick, then give up loudly
+  let pendingCockpit = null;
+
+  /** Stub-safe: the test DOM has no classList on body. */
+  function inCockpit() {
+    try {
+      return document.body?.classList?.contains?.('cockpit-mode') === true;
+    } catch {
+      return false;
+    }
+  }
+
+  function armCockpitFollow(reference) {
+    if (!reference) return;
+    pendingCockpit = { vehicle: reference, tries: COCKPIT_FOLLOW_TRIES };
+  }
+
+  /** Called every tick with the snapshot's records. */
+  function followLaunchedMission(records) {
+    if (!pendingCockpit) return;
+    if (inCockpit()) {
+      // Already flying the view -- either we just succeeded or the operator got
+      // there first. Either way stop trying.
+      pendingCockpit = null;
+      return;
+    }
+    const ref = pendingCockpit.vehicle;
+    const rec = (records || []).find((r) => r.reference === ref);
+    const pos = rec?.position;
+    const hasFix =
+      Number.isFinite(pos?.latitude) && Number.isFinite(pos?.longitude);
+    // === true, not !== false: only a real entry disarms the retry.
+    if (hasFix && onEnterCockpit?.(ref) === true) {
+      setStatus(`cockpit: following ${ref}`);
+      pendingCockpit = null;
+      return;
+    }
+    pendingCockpit.tries -= 1;
+    if (pendingCockpit.tries <= 0) {
+      setStatus(
+        `cockpit: could not follow ${ref} — use the Cockpit button`,
+        true,
+      );
+      pendingCockpit = null;
+    }
+  }
+
   async function launch() {
     launchBtn.disabled = true;
     try {
@@ -634,11 +695,14 @@ export function createUavMissionPanel({
       });
       const r = unwrapMcp(out);
       if (r?.rejected) {
+        pendingCockpit = null;
         setStatus(`rejected: ${r.error || JSON.stringify(r.gate || r)}`, true);
       } else {
         setStatus(
-          `${MISSIONS[kind].label} queued · task ${r?.task_id?.slice(0, 8) || '?'}`,
+          `${MISSIONS[kind].label} queued · task ${r?.task_id?.slice(0, 8) || '?'} · cockpit on position`,
         );
+        // Follow the drone that is actually flying this mission.
+        armCockpitFollow(vehicle());
       }
     } catch (e) {
       setStatus(`launch failed: ${e.message}`, true);
@@ -649,6 +713,7 @@ export function createUavMissionPanel({
 
   async function abort() {
     try {
+      pendingCockpit = null;
       await post('/control/command', { tool: 'uav_abort', vehicle: vehicle() });
       setStatus('aborted — hover');
     } catch (e) {
@@ -1018,6 +1083,7 @@ export function createUavMissionPanel({
     }
     const records = snap.records || [];
     refreshVehicleOptions(records);
+    followLaunchedMission(records);
     const rec =
       records.find((r) => r.reference === vehicle()) || records[0] || null;
     await enrichFromControl(rec);
@@ -1158,6 +1224,10 @@ export function createUavMissionPanel({
     _alarms: alarms,
     _roster: roster,
     _missionViews: missionViews,
+    /** Arm the post-launch cockpit follow (tests). */
+    armCockpitFollow,
+    isCockpitFollowArmed: () => pendingCockpit !== null,
+    _followLaunchedMission: followLaunchedMission,
     _theaters: theaters,
     _events: events,
   };
