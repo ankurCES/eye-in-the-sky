@@ -1798,6 +1798,7 @@
       "src/ui/uavDom.js",
       "src/ui/uavHud.js",
       "src/ui/uavMissionPanel.js",
+      "src/ui/uavMissionViews.js",
       "src/ui/uavTheaters.js",
       "src/ui/uiLifetime.js",
       "src/ui/visualEffects.js",

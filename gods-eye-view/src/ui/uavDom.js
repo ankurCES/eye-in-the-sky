@@ -64,6 +64,22 @@ export function replaceKids(el, kids) {
   }
 }
 
+/**
+ * Set a percentage width without relying on a `style` object.
+ *
+ * Same reason as setHidden: the test stubs build plain objects with no `style`,
+ * and every other surface here avoids inline styles entirely. Used for the
+ * mission-progress bar, which is the one place a computed length is unavoidable.
+ * @param {object} el element
+ * @param {number} pct 0-100
+ */
+export function setWidthPct(el, pct) {
+  const n = Number(pct);
+  const width = `${Math.max(0, Math.min(100, Number.isFinite(n) ? n : 0))}%`;
+  if (el?.style) el.style.width = width;
+  else if (el?.setAttribute) el.setAttribute('data-width', width);
+}
+
 /** Show or hide an element without relying on a `style` object. */
 export function setHidden(el, hidden) {
   if (!el) return;

@@ -1082,3 +1082,60 @@ test('the panel re-enables pointer events on itself', () => {
   );
   panel.destroy();
 });
+
+// Stacked as a vertical column in the rail this panel reached ~1900px -- taller
+// than any viewport, so everything from the contact roster down was unreachable
+// at normal zoom. It now opens as a HORIZONTAL drawer: wider than the rail, two
+// columns, and bounded by the rail's own --left-panel-allocated-height budget
+// with the body doing the scrolling.
+test('the open panel is a horizontal drawer, not a tall column', () => {
+  const doc = stubDoc();
+  const panel = mountPanel(doc).mount(doc.body);
+  const style = doc.body.children.find(
+    (el) =>
+      el.tag === 'style' && /uav-mission-panel/.test(el.textContent || ''),
+  );
+  const css = style.textContent;
+  assert.match(
+    css,
+    /#uav-mission-panel:not\(\.collapsed\)\{width:680px/,
+    'open drawer must be wider than the 360px rail',
+  );
+  assert.match(
+    css,
+    /max-height:var\(--left-panel-allocated-height/,
+    'height must come from the rail budget, not a guessed vh figure',
+  );
+  assert.match(
+    css,
+    /#uav-mission-panel \.uav-body\{display:grid;[\s\S]*?grid-template-columns:repeat\(2/,
+    'the body lays out in two columns',
+  );
+  assert.match(
+    css,
+    /flex:1 1 auto;min-height:0;overflow-y:auto/,
+    'the body scrolls inside the budget instead of growing past it',
+  );
+  panel.destroy();
+});
+
+test('the drawer carries a mission-views surface', () => {
+  const doc = stubDoc();
+  const panel = mountPanel(doc).mount(doc.body);
+  assert.ok(panel._missionViews, 'panel exposes its mission views');
+  const rows = panel._missionViews.update({
+    missions: [
+      {
+        missionId: 'MSN-9',
+        vehicle: 'Drone1',
+        kind: 'grid_search',
+        phase: 'executing',
+        progressPct: 42,
+      },
+    ],
+    records: [{ reference: 'Drone1' }],
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].lead, 'Drone1');
+  panel.destroy();
+});

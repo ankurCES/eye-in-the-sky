@@ -36,6 +36,7 @@ import {
 import { createUavMissionHud } from './uavHud.js';
 import { createUavAlarmSurface } from './uavAlarms.js';
 import { createUavContactRoster } from './uavContactRoster.js';
+import { createUavMissionViews } from './uavMissionViews.js';
 
 export { THEATERS, SEED_POIS, OFFLINE_THEATERS } from './uavTheaters.js';
 
@@ -53,10 +54,49 @@ const ADOPT_EVERY = 15; // ticks between running-theater adoption retries
 const ADOPT_MAX_TRIES = 5; // then stop asking; the running line says what we know
 
 const CSS = `
+/* A HORIZONTAL DRAWER, not a tall column.
+   Stacked vertically in the rail this panel grew to ~1900px -- taller than any
+   normal viewport, so everything from the contact roster down was simply
+   unreachable. It now opens SIDEWAYS: collapsed it is just the header at rail
+   width; open it slides out to a fixed drawer width and lays its content in
+   columns, capped to the viewport with its own scroll. */
 #uav-mission-panel{position:relative;width:100%;z-index:auto;
   background:rgba(10,14,18,.92);border:1px solid #1de9b6;border-radius:8px;
   color:#d7f5ec;font:12px/1.5 "SF Mono",Menlo,monospace;
-  box-shadow:0 6px 24px rgba(0,0,0,.5);backdrop-filter:blur(6px)}
+  box-shadow:0 6px 24px rgba(0,0,0,.5);backdrop-filter:blur(6px);
+  transition:width .18s ease}
+#uav-mission-panel:not(.collapsed){width:680px;
+  max-width:calc(100vw - 96px);
+  /* The rail measures how much vertical room this panel may take and publishes
+     it as --left-panel-allocated-height (the sibling panels consume it through
+     flex-basis). Honour the same budget instead of guessing a vh figure, or the
+     drawer runs off the bottom whenever another panel is open above it. */
+  display:flex;flex-direction:column;
+  max-height:var(--left-panel-allocated-height,72vh)}
+#uav-mission-panel:not(.collapsed) .uav-inner{display:flex;flex-direction:column;
+  min-height:0;flex:1 1 auto}
+/* The body is the drawer: two columns, and it owns the scrolling so the panel
+   itself never runs past the bottom of the screen. */
+#uav-mission-panel .uav-body{display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:0 16px;align-content:start;
+  /* min-height:0 is what actually lets a flex child scroll instead of growing
+     past its parent. */
+  flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;
+  padding-right:4px}
+/* Full-width rows inside the grid: anything that reads as a band rather than a
+   field. Declared by class so a new section defaults to a column, not a band. */
+#uav-mission-panel .uav-body > .uav-span{grid-column:1 / -1}
+#uav-mission-panel .uav-col{min-width:0}
+/* The readout column starts level with the first control, not with the
+   'MCP-gated' subtitle above it. */
+#uav-mission-panel .uav-col-readouts{padding-top:18px}
+#uav-mission-panel .uav-col-readouts > :first-child{margin-top:0}
+/* One column when the drawer cannot be wide (narrow window / phone). */
+@media (max-width:760px){
+  #uav-mission-panel:not(.collapsed){width:calc(100vw - 32px)}
+  #uav-mission-panel .uav-body{grid-template-columns:1fr}
+}
 #uav-mission-panel .uav-inner{padding:10px 12px 12px}
 #uav-mission-panel .panel-header{display:flex;align-items:center;gap:8px;
   cursor:pointer;user-select:none}
@@ -306,6 +346,26 @@ export function createUavMissionPanel({
     onSelect: (contact) => focusContact(contact),
   });
 
+  // Mission views: every mission actually in the air, and a way to put the
+  // camera on any of them. Selecting one tracks that mission's LEAD drone and
+  // enters the cockpit FPV -- looking, never commanding (the MCP server stays
+  // the only command path).
+  const missionViews = createUavMissionViews({
+    onSelect: (row) => {
+      if (!row?.lead) return;
+      // Point the panel's own vehicle selector at the lead so every later
+      // readout and command in this panel refers to the drone being watched.
+      if ([...vehicleSel.options].some((o) => o.value === row.lead))
+        vehicleSel.value = row.lead;
+      const ok = onEnterCockpit?.(row.lead);
+      setStatus(
+        ok === false
+          ? `mission view: ${row.lead} is not trackable yet`
+          : `mission view: ${row.kind} — FPV on ${row.lead}`,
+      );
+    },
+  });
+
   // ---- Tactical options -------------------------------------------------
   // Target coordinate mapping
   const mapTargetChk = h('input', {
@@ -351,9 +411,13 @@ export function createUavMissionPanel({
     h('span', { class: 'panel-divider' }),
     collapseBtn,
   );
-  const body = h(
+  // Two columns inside the drawer: what the operator SETS on the left, what the
+  // aircraft REPORTS on the right. Grouped into column elements rather than
+  // dropped straight into the grid, so a label never lands in one column with
+  // its field in the other.
+  const bodyControls = h(
     'div',
-    { class: 'uav-body' },
+    { class: 'uav-col uav-col-controls' },
     h('div', { class: 'sub' }, 'MCP-gated · ISR only'),
     h('label', {}, 'Theater / Map'),
     theaterSel,
@@ -368,13 +432,19 @@ export function createUavMissionPanel({
     poiSel,
     h('div', { class: 'row' }, launchBtn, abortBtn),
     h('div', { class: 'row' }, cockpitBtn),
-    alarms.banner,
-    hud.element,
-    roster.element,
     tacticalSec,
     statusEl,
+  );
+  const bodyReadouts = h(
+    'div',
+    { class: 'uav-col uav-col-readouts' },
+    alarms.banner,
+    hud.element,
+    missionViews.element,
+    roster.element,
     teleEl,
   );
+  const body = h('div', { class: 'uav-body' }, bodyControls, bodyReadouts);
   const panel = h(
     'div',
     {
@@ -969,6 +1039,13 @@ export function createUavMissionPanel({
       ? snap.contacts || []
       : normalizeTargetsAsContacts(snap.targets);
     roster.update(contacts);
+    // Mission views list everything in the air, not just the selected vehicle,
+    // so it takes the whole snapshot rather than the single chosen record.
+    missionViews.update(snap);
+    // normalizeMission publishes `missionId`; `mission_id` is the raw bridge
+    // spelling and would silently clear the highlight on every tick.
+    const activeId = mission?.missionId ?? mission?.id ?? mission?.mission_id;
+    if (activeId) missionViews.setActive(activeId);
     drawOverlays(rec);
     return snap;
   }
@@ -1036,6 +1113,7 @@ export function createUavMissionPanel({
       overlayHost.append(alarms.element);
       if (hud.style) host.append(hud.style);
       if (roster.style) host.append(roster.style);
+      if (missionViews.style) host.append(missionViews.style);
       setHidden(alarms.element, true);
       // Served theater table first; the bundled copy stays labelled offline.
       // The same pass adopts whichever theater the bridge is flying.
@@ -1051,6 +1129,7 @@ export function createUavMissionPanel({
       events.stop();
       alarms.destroy();
       roster.destroy();
+      missionViews.destroy();
       hud.destroy();
       enableMapTarget(false);
       if (overlayDs && viewer) viewer.dataSources.remove(overlayDs, true);
@@ -1078,6 +1157,7 @@ export function createUavMissionPanel({
     _hud: hud,
     _alarms: alarms,
     _roster: roster,
+    _missionViews: missionViews,
     _theaters: theaters,
     _events: events,
   };
