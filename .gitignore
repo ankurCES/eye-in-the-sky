@@ -31,6 +31,9 @@ coverage.xml
 # ---------------------------------------------------------------------------
 node_modules/
 .vite/
+# godseye/ is a python project. A stray `npm`/`npx` run inside it mints an
+# empty package-lock.json with no package.json beside it; it is never source.
+godseye/package-lock.json
 
 # ---------------------------------------------------------------------------
 # Runtime state written by the stack itself. `launch.py --db` defaults to
