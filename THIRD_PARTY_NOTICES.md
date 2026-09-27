@@ -64,6 +64,9 @@ apart from the UAV integration described below.
 `src/app/layers/uav.js`, and `docs/godseye-mcp-server-design.md`. Roughly 70 further lines are hooks
 added into ~13 pre-existing upstream files (for example a single registration line in
 `src/app/constructCatalog.js`, `src/data/layerState.js:387`, `src/ui/applicationShell.js:333`).
+The intelligence console is also this project's: `src/console/**` (53 files, tests included) and
+the tracking port `src/app/trackingPort.js`, with integration edits in `src/main.js`, `index.html`,
+`src/app/controls.js` and `src/app/tools.js`.
 Everything else in `gods-eye-view/` is upstream code under the MIT licence above.
 
 **Excluded from this repo** (regenerable or bulky, not part of the source): `node_modules/`,
@@ -106,6 +109,84 @@ Not redistributed, but their terms bind how the running system may be used (see
 Its own GDAL metadata reads *"Derived from work by NGA. Public Domain"*. It ships as package data
 because `geo.canonical_altitude()` is the single datum-conversion point and raises rather than
 degrading silently when no geoid source is available.
+
+---
+
+## 6. Claude Agent SDK and the Claude Code CLI (the analyst)
+
+The in-app analyst uses the Python package `claude-agent-sdk` (0.2.160, installed by the `app`
+extra of `godseye/pyproject.toml`). It is not vendored in this repository. The desktop build
+(`scripts/build_desktop.sh`) freezes the package into the app and copies the Claude Code CLI that the
+package bundles (`claude_agent_sdk/_bundled/claude`, version 2.1.283) into
+`Contents/Helpers/claude`, unmodified and still signed by Anthropic (`--no-cli` leaves it out).
+
+What the installed distribution says (`claude_agent_sdk-0.2.160.dist-info`):
+
+- `licenses/LICENSE` is the MIT License, "Copyright (c) 2025 Anthropic, PBC". Its text is the same
+  MIT text reproduced in section 1, with that copyright line.
+- `METADATA` declares `License: MIT`, and its "License and terms" section adds that use of the SDK
+  "is governed by Anthropic's Commercial Terms of Service"
+  (<https://www.anthropic.com/legal/commercial-terms>), including when it powers products and
+  services offered to your own customers and end users, except where a component or dependency is
+  covered by a different licence stated in that component's own LICENSE file.
+- The wheel carries no LICENSE file for the bundled CLI (`_bundled/` holds only the `claude` binary
+  and a `.gitignore`). Nothing in the distribution states that the CLI is under the MIT grant; the
+  only terms it points to are the Commercial Terms above. Check Anthropic's terms before
+  redistributing a desktop build that includes `Contents/Helpers/claude`.
+
+Separately from the licence, Anthropic's Agent SDK documentation asks third-party products not to
+offer claude.ai login or its rate limits without prior approval, and to use API-key
+authentication instead. This project uses the owner's own Claude login only for local use; see
+`godseye/INTEL_CONSOLE.md`, "Analyst sign-in and Anthropic's policy".
+
+## 7. pywebview: BSD 3-Clause
+
+The native window (`--window` and the desktop app) uses `pywebview` (6.2.1, `app` extra), frozen
+into the desktop app with its Cocoa backend. Its `licenses/LICENSE` is the BSD 3-Clause License,
+"Copyright (c) 2014-2017, Roman Sirokov". Redistribution in binary form must reproduce that copyright
+notice, the list of conditions and the disclaimer in the documentation or other materials provided
+with the distribution; the full text is in
+`godseye/.venv/lib/python3.*/site-packages/pywebview-6.2.1.dist-info/licenses/LICENSE` (and at
+<https://github.com/r0x0r/pywebview>). The desktop build does not yet copy it into the app.
+
+## 8. PyInstaller: GPL-2.0-or-later with the bootloader exception
+
+`PyInstaller` (6.22.3, `desktop` extra) builds the macOS app; it is a build tool, not a library the
+app imports. Its `licenses/COPYING.txt` says:
+
+- PyInstaller is under the GNU General Public License, version 2 or (at your option) any later
+  version.
+- **Bootloader exception**: the authors give unlimited permission to link or embed the compiled
+  bootloader and related files (`bootloader/`, `PyInstaller/loader`) into combinations with other
+  programs and to distribute those combinations without restriction from the use of those files.
+  The GPL still applies otherwise, for example to modifying those files or distributing them on
+  their own.
+- Run-time hooks (`PyInstaller/hooks/rthooks`) and the additional run-time modules
+  (`PyInstaller/fake-modules`) that end up inside the executable are under the Apache License 2.0.
+
+So the app PyInstaller produces is not placed under the GPL by being built with it.
+`pyinstaller-hooks-contrib` (2026.7, a PyInstaller dependency) follows the same split: its hooks
+are GPL-2.0-or-later and the run-time hooks it adds to executables are Apache-2.0.
+
+## 9. Fonts (loaded from Google Fonts, not vendored)
+
+`gods-eye-view/index.html` links stylesheets from `fonts.googleapis.com`; no font file is in this
+repository or in the desktop app, and the browser fetches them at run time.
+
+- **Atkinson Hyperlegible Next** and **Atkinson Hyperlegible Mono** (Braille Institute): the
+  console's faces. SIL Open Font License 1.1.
+- Upstream God's Eye View also loads **Inter** and **JetBrains Mono** (SIL Open Font License 1.1)
+  and **Material Symbols Outlined** (Apache License 2.0).
+
+Offline, the browser falls back to local fonts.
+
+## 10. Other Python packages in the desktop app
+
+The desktop app also freezes `godseye-uav`'s runtime dependencies (among them fastapi, starlette,
+uvicorn, pydantic, mcp, anyio, msgpack-rpc-python, msgpack, tornado, pyproj with its PROJ data, and
+egm96) and their own dependencies, each under its own licence. Their licence files are in the
+installed `*.dist-info` directories; the build does not yet copy them, or this file, into the app.
+Collect them before giving a build to anyone.
 
 ---
 

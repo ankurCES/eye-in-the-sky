@@ -1,0 +1,36 @@
+/*
+ * Intelligence console reset (UX spec §11.2, file order step 3).
+ *
+ * Imported FIRST by console.css, before the per-owner partials. Its rules
+ * score (0,1,0), enough to beat GEV's universal and element rules, and being
+ * earliest in the cascade every partial's single-class rule (also (0,1,0))
+ * wins the tie by order. Declared later, this reset used to strip the
+ * partials' padding, margins, fonts and list bullets.
+ */
+
+.ic-root :where(*, *::before, *::after) {
+  box-sizing: border-box;
+}
+
+.ic-root :where(button, input, textarea, ul, ol, p, h1, h2, h3, h4, dl, dd) {
+  margin: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  letter-spacing: 0;
+}
+
+.ic-root :where(button) {
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: inherit;
+}
+
+.ic-root :where(ul, ol) {
+  list-style: none;
+}
+
+.ic-root [hidden] {
+  display: none !important;
+}

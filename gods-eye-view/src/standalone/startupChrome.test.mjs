@@ -10,7 +10,7 @@ const source = readFileSync(
   .replace(/^import .*;\n/gm, '')
   .replace('export function', 'function');
 
-function fixture() {
+function fixture(options = {}) {
   const timers = new Map();
   const listeners = new Map();
   const events = [];
@@ -51,6 +51,7 @@ function fixture() {
     },
     dataManager: {},
     signal: controller.signal,
+    ...options,
   });
   return {
     events,
@@ -123,4 +124,22 @@ test('shutdown during the cover transition cancels the listener and fallback', a
   transition();
   f.fire(900);
   assert.deepEqual(f.events, ['hidden', 'settings:destroy']);
+});
+
+// The intelligence console owns the landing view (src/main.js). The launcher
+// is switched off by passing `initializeWelcome: null` -- the option the
+// tools phase sets when `firstRun` is false -- not by an early return inside
+// the reveal: the loader still hides, and nothing is revealed or persisted.
+test('initializeWelcome: null hides the cover and never reveals the launcher', async () => {
+  const f = fixture({ initializeWelcome: null });
+  f.restored();
+  f.fire(1000);
+  await flush();
+  assert.deepEqual(f.events, ['hidden']);
+  f.listeners.get('transitionend')?.();
+  f.fire(900);
+  assert.deepEqual(f.events, ['hidden'], 'no welcome');
+  await f.stop();
+  assert.deepEqual(f.events, ['hidden', 'settings:destroy']);
+  assert.equal(f.timers.size, 0);
 });

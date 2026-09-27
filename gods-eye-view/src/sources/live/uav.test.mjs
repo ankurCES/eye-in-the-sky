@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 // Contract-level test of the UAV source normalizer against a bridge payload.
 import {
   alarmSeverityRank,
+  configureUavSource,
   createUavEventStream,
   createUavSource,
   fetchUavActiveTheater,
@@ -790,6 +791,44 @@ test('the theater fetch can be pinned to the same bridge', async () => {
     assert.equal(seen[0].url, 'http://pinned.test/theaters');
     assert.equal(seen[0].auth, 'Bearer pinned-token');
   } finally {
+    globalThis.fetch = original;
+  }
+});
+
+// src/app/sources.js configures the source with the app's resolver GETTERS
+// (host injection, then localStorage, then the build env). They must be read
+// per request, and they must win: the build env used to sit above them, so a
+// VITE_UAV_BRIDGE_TOKEN baked into a build beat the in-app host's token.
+test('a configured origin and token are getters, read on every request', async () => {
+  const seen = [];
+  const original = globalThis.fetch;
+  let origin = 'http://127.0.0.1:8780';
+  let secret = 'host-token';
+  globalThis.fetch = async (url, init) => {
+    seen.push({ url: String(url), auth: init?.headers?.Authorization });
+    return { ok: true, json: async () => BRIDGE_SNAPSHOT };
+  };
+  try {
+    configureUavSource({ baseUrl: () => origin, token: () => secret });
+    const source = createUavSource();
+    await source.getSnapshot({});
+    origin = 'http://127.0.0.1:8781';
+    secret = 'rotated-token';
+    await source.getSnapshot({});
+    assert.match(seen[0].url, /^http:\/\/127\.0\.0\.1:8780\/snapshot/);
+    assert.equal(seen[0].auth, 'Bearer host-token');
+    const later = seen.find((call) => call.url.includes(':8781/snapshot'));
+    assert.ok(later, 'the new origin is used without reconfiguring');
+    assert.equal(later.auth, 'Bearer rotated-token');
+
+    // Unconfigured, the loopback defaults apply (no build env under node).
+    configureUavSource({});
+    seen.length = 0;
+    await createUavSource().getSnapshot({});
+    assert.match(seen[0].url, /^http:\/\/localhost:8790\/snapshot/);
+    assert.equal(seen[0].auth, 'Bearer dev-token');
+  } finally {
+    configureUavSource({});
     globalThis.fetch = original;
   }
 });

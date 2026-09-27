@@ -1,5 +1,6 @@
 /** Camera placement, ground acquisition and motion correction for the Cockpit controller. */
 import * as Cesium from 'cesium';
+import { viewerHasEntity } from './cockpitTrackingController.js';
 import {
   cockpitAnchorCorrectionStep,
   cockpitGroundSafeHeight,
@@ -45,7 +46,7 @@ export function update() {
   if (
     !info ||
     !this.trackedEntity ||
-    !this.viewer.entities.contains(this.trackedEntity)
+    !viewerHasEntity(this.viewer, this.trackedEntity)
   ) {
     if (nowMs < this.contextNavigationDeadlineMs) return;
     this.exit({ restoreTracking: false });

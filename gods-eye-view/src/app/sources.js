@@ -12,14 +12,11 @@ import { configureLaunchSource } from '../data/rocketLaunches.js';
 import { configureFirmsSource } from '../data/firmsHeatmap.js';
 import { configureMilitaryRegistrySource } from '../data/militaryRegistry.js';
 import { configureUavSource } from '../sources/live/uav.js';
-configureUavSource({
-  baseUrl:
-    (typeof localStorage !== 'undefined' && localStorage.getItem('gev.uav.base')) ||
-    import.meta.env?.VITE_UAV_BRIDGE_URL,
-  token:
-    (typeof localStorage !== 'undefined' && localStorage.getItem('gev.uav.token')) ||
-    import.meta.env?.VITE_UAV_BRIDGE_TOKEN,
-});
+import { uavBridgeToken, uavBridgeUrl } from './uavBridge.js';
+// Getters, not values: the source reads them on every request, so the in-app
+// host's injected token, or an operator's localStorage override written after
+// load, reaches the next poll without a reload. One resolver for all readers.
+configureUavSource({ baseUrl: uavBridgeUrl, token: uavBridgeToken });
 const configure = {
   alpr: configureAlprSource,
   cctv: configureCctvSource,

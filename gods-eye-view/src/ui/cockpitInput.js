@@ -14,8 +14,13 @@ export function onKeyDown(event) {
         ?.classList.contains('disclosure-open')
     )
       return;
+    // Only an OPEN utility disclosure owns Escape. A control nested in a
+    // collapsed (hidden) popover, such as the Parameters panel's own collapse
+    // button, still reports aria-expanded="true" and must not block the exit.
     if (
-      document.querySelector('#cockpit-utility-controls [aria-expanded="true"]')
+      document.querySelector(
+        '#cockpit-utility-controls [aria-expanded="true"]:not([hidden] *)',
+      )
     )
       return;
     if (this.context?.contains(event.target) && !this.contextCollapsed) {

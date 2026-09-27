@@ -36,17 +36,25 @@ const TRACKS_MAX_RETRY_MS = 60000;
 
 // Config is injected by the app layer (browser-global access is forbidden
 // inside sources/live). Callers may pass baseUrl/token or a config provider.
+//
+// Resolution order, per request: a per-call override, then whatever the app
+// configured (src/app/uavBridge.js, which already folds in the host
+// injection, localStorage and the build env), then the build env for callers
+// that never configure, then the loopback defaults. The env used to sit ABOVE
+// the configured value, so a build-time VITE_UAV_BRIDGE_TOKEN silently beat
+// the in-app host's token and an operator's localStorage override.
 let runtime = {
-  baseUrl: DEFAULT_BASE,
-  token: DEFAULT_TOKEN,
+  baseUrl: null,
+  token: null,
   eventSourceFactory: null,
 };
 
 /**
  * Configure the bridge transport.
  * @param {object} [config]
- * @param {string} [config.baseUrl] bridge origin, default http://localhost:8790
- * @param {string} [config.token] Bearer token for the bridge
+ * @param {string|(() => string)} [config.baseUrl] bridge origin, or a getter
+ *   read on every request; default http://localhost:8790
+ * @param {string|(() => string)} [config.token] Bearer token, or a getter
  * @param {(url: string) => object} [config.eventSourceFactory] constructs the
  *   SSE client for `/events`; omitted means alarms are unsupported, never fatal
  */
@@ -56,8 +64,8 @@ export function configureUavSource({
   eventSourceFactory,
 } = {}) {
   runtime = {
-    baseUrl: baseUrl || DEFAULT_BASE,
-    token: token || DEFAULT_TOKEN,
+    baseUrl: typeof baseUrl === 'function' || baseUrl ? baseUrl : null,
+    token: typeof token === 'function' || token ? token : null,
     eventSourceFactory:
       typeof eventSourceFactory === 'function' ? eventSourceFactory : null,
   };
@@ -72,8 +80,8 @@ function resolve(override) {
 function baseUrl(override) {
   return (
     resolve(override) ||
+    resolve(runtime.baseUrl) ||
     import.meta.env?.VITE_UAV_BRIDGE_URL ||
-    runtime.baseUrl ||
     DEFAULT_BASE
   );
 }
@@ -81,8 +89,8 @@ function baseUrl(override) {
 function token(override) {
   return (
     resolve(override) ||
+    resolve(runtime.token) ||
     import.meta.env?.VITE_UAV_BRIDGE_TOKEN ||
-    runtime.token ||
     DEFAULT_TOKEN
   );
 }

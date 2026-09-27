@@ -4,6 +4,28 @@ import {
   resolveTrackedAircraftInfo,
 } from '../cockpitMath.js';
 
+/**
+ * Whether `entity` is still live in `viewer`.
+ *
+ * `viewer.entities.contains()` alone is wrong for layers that keep their
+ * entities in their own DataSource (the UAV layer uses a CustomDataSource):
+ * it answers false for a perfectly live drone, and the cockpit then exits the
+ * frame after it enters (measured: 13 ms). An entity is live when the
+ * viewer's own collection holds it, or when the collection that owns it
+ * belongs to a DataSource the viewer still holds.
+ */
+export function viewerHasEntity(viewer, entity) {
+  if (!entity || !viewer) return false;
+  if (viewer.entities?.contains?.(entity)) return true;
+  const collection = entity.entityCollection;
+  const owner = collection?.owner;
+  return (
+    collection?.contains?.(entity) === true &&
+    !!owner &&
+    viewer.dataSources?.contains?.(owner) === true
+  );
+}
+
 export function readAircraftInfo() {
   // In cockpit mode the controller takes the entity off `viewer.trackedEntity`
   // (see update()), so the cockpit's own handle is the tracked identity there.
@@ -116,7 +138,7 @@ export function _adoptTrackedEntity(nowMs, suppliedInfo = null) {
     return false;
   const info = suppliedInfo || this.readAircraftInfo();
   if (!info) return false;
-  if (this.trackedEntity && this.viewer.entities.contains(this.trackedEntity)) {
+  if (this.trackedEntity && viewerHasEntity(this.viewer, this.trackedEntity)) {
     this.trackedEntity.show = this.trackedEntityWasShown;
   }
   this.trackedEntity = nextEntity;
@@ -241,11 +263,11 @@ export function exit({ restoreTracking = true } = {}) {
   if (this.signalStream) this.signalStream.hidden = true;
   this.hud?.classList.remove('signals-active');
   this.viewer.scene.screenSpaceCameraController.enableInputs = true;
-  if (entity && this.viewer.entities.contains(entity))
+  if (entity && viewerHasEntity(this.viewer, entity))
     entity.show = this.trackedEntityWasShown;
   this.trackedEntityWasShown = true;
   this.dispatchCockpitModeChanged(false);
-  if (restoreTracking && entity && this.viewer.entities.contains(entity)) {
+  if (restoreTracking && entity && viewerHasEntity(this.viewer, entity)) {
     this.viewer.trackedEntity = entity;
     this.restoreTrackingFrame(entity);
   }

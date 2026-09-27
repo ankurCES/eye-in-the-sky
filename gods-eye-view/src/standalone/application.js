@@ -10,13 +10,23 @@ import { createStandaloneTools } from './tools.js';
 // The existing controls and layer catalog contain page-scoped state.
 let constructed = false;
 
-/** Compose the standalone application once per page. Reload to start again. */
+/**
+ * Compose the standalone application once per page. Reload to start again.
+ *
+ * `intelConsole` is set when the intelligence console (src/console) is the
+ * landing view: `{onTrackingPort(port|null)}` receives the map's tracking
+ * port once the controls exist. It also turns the first-run launcher off by
+ * default (`firstRun`), since the launcher would open behind the console and
+ * take its keyboard focus.
+ */
 export function createStandaloneApplication({
   googleApiKey,
   cesiumToken,
   geospatial = {},
   voice = {},
   allowQaRegistration = false,
+  intelConsole = null,
+  firstRun = intelConsole == null,
 }) {
   if (constructed)
     throw new Error('The standalone application already owns this page');
@@ -60,10 +70,17 @@ export function createStandaloneApplication({
         loaderStatus,
         placeSearch,
         catalog,
+        intelConsole,
       }),
     createData: (context) =>
       createStandaloneData({ ...context, allowQaRegistration, catalog }),
     createTools: (context) =>
-      createStandaloneTools({ ...context, loadingScreen, placeSearch, voice }),
+      createStandaloneTools({
+        ...context,
+        loadingScreen,
+        placeSearch,
+        voice,
+        firstRun,
+      }),
   });
 }

@@ -14,6 +14,7 @@ import { createLaunchSource } from '../layers/launches/source.js';
 import { createOverpassAlprSource } from '../layers/alpr/source.js';
 import { createFirmsSource } from '../layers/firms/source.js';
 import { createUavSource } from '../sources/live/uav.js';
+import { uavBridgeToken, uavBridgeUrl } from '../app/uavBridge.js';
 import { createReferenceSources } from '../sources/reference.js';
 export { createReferenceSources as createStandaloneReferenceSources } from '../sources/reference.js';
 
@@ -36,6 +37,10 @@ export function createStandaloneLayerSources() {
     launches: createLaunchSource(),
     alpr: createOverpassAlprSource(),
     firms: createFirmsSource(),
-    uav: createUavSource(),
+    // The globe layer reads the same bridge as the mission panel and the
+    // console (host injection, then localStorage, then the build env). Left
+    // unconfigured it fell back to the build env and localhost:8790, so under
+    // the in-app host the drones never appeared on the map.
+    uav: createUavSource({ baseUrl: uavBridgeUrl, token: uavBridgeToken }),
   };
 }

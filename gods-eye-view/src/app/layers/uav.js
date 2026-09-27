@@ -2,10 +2,25 @@ import { createUavLayer } from '../../layers/uav/index.js';
 import * as picking from '../../data/pickRegistry.js';
 import * as render from '../../renderGovernor.js';
 import * as context from '../../data/contextStore.js';
+import { uavBridgeToken, uavBridgeUrl } from '../uavBridge.js';
 
-/** Bridge defaults mirror src/sources/live/uav.js — loopback only. */
-const DEFAULT_BRIDGE_URL = 'http://localhost:8790';
-const DEFAULT_BRIDGE_TOKEN = 'dev-token';
+/**
+ * The bridge origin for `GET /mission-overlay`, resolved on every read by the
+ * one UAV bridge resolver. It used to read only the build env and ignored the
+ * localStorage override (and the in-app host's injected config) that the
+ * panel and the source honoured, so the overlay alone asked the wrong origin.
+ * Getters rather than values: the overlay reads `baseUrl`/`token` per fetch.
+ */
+function liveMissionOverlayConfig() {
+  return {
+    get baseUrl() {
+      return uavBridgeUrl();
+    },
+    get token() {
+      return uavBridgeToken();
+    },
+  };
+}
 
 /**
  * Construct the UAV (AirSim) layer with an application-supplied source.
@@ -30,10 +45,7 @@ export function createApplicationUav({
   source,
   resolveAsset = (url) =>
     `${import.meta.env?.BASE_URL || '/'}${url.replace(/^\//, '')}`,
-  missionOverlay = {
-    baseUrl: import.meta.env?.VITE_UAV_BRIDGE_URL || DEFAULT_BRIDGE_URL,
-    token: import.meta.env?.VITE_UAV_BRIDGE_TOKEN || DEFAULT_BRIDGE_TOKEN,
-  },
+  missionOverlay = liveMissionOverlayConfig(),
 } = {}) {
   return createUavLayer({
     source,

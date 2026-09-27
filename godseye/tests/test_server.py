@@ -167,6 +167,23 @@ def test_bearer_verifier():
     assert run(v.verify_token("wrong")) is None
 
 
+def test_auth_settings_state_the_token_resource_policy(tmp_path):
+    """The static verifier's tokens carry no `resource`, so the server says
+    validate_token_resource=False explicitly: no MCPDeprecationWarning at boot
+    (it printed on every app launch), and mcp 3.0's True default cannot start
+    refusing the shared token."""
+    import warnings
+
+    from mcp.shared.exceptions import MCPDeprecationWarning
+
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        with build_server(tmp_path) as srv:
+            policy = srv.mcp.settings.auth.validate_token_resource
+    assert not [w for w in seen if issubclass(w.category, MCPDeprecationWarning)]
+    assert policy is False
+
+
 # ------------------------------------------------------- T1: the datum -----
 
 def test_telemetry_publishes_all_three_datums_from_one_conversion(server):
@@ -1231,6 +1248,7 @@ CONTRACT_TOOLS = {
     # §4.4 scenario / sim admin
     "sim_spawn_target", "sim_move_target", "sim_set_time", "sim_set_weather",
     "sim_set_link_state", "sim_set_gps_degradation", "sim_reset",
+    "sim_set_fuel",
 }
 
 #: PLAN §4.8 / TOOL_CONTRACT §4.8. All eight were missing (R6).
@@ -1927,6 +1945,22 @@ def test_mission_identify_target_cross_cues_wide_to_narrow(server):
             server.tracks.get(track_id).lat, abs=1e-6)
         assert isinstance(out["track_history"], list) and out["track_history"]
         assert isinstance(out["key_images"], list)
+    run(main())
+
+
+def test_identify_product_lists_captured_frames_as_key_images(server):
+    """Regression: `self.frames` holds {"png", "meta"}; the identify product
+    read `["resource"]` off the entry and raised KeyError once any frame had
+    been captured on the vehicle (seen live in the app host's demo run)."""
+    async def main():
+        _, track_id = await spawn_and_scan(server, ob_class="supply_truck")
+        cap = await tool(server, "uav_capture_image")(vehicle="Drone1")
+        assert cap.get("error") is None, cap
+        out = await tool(server, "mission_identify_target")(
+            vehicle="Drone1", track_id=track_id, alt_agl_m=120.0, dry_run=True)
+        assert out.get("error") is None, out
+        assert cap["resource"] in out["key_images"]
+        assert out["key_images_note"] is None
     run(main())
 
 
@@ -5529,3 +5563,286 @@ def test_a_restored_bingo_latch_still_commits_the_vehicle_to_rtb(tmp_path):
         assert rtb[-1]["reason"] == "bingo", rtb[-1]
         assert srv.mission_flags.get("Drone1") == MISSION_INCOMPLETE_FUEL
         assert srv.fuel_for("Drone1").bingo.tripped is True
+
+
+# ==========================================================================
+# sim_set_fuel — the operator refuel / BINGO-latch override (CONTRACT §9,
+# ported from the ObraMaestra stack with its defects fixed; see
+# GodseyeUavServer._set_fuel).
+# ==========================================================================
+
+def test_sim_set_fuel_is_published_with_an_idempotency_key(server):
+    assert "sim_set_fuel" in server.mcp._tool_manager._tools
+    props = schema_of(server, "sim_set_fuel")
+    assert {"vehicle", "fuel_pct", "idempotency_key"} <= set(props)
+    required = server.mcp._tool_manager._tools["sim_set_fuel"].parameters.get("required", [])
+    # A safety override names its target; there is no silent 'Drone1'.
+    assert "vehicle" in required
+
+
+def test_sim_set_fuel_clears_a_bingo_latch_and_returns_the_real_line(server):
+    """The port returned `bingo_pct_at_trip` read AFTER the clear — always None.
+    The answer must carry the CURRENT line, priced as telemetry prices it, and
+    must not cancel the forced RTB already flying."""
+    async def main():
+        await takeoff_to(server, "Drone1", 60.0)
+        fm = server.fuel_for("Drone1")
+        fm.fuel_pct = 12.0
+        v = await server.tick_once("Drone1")
+        assert v["bingo"]["tripped_now"] is True
+        q = server.tasking.queue_for("Drone1")
+        end = time.monotonic() + 10.0
+        while time.monotonic() < end and (
+                q.current is None or q.current.tool != "uav_return_to_home"):
+            await asyncio.sleep(0.1)
+        assert q.current is not None and q.current.uncancellable is True
+        rtb_id = q.current.id
+
+        out = await tool(server, "sim_set_fuel")(vehicle="Drone1", fuel_pct=100.0)
+        assert out.get("error") is None, out
+        assert out["ok"] is True and out["status"] == "accepted"
+        assert out["fuel_pct"] == pytest.approx(100.0)
+        assert out["fuel_pct_before"] == pytest.approx(12.0, abs=0.5)
+        assert out["bingo_was_latched"] is True
+        assert out["bingo_tripped"] is False and fm.bingo.tripped is False
+        assert out["relatch_expected"] is False
+        assert out["operator_override"] is True
+        # the line is a number, and it is the same line telemetry publishes
+        line = out["bingo_fuel_pct"]
+        assert isinstance(line, float) and line >= 20.0, out
+        tele = await tool(server, "uav_get_telemetry")(vehicle="Drone1")
+        assert line == pytest.approx(tele["bingo_fuel_pct"], abs=1.0)
+        assert "priced now" in out["bingo_fuel_pct_basis"]
+        assert out["margin_pct"] == pytest.approx(100.0 - line, abs=0.01)
+        # the forced RTB is named and NOT cancelled
+        assert out["safety_task_in_flight"]["task_id"] == rtb_id
+        assert "NOT" in out["note"] and "cancelled" in out["note"]
+        assert q.current is not None and q.current.id == rtb_id
+        # how the last mission ended is a record; the override leaves it alone
+        assert out["mission_status"] == MISSION_INCOMPLETE_FUEL
+        assert server.mission_flags["Drone1"] == MISSION_INCOMPLETE_FUEL
+
+        audit = [r for r in server.store.audit.read_all() if r["kind"] == "fuel_reset"]
+        assert len(audit) == 1
+        row = audit[0]
+        assert row["vehicle"] == "Drone1" and row["operator_override"] is True
+        assert row["fuel_pct"] == pytest.approx(100.0)
+        assert row["bingo_before"]["tripped"] is True
+        assert row["bingo_fuel_pct"] == line
+        assert row["safety_task_in_flight"] == rtb_id
+        # journaled, so a restart does not restore the empty, latched clock
+        persisted = server.store.fuel_state("Drone1")
+        assert persisted["fuel_pct"] == pytest.approx(100.0)
+        assert persisted["bingo_latched"] is False
+        assert persisted["reason"] == "operator_fuel_reset"
+    run(main())
+
+
+def test_sim_set_fuel_below_the_line_says_bingo_will_relatch(server):
+    """The override clears a latch; it does not suspend the rule."""
+    async def main():
+        await server.tick_once("Drone1")
+        out = await tool(server, "sim_set_fuel")(vehicle="Drone1", fuel_pct=5.0)
+        assert out.get("error") is None, out
+        assert out["bingo_fuel_pct"] is not None and out["bingo_fuel_pct"] > 5.0
+        assert out["relatch_expected"] is True
+        assert "re-latches" in out["note"]
+        v = await server.tick_once("Drone1")
+        assert v["bingo"]["latched"] is True
+    run(main())
+
+
+def test_sim_set_fuel_replays_an_idempotency_key_without_re_executing(server):
+    async def main():
+        first = await tool(server, "sim_set_fuel")(
+            vehicle="Drone1", fuel_pct=80.0, idempotency_key="refuel-1")
+        assert first["status"] == "accepted" and first["idempotency_key"] == "refuel-1"
+        fm = server.fuel_for("Drone1")
+        fm.fuel_pct = 55.0          # burn happens between the two calls
+        again = await tool(server, "sim_set_fuel")(
+            vehicle="Drone1", fuel_pct=80.0, idempotency_key="refuel-1")
+        assert again["status"] == "duplicate" and again["idempotent_replay"] is True
+        assert again["fuel_pct"] == first["fuel_pct"]
+        assert fm.fuel_pct == pytest.approx(55.0), "a replayed key re-executed"
+        resets = [r for r in server.store.audit.read_all() if r["kind"] == "fuel_reset"]
+        assert len(resets) == 1
+    run(main())
+
+
+def test_sim_set_fuel_refuses_an_unknown_vehicle_and_bad_fuel(server):
+    async def main():
+        fm = server.fuel_for("Drone1")
+        before = fm.fuel_pct
+        out = await tool(server, "sim_set_fuel")(vehicle="Drone9", fuel_pct=100.0)
+        assert out["error"]["code"] == "unknown_vehicle", out
+        assert "Drone9" not in server.monitors, "an unknown name minted a fuel clock"
+        for bad in (-1.0, 100.5, float("nan"), float("inf")):
+            out = await tool(server, "sim_set_fuel")(vehicle="Drone1", fuel_pct=bad)
+            assert out["error"]["code"] == "invalid_parameter", (bad, out)
+        out = await tool(server, "sim_set_fuel")(vehicle="  ", fuel_pct=100.0)
+        assert out["error"]["code"] == "missing_parameter"
+        assert fm.fuel_pct == before
+        assert not [r for r in server.store.audit.read_all() if r["kind"] == "fuel_reset"]
+        # an error is never recorded against a key, so a retry can still succeed
+        err = await tool(server, "sim_set_fuel")(
+            vehicle="Drone9", fuel_pct=100.0, idempotency_key="k")
+        assert "error" in err
+    run(main())
+
+
+def test_sim_set_fuel_survives_a_restart(tmp_path):
+    """The port reset memory only: a restart restored the latched, empty clock
+    from fuel.jsonl and the vehicle was grounded again."""
+    _seed_fuel_row(tmp_path, fuel_pct=12.0, bingo_latched=True)
+    with _restart_server(tmp_path) as srv:
+        assert srv.fuel_for("Drone1").bingo.tripped is True
+        out = run(tool(srv, "sim_set_fuel")(vehicle="Drone1", fuel_pct=100.0))
+        assert out.get("error") is None, out
+        assert out["bingo_tripped"] is False
+    with _restart_server(tmp_path) as srv2:
+        fm = srv2.fuel_for("Drone1")
+        assert fm.fuel_pct == pytest.approx(100.0)
+        assert fm.bingo.tripped is False
+
+
+# ---------------------------------------------------------------------------
+# review-finding regressions (mission defaults, refuel cancel-safety, INTREP)
+# ---------------------------------------------------------------------------
+
+_DISCRETE_TOOL = {"grid_search": "mission_grid_search", "recon_route": "mission_recon_route",
+                  "track_target": "mission_track_target",
+                  "identify_target": "mission_identify_target",
+                  "threat_assessment": "mission_threat_assessment",
+                  "orbit_poi": "uav_orbit_poi"}
+
+
+def test_the_dispatcher_defaults_equal_each_discrete_tools_defaults(server):
+    """A dry run through `mission_dry_run`/`uav_mission` is shown to the
+    operator as the preview of a live call through the discrete tool, so the
+    two paths must fill an omitted parameter the same way (the orbit radius
+    once defaulted to 80 m on one and 150 m on the other)."""
+    from godseye_uav.server import MISSION_PARAM_DEFAULTS
+
+    assert GodseyeUavServer.MISSION_PARAM_DEFAULTS is MISSION_PARAM_DEFAULTS
+    for kind, name in _DISCRETE_TOOL.items():
+        props = schema_of(server, name)
+        for key, value in MISSION_PARAM_DEFAULTS[kind].items():
+            assert key in props, (kind, key)
+            assert props[key].get("default") == value, (kind, key, props[key].get("default"))
+
+
+def test_a_dispatched_orbit_and_uav_orbit_poi_plan_the_same_ring_by_default(server):
+    async def main():
+        via_dispatch = await tool(server, "mission_dry_run")(
+            vehicle="Drone1", kind="orbit_poi", params={"lat": 47.645, "lon": -122.14})
+        via_tool = await tool(server, "uav_orbit_poi")(
+            vehicle="Drone1", lat=47.645, lon=-122.14, dry_run=True)
+        return via_dispatch, via_tool
+    a, b = run(main())
+    assert a.get("error") is None and b.get("error") is None, (a, b)
+    assert a["est_time_s"] == b["est_time_s"]
+    assert len(a["waypoints"]) == len(b["waypoints"])
+    assert [(w["lat"], w["lon"]) for w in a["waypoints"]] == \
+        [(w["lat"], w["lon"]) for w in b["waypoints"]]
+
+
+def test_a_cancelled_sim_set_fuel_changes_nothing(server):
+    """The analyst runs sim_set_fuel in a task that is cancelled on session
+    close, host shutdown or a CLI cancel. Cancelled mid-call, the override took
+    effect in memory (latch cleared, fuel 100) with no audit and no journal
+    row. Now every await comes first: a cancel leaves the vehicle untouched."""
+    async def main():
+        fm = server.fuel_for("Drone1")
+        fm.fuel_pct = 3.0
+        await server.tick_once("Drone1")
+        assert fm.bingo.tripped is True
+        real_wind = server.backend.wind_ne
+
+        async def slow_wind():
+            await asyncio.sleep(1.0)
+            return await real_wind()
+
+        server.backend.wind_ne = slow_wind
+        task = asyncio.ensure_future(
+            server.mcp.call_tool("sim_set_fuel", {"vehicle": "Drone1", "fuel_pct": 100.0}))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        resets = [r for r in server.store.audit.read_all() if r["kind"] == "fuel_reset"]
+        cancelled = (fm.bingo.tripped, fm.fuel_pct, len(resets),
+                     server.store.fuel_state("Drone1")["bingo_latched"])
+        server.backend.wind_ne = real_wind
+        out = await tool(server, "sim_set_fuel")(vehicle="Drone1", fuel_pct=100.0)
+        resets = [r for r in server.store.audit.read_all() if r["kind"] == "fuel_reset"]
+        return cancelled, out, len(resets)
+    cancelled, out, resets = run(main())
+    assert cancelled == (True, 3.0, 0, True)          # nothing half-applied
+    assert out["bingo_tripped"] is False and out["fuel_pct"] == 100.0
+    assert out["bingo_fuel_pct"] is not None and resets == 1
+
+
+def test_a_target_report_with_no_vehicle_invents_no_aircraft(server):
+    """`uav_target_report {}` (an auto-approved analyst READ) with no mission
+    defaulted the observer to "UAV" and read that name's camera; FakeAirSim
+    then minted a vehicle "UAV" that the roster, fleet and intel graph showed."""
+    async def main():
+        before = sorted(await server.backend.list_vehicles())
+        rep = await tool(server, "uav_target_report")()
+        explicit = await tool(server, "uav_target_report")(vehicle="NoSuchDrone")
+        after = sorted(await server.backend.list_vehicles())
+        return before, rep, explicit, after
+    before, rep, explicit, after = run(main())
+    assert rep.get("error") is None and explicit.get("error") is None, (rep, explicit)
+    assert after == before == ["Drone1"]
+    assert "sensor_conditions" in rep
+
+
+# ---------------------------------------------------------------------------
+# MCP auth metadata names the port the server is actually reached on
+# ---------------------------------------------------------------------------
+
+def test_mcp_auth_metadata_follows_the_served_address(tmp_path):
+    from godseye_uav import server as server_mod
+    from starlette.testclient import TestClient
+
+    with build_server(tmp_path) as srv:
+        assert srv.public_url == server_mod.LEGACY_MCP_BASE_URL   # nothing better known yet
+        seen = {}
+
+        async def fake_run(**kw):
+            app = srv.mcp.streamable_http_app(streamable_http_path="/mcp",
+                                              stateless_http=True)
+            seen["kw"], seen["app"] = kw, app
+
+        srv.mcp.run_streamable_http_async = fake_run
+        run(srv.serve(host="127.0.0.1", port=52123))      # legacy launch.py path
+        assert srv.public_url == "http://127.0.0.1:52123"
+        assert seen["kw"]["port"] == 52123
+        # no lifespan needed: the bearer check answers before any session
+        r = TestClient(seen["app"]).post(
+            "/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        assert r.status_code == 401
+        assert ('resource_metadata="http://127.0.0.1:52123/.well-known/'
+                'oauth-protected-resource"') in r.headers["www-authenticate"]
+
+    with build_server(tmp_path / "pinned", public_url="http://[::1]:52124/") as srv:
+        assert srv.public_url == "http://[::1]:52124"
+        srv.mcp.run_streamable_http_async = lambda **kw: asyncio.sleep(0)
+        run(srv.serve(host="127.0.0.1", port=52125))       # an explicit URL is kept
+        assert srv.public_url == "http://[::1]:52124"
+        srv.advertise_at("http://127.0.0.1:52126")
+        assert srv.public_url == "http://127.0.0.1:52126"
+
+
+@pytest.mark.parametrize("host,port,want", [
+    ("127.0.0.1", 8791, "http://127.0.0.1:8791"),
+    ("0.0.0.0", 52100, "http://127.0.0.1:52100"),
+    ("::", 52100, "http://127.0.0.1:52100"),
+    ("::1", 52100, "http://[::1]:52100"),
+    ("localhost", 52100, "http://localhost:52100"),
+])
+def test_http_base_is_a_dialable_url(host, port, want):
+    from godseye_uav import server as server_mod
+
+    assert server_mod._http_base(host, port) == want

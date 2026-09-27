@@ -233,12 +233,41 @@ GEOFENCE = {"geofence": [[47.636, -122.145], [47.636, -122.135],
                         "ao": [[47.636, -122.145], [47.636, -122.135],
                                [47.647, -122.135], [47.647, -122.145]]}}
 
-THREATREP = {"format": "THREATREP", "count": 1, "highest_threat": "high",
-             "assessments": [{"track_id": "TRK-ABC-0003", "threat_level": "high",
-                              "envelope_m": 24000.0,
-                              "assessment": {"capability": {
-                                  "envelope_m": 24000.0,
-                                  "acquisition_range_m": 60000.0}}}]}
+# The SUMMARY THREATREP `uav_assess_threat` really returns (threat.assess_area,
+# detail="summary", top_n=10): expanded rows carry the flat score components
+# and `envelope_m` but NOT the nested `assessment` block (so no acquisition
+# range - the bridge takes that from the track's SALUTE equipment row), and
+# contacts past top_n arrive as compact `omitted` rows. This fixture used to be
+# the FULL nested shape, which the server no longer sends by default and which
+# hid both live defects (29 of 39 contacts unassessed, no acquisition rings).
+# tests/test_intel_graph.py pins these key sets to the real assess_area output.
+THREATREP = {
+    "format": "THREATREP", "count": 1, "scoped_by_polygon": True,
+    "scoping_error": None,
+    "area_polygon": [[47.636, -122.145], [47.636, -122.135],
+                     [47.647, -122.135], [47.647, -122.145]],
+    "tracks_out_of_area": 0,
+    "highest_threat": "high", "highest_threat_track": "TRK-ABC-0003",
+    "assessments": [{
+        "format": "THREAT_ASSESSMENT", "track_id": "TRK-ABC-0003",
+        "category": "sam", "ob_class": "sam_medium_range",
+        "ob_name": "medium-range SAM battery (SA-6/2K12 class)",
+        "threat_score": 0.52, "threat_level": "high", "capability": 0.95,
+        "capability_weight": 0.95, "envelope_factor": 1.0, "intent": 0.55,
+        "confidence_level": "probable", "confidence_score": 0.444,
+        "in_envelope": True, "envelope_m": 24000.0, "envelope_asserted": True,
+        "observer_range_m": 180.0,
+        "rationale": "medium-range SAM battery [sam_medium_range] capability 0.95",
+        "sensor_posture": {"code": "increase_standoff",
+                           "advisory": "SENSOR POSTURE: open to at least 26400 m standoff",
+                           "standoff_m": 26400.0, "basis": "24000 m envelope",
+                           "scope": "sensor employment and aircraft self-protection only",
+                           "authority": "ISR-only"},
+        "recommendation": "SENSOR POSTURE: open to at least 26400 m standoff"}],
+    "detail": "summary", "detailed_count": 1, "omitted_count": 0, "omitted": [],
+    "truncation": None,
+    "detail_note": "summary: flat score components only.",
+    "isr_only": True, "authority": "ISR-only"}
 
 
 def full_mcp(**over):
@@ -1567,6 +1596,17 @@ class TestAlarmDerivation:
         assert got[0]["detail"]["lost_link_plan"]["behaviour"] == "rtb"
         assert got[1]["severity"] == "info"
 
+    def test_a_healthy_link_at_boot_is_not_announced_as_restored(self):
+        """The first poll of a vehicle whose link is up used to publish
+        `link_restored` ("datalink restored") for every aircraft at boot."""
+        mcp = full_mcp()
+        feed, hub = wired(mcp)
+        sub = hub.subscribe()
+        feed.poll_once()
+        feed.poll_once()
+        kinds = [a["kind"] for a in self._drain(hub, sub)]
+        assert "link_restored" not in kinds and "lost_link" not in kinds, kinds
+
     def test_lost_link_also_fires_from_the_pending_rtb_reason(self):
         mcp = full_mcp()
         feed, hub = wired(mcp)
@@ -2048,6 +2088,67 @@ class TestFailVisibly:
             veh = tc.get("/snapshot", headers=H).json()["vehicles"][0]
             assert veh["telemetry_error"] == "RuntimeError: rpc died"
             assert veh["stale_ms"] > 0, "a stale fix must announce its age"
+
+    def test_a_vehicle_link_loss_is_not_the_sim_host_going_down(self, sim):
+        """`sim_set_link_state lost` makes the sim ANSWER telemetry calls with
+        an error. That is one vehicle's datalink, not the sim host: the client
+        stays, `sim_state` stays up (the console's feed:sim must not read
+        "down"), and the vehicle row goes stale carrying the reason."""
+        adapter = AirSimAdapter(ip="127.0.0.1", port=PORT)
+        app = create_app(adapter=adapter, token=TOKEN, start_loops=False)
+        with TestClient(app) as tc:
+            state = app.state.bridge
+            assert state.tick_vehicle("Drone1") is not None
+            client = adapter._client
+            sim.set_link_state("Drone1", "lost")
+            try:
+                time.sleep(0.02)
+                assert state.tick_vehicle("Drone1") is None
+                assert adapter.sim_state == "up"
+                assert adapter._client is client, "a vehicle fault must not drop the client"
+                assert "datalink lost" in adapter.vehicle_errors["Drone1"]
+                body = tc.get("/snapshot", headers=H).json()
+                assert body["sim_state"] == "up"
+                veh = body["vehicles"][0]
+                assert "datalink lost" in veh["telemetry_error"]
+                assert veh["stale_ms"] > 0
+                assert tc.get("/health").json()["sim_state"] == "up"
+            finally:
+                sim.set_link_state("Drone1", "nominal")
+            assert state.tick_vehicle("Drone1") is not None
+            assert "Drone1" not in adapter.vehicle_errors and adapter.last_error is None
+
+    def test_an_unreachable_sim_host_still_reads_down(self):
+        adapter = AirSimAdapter(ip="127.0.0.1", port=_free_port(range(48031, 48040)))
+        assert adapter.snapshot("Drone1") is None      # nothing listens there
+        assert adapter.sim_state.startswith("down: TransportError"), adapter.sim_state
+        assert adapter.vehicle_errors == {}
+
+    def test_only_an_answered_rpc_error_counts_as_the_sim_being_up(self):
+        from msgpackrpc.error import RPCError, TimeoutError, TransportError
+
+        assert bridge_mod.sim_answered(RPCError("datalink lost: no telemetry from Drone1"))
+        assert not bridge_mod.sim_answered(TransportError("Retry connection over the limit"))
+        assert not bridge_mod.sim_answered(TimeoutError("Request timed out"))
+        assert not bridge_mod.sim_answered(RPCError("Request timed out"))  # on_timeout's form
+        assert not bridge_mod.sim_answered(RPCError(""))
+        assert not bridge_mod.sim_answered(OSError("connection reset"))
+
+    def test_a_transport_failure_mid_snapshot_still_drops_the_client(self, sim):
+        from msgpackrpc.error import TransportError
+
+        adapter = AirSimAdapter(ip="127.0.0.1", port=PORT)
+        assert adapter.snapshot("Drone1") is not None
+
+        class Dead:
+            def getMultirotorState(self, vehicle_name=""):
+                raise TransportError("Retry connection over the limit")
+
+        adapter._client = Dead()
+        assert adapter.snapshot("Drone1") is None
+        assert adapter._client is None
+        assert adapter.sim_state.startswith("down: TransportError")
+        assert adapter.vehicle_errors == {}
 
     def test_loop_c_failure_keeps_the_last_picture_and_says_so(self):
         mcp = full_mcp()

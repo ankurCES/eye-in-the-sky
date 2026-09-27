@@ -19,6 +19,7 @@ export function createApplicationTools({
   loadingScreen,
   placeSearch,
   voice = {},
+  firstRun = true,
   startChrome,
   onSceneDirector,
   sceneDataPacks,
@@ -26,7 +27,8 @@ export function createApplicationTools({
   defer,
 }) {
   const { viewer, tileset, mapStackController, operations } = scene;
-  const { styleManager, weatherEffects, cockpitCloudEffects } = controls;
+  const { styleManager, weatherEffects, cockpitCloudEffects, trackingPort } =
+    controls;
   const { dataManager } = data;
   const sceneDirector = new SceneDirector(viewer, styleManager, dataManager, {
     dataPacks: sceneDataPacks,
@@ -54,7 +56,17 @@ export function createApplicationTools({
   const drawTool = initDrawTool({ viewer, annotations });
   defer(() => drawTool?.destroy());
   if (startChrome)
-    defer(startChrome({ loadingScreen, styleManager, dataManager, signal }));
+    defer(
+      startChrome({
+        loadingScreen,
+        styleManager,
+        dataManager,
+        signal,
+        // The intelligence console owns the landing view: the first-run
+        // launcher would open behind it and take keyboard focus from it.
+        ...(firstRun ? {} : { initializeWelcome: null }),
+      }),
+    );
   // Idle render governor: flips the scene into requestRenderMode whenever
   // nothing animates per frame. Installed AFTER every module above has had
   // its chance to register pre-install holds. (perf wave 2)
@@ -78,8 +90,13 @@ export function createApplicationTools({
   // nobody, and browser rAF throttling still lets throttled frames burn
   // GPU. Holder/data state is untouched, so return is seamless: restore
   // the loop, refresh the one DOM surface we gated, render a frame.
+  //
+  // The console's orb hides the map (trackingPort.setMapVisible(false)), and a
+  // hidden map is suspended exactly like a hidden tab. This is the ONE writer
+  // of useDefaultRenderLoop: the port calls it on every visibility change, so
+  // a tab switch while the orb is up cannot restart the loop behind it.
   const syncVisibilitySuspension = () => {
-    const hidden = document.hidden;
+    const hidden = document.hidden || trackingPort?.isMapHidden?.() === true;
     viewer.useDefaultRenderLoop = !hidden;
     cockpitCloudEffects?.setSuspended?.(hidden);
     if (!hidden) {
@@ -88,9 +105,11 @@ export function createApplicationTools({
     }
   };
   document.addEventListener('visibilitychange', syncVisibilitySuspension);
-  defer(() =>
-    document.removeEventListener('visibilitychange', syncVisibilitySuspension),
-  );
+  trackingPort?.setRenderSync?.(syncVisibilitySuspension);
+  defer(() => {
+    document.removeEventListener('visibilitychange', syncVisibilitySuspension);
+    trackingPort?.setRenderSync?.(null);
+  });
   defer(() => {
     removeTrackingListener();
     releaseContinuousRender('tracked-entity');
@@ -113,6 +132,8 @@ export function createApplicationTools({
     getRenderGovernorDiagnostics,
     surfaceServices: operations.surface,
     requestRender: governorRequestRender,
+    uavMissionPanel: controls.uavMissionPanel,
+    trackingPort,
   };
   const debug = window.__godsEyeView;
   defer(() => {
@@ -137,5 +158,8 @@ export function createApplicationTools({
       delete window.__gevVoiceCommands;
   });
   debug.voiceCommands = voiceCommands;
+  // Every phase has run: the tracking port becomes ready and the one-time UAV
+  // start (layer on, camera to the lead drone's theater) begins.
+  controls.attachData?.(dataManager);
   return { sceneDirector, annotations, voiceCommands };
 }

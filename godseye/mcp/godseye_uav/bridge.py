@@ -153,6 +153,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import math
 import os
@@ -164,6 +165,7 @@ import urllib.request
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -546,6 +548,22 @@ class EventHub:
         with self._lock:
             return list(self._history)[-limit:]
 
+    def recent_numbered(self, limit: int = 20) -> list[tuple[int, dict]]:
+        """`recent`, with each payload's 1-based publish sequence number.
+
+        The history and the publish counter are read under ONE lock hold, so
+        the numbers are stable across calls: the Nth alarm this hub ever
+        published is always `N`, which is what lets a reader (the intel graph's
+        `alarm:{seq}` ids) name an alarm without inventing an id for it.
+        """
+        if limit <= 0:
+            return []
+        with self._lock:
+            history = list(self._history)
+            last = self.published
+        first = last - len(history) + 1
+        return [(first + i, payload) for i, payload in enumerate(history)][-limit:]
+
 
 # ---------------------------------------------------------------------------
 # vehicle telemetry
@@ -691,6 +709,27 @@ class VehicleSnapshot:
         self.alt_agl_launch_datum_mismatch_m = mismatch_m
 
 
+def sim_answered(exc: BaseException) -> bool:
+    """Did the sim host ANSWER this call, with an error for it?
+
+    msgpack-rpc raises its base ``RPCError`` for an error the server sent back
+    (a vehicle whose datalink the sim reports lost, a vehicle name it does not
+    know) and the subclasses ``TransportError`` / ``TimeoutError`` for a host
+    that did not answer. Its per-request timeout arrives as a base
+    ``RPCError("Request timed out")``, so that text is transport too. Anything
+    that is not an ``RPCError`` (``OSError``, a tornado stream error) is
+    transport as well: only a reply proves the host is up.
+    """
+    try:
+        from msgpackrpc.error import RPCError
+    except ImportError:  # pragma: no cover - msgpack-rpc ships with airsim
+        return False
+    if type(exc) is not RPCError:
+        return False
+    text = str(exc)
+    return bool(text) and "timed out" not in text.lower()
+
+
 def _attitude_from_quat(q) -> tuple[float, float]:
     """AirSim orientation quaternion -> (pitch_deg, roll_deg). Identity-safe."""
     try:
@@ -759,6 +798,10 @@ class AirSimAdapter:
         #: last snapshot failure, kept so the bridge can report it instead of
         #: returning None into a void (BRIDGE_CONTRACT rule 3).
         self.last_error: str | None = None
+        #: vehicle -> the error the sim ANSWERED its telemetry call with (e.g.
+        #: "datalink lost"). A per-vehicle fault: the sim host is up, so it
+        #: never reaches `sim_state`. Cleared by the vehicle's next good sample.
+        self.vehicle_errors: dict[str, str] = {}
         #: set when the vehicle roster is an assumption rather than a reading.
         self.vehicles_fallback: str | None = None
         #: last camera failure, so a 503 can say WHY the PIP is dark.
@@ -870,6 +913,7 @@ class AirSimAdapter:
             # reading) and the number itself is only the FALLBACK now:
             # `BridgeState.enrich` replaces it with the server's measured AGL.
             launch_datum_agl = -ned.z
+            self.vehicle_errors.pop(name, None)
             return VehicleSnapshot(
                 name=name,
                 latitude=gp.latitude,
@@ -894,10 +938,21 @@ class AirSimAdapter:
                 datum_source=fix.source,
             )
         except Exception as e:
-            # NOT silence. The error is kept, surfaces in `sim_state`, in
-            # `/health` and on the stale vehicle row (BRIDGE_CONTRACT rule 3).
-            self._client_err = f"{type(e).__name__}: {e}"
-            self.last_error = self._client_err
+            # NOT silence. The error is kept, surfaces in `/health` and on the
+            # stale vehicle row (BRIDGE_CONTRACT rule 3).
+            msg = f"{type(e).__name__}: {e}"
+            self.last_error = msg
+            if sim_answered(e):
+                # The sim host answered, with an error for THIS vehicle: a
+                # datalink the sim reports lost (`sim_set_link_state`), or a
+                # name it does not know. That is the vehicle's fault, not the
+                # sim's. The client is healthy and stays, and `sim_state` stays
+                # up: dropping the client here made one drone's simulated link
+                # loss read as "sim host not responding" everywhere (and
+                # reconnected at 10 Hz for as long as the link was down).
+                self.vehicle_errors[name] = msg
+                return None
+            self._client_err = msg
             self._client = None
             return None
 
@@ -1250,6 +1305,13 @@ class MissionFeed:
         self._geofence_error: str | None = None
         self._geofence_ms = 0
         self._detail_missing: set[str] = set()
+        #: The raw `uav_list_tracks` rows (full SALUTE) behind the last
+        #: `contacts[]`. `/snapshot` publishes only the compact contact row;
+        #: the intel graph needs the rest (ob_class, equipment, sightings,
+        #: first_seen, size.members). Replaced wholesale under `_lock`, and
+        #: emptied with `contacts[]` when the tool fails, so the two never
+        #: disagree about what the store holds.
+        self._track_rows: list[dict] = []
         #: mission_id -> vehicle, so a mission survives its flying task long
         #: enough for the operator to read how it ended (MISSION_RETAIN_S).
         self._seen_missions: dict[str, str] = {}
@@ -1270,6 +1332,34 @@ class MissionFeed:
     def overlay(self) -> dict:
         with self._lock:
             return self._overlay
+
+    # Locked, copying accessors for the private caches below (CONTRACT §6).
+    # Loop C writes `_mission_detail` / `_threat_rings` / `_track_rows` /
+    # `_geofence` under `_lock`, so a reader on another thread (the intel
+    # graph, a route handler) gets a consistent copy instead of iterating a
+    # dict loop C is growing - "dictionary changed size during iteration".
+    # The copies are one level deep: loop C REPLACES the documents it caches,
+    # it never edits them in place, so the nested values are safe to share -
+    # and callers must treat them as read-only.
+    def mission_details(self) -> dict[str, dict]:
+        """mission_id -> the cached `uav://mission/{id}` `.mission` document."""
+        with self._lock:
+            return {k: dict(v) for k, v in self._mission_detail.items()}
+
+    def threat_rings(self) -> dict[str, dict]:
+        """track_id -> {engagement, acquisition} ring radii (metres or None)."""
+        with self._lock:
+            return {k: dict(v) for k, v in self._threat_rings.items()}
+
+    def geofence_doc(self) -> dict | None:
+        """The cached `uav://safety/geofence` document, or None if unread."""
+        with self._lock:
+            return copy.deepcopy(self._geofence) if self._geofence is not None else None
+
+    def track_rows(self) -> list[dict]:
+        """The raw `uav_list_tracks` rows behind the current `contacts[]`."""
+        with self._lock:
+            return list(self._track_rows)
 
     def active_theater(self) -> dict:
         """The theater the RUNNING MCP server is enforcing, or an honest unknown.
@@ -1646,6 +1736,7 @@ class MissionFeed:
                     detail={"margin_m": proximity}))
 
         if self._seen_link.get(name) != link_lost:
+            was_lost = self._seen_link.get(name) is True
             self._seen_link[name] = link_lost
             if link_lost:
                 link = tick.get("link") if isinstance(tick.get("link"), dict) else {}
@@ -1660,7 +1751,10 @@ class MissionFeed:
                     message=("link lost - lost-link plan "
                              f"{named or 'running'} executing"),
                     detail={"lost_link_plan": plan}))
-            else:
+            elif was_lost:
+                # Only a link that was seen LOST is restored. The first poll
+                # of a healthy vehicle used to announce "datalink restored"
+                # for every aircraft at every boot.
                 self._emit(Alarm(kind="link_restored", vehicle=name,
                                  mission_id=mission_id, message="datalink restored"))
 
@@ -1741,7 +1835,8 @@ class MissionFeed:
             self._detail_missing.add(mission_id)
             return {}
         self._detail_missing.discard(mission_id)
-        self._mission_detail[mission_id] = doc["mission"]
+        with self._lock:
+            self._mission_detail[mission_id] = doc["mission"]
         return doc["mission"]
 
     def _track_for(self, mission_id: str) -> str:
@@ -1754,12 +1849,18 @@ class MissionFeed:
     def _poll_contacts(self, now_ms: int) -> tuple[list[dict], FeedStatus]:
         out, err = self.mcp.call_tool("uav_list_tracks", {})
         if err or not isinstance(out, dict):
+            with self._lock:
+                self._track_rows = []
             return [], FeedStatus(False, err or "no payload", now_ms,
                                   "mcp:uav_list_tracks")
         rows = out.get("tracks")
         if not isinstance(rows, list):
+            with self._lock:
+                self._track_rows = []
             return [], FeedStatus(False, "uav_list_tracks returned no tracks[]",
                                   now_ms, "mcp:uav_list_tracks")
+        with self._lock:
+            self._track_rows = [r for r in rows if isinstance(r, dict)]
 
         ids = [str(r.get("track_id")) for r in rows if isinstance(r, dict)]
         key = "|".join(sorted(ids))
@@ -1768,7 +1869,7 @@ class MissionFeed:
         # an audit record and pulls telemetry on every call.
         if key != self._track_key:
             self._track_key = key
-            self._refresh_threat()
+            self._refresh_threat(rows)
             for tid in ids:
                 if tid and tid not in self._seen_tracks:
                     self._seen_tracks.add(tid)
@@ -1788,18 +1889,48 @@ class MissionFeed:
             detail += "; threat_level unavailable (uav_assess_threat not served)"
         return contacts, FeedStatus(True, None, now_ms, detail)
 
-    def _refresh_threat(self) -> None:
+    def _refresh_threat(self, rows: list | None = None) -> None:
+        """Re-run the area threat assessment and fold it onto the contacts.
+
+        `uav_assess_threat` (no track_id) answers with the SUMMARY THREATREP
+        (`threat.assess_area`, detail="summary", top_n=10): the top 10 contacts
+        expanded in `assessments`, every other assessed contact as a compact
+        row in `omitted` ({track_id, category, ob_class, threat_level,
+        threat_score, confidence_level, in_envelope}). Reading `assessments`
+        alone left all but ten contacts at `threat_level: None` on a live store
+        of 39 - a contact the server HAD assessed reading as "not assessed".
+        Both lists are folded now. A contact in neither (outside the assessed
+        area) still has no level, which is the truth.
+
+        Rings stay with the expanded rows, which carry the flat `envelope_m`.
+        The summary shape drops the nested `assessment.capability` block the
+        acquisition range used to come from, so live acquisition rings were
+        never drawn; the same OB-library figure travels on the track's own
+        SALUTE row (`equipment.acquisition_range_m` - the value
+        `threat.assess_capability` cites), so that is the fallback.
+        """
         names = list(self._vehicles())
         if not names:
-            self._threat = {}
+            with self._lock:
+                self._threat = {}
             return
         out, err = self.mcp.call_tool("uav_assess_threat", {"vehicle": names[0]})
         if err or not isinstance(out, dict):
             # Not fatal and not faked: contacts keep flowing with
             # threat_level=None and `/snapshot.feeds` says the tool is absent.
-            self._threat = {}
+            with self._lock:
+                self._threat = {}
             return
+        acq_by_track: dict[str, float] = {}
+        for r in rows or []:
+            if not isinstance(r, dict) or not r.get("track_id"):
+                continue
+            equip = r.get("equipment") if isinstance(r.get("equipment"), dict) else {}
+            acq = _f(equip.get("acquisition_range_m"))
+            if acq is not None:
+                acq_by_track[str(r["track_id"])] = acq
         levels: dict[str, str] = {}
+        rings: dict[str, dict] = {}
         for a in out.get("assessments") or []:
             if not isinstance(a, dict) or not a.get("track_id"):
                 continue
@@ -1812,11 +1943,20 @@ class MissionFeed:
             if isinstance(cap, dict):
                 envelope = _f(cap.get("envelope_m")) if envelope is None else envelope
                 acquisition = _f(cap.get("acquisition_range_m"))
+            if acquisition is None:
+                acquisition = acq_by_track.get(tid)
             # An engagement ring and an acquisition ring are different facts
             # (M14 framing: this is sensor-posture advice, not targeting).
-            self._threat_rings[tid] = {"engagement": envelope,
-                                       "acquisition": acquisition}
-        self._threat = levels
+            rings[tid] = {"engagement": envelope, "acquisition": acquisition}
+        for a in out.get("omitted") or []:
+            if not isinstance(a, dict) or not a.get("track_id"):
+                continue
+            tid = str(a["track_id"])
+            if tid not in levels and a.get("threat_level"):
+                levels[tid] = str(a["threat_level"])
+        with self._lock:
+            self._threat_rings.update(rings)
+            self._threat = levels
 
     def _contact(self, row: dict) -> dict | None:
         tid = str(row.get("track_id") or "")
@@ -2622,8 +2762,7 @@ def create_app(adapter: AirSimAdapter | None = None, token: str = "dev-token",
                                  "polls": getattr(state.feed, "polls", 0),
                                  **state.feed.intel().feeds_dict()}}
 
-    @app.get("/snapshot")
-    def snapshot(_: bool = Depends(auth)):
+    def snapshot_body() -> dict:
         # Pure cache read. No MCP call, no camera pull, no geoid lookup - a
         # slow feed can never stall the poll (BRIDGE_CONTRACT rule 4).
         snaps = state.all_snapshots()
@@ -2640,6 +2779,10 @@ def create_app(adapter: AirSimAdapter | None = None, token: str = "dev-token",
             "contacts": intel.contacts,
             "feeds": intel.feeds_dict(),
         }
+
+    @app.get("/snapshot")
+    def snapshot(_: bool = Depends(auth)):
+        return snapshot_body()
 
     @app.get("/snapshot/{name}")
     def snapshot_one(name: str, _: bool = Depends(auth)):
@@ -2789,4 +2932,61 @@ def create_app(adapter: AirSimAdapter | None = None, token: str = "dev-token",
                 503, f"camera unavailable: {adapter.camera_error or 'no frame'}")
         return Response(content=png, media_type="image/png")
 
+    app.state.godseye = _godseye_context(
+        state=state, hub=hub, feed=feed, mcp=mcp, adapter=adapter,
+        active_theater=active_theater, token=token, snapshot=snapshot_body)
     return app
+
+
+def _feed_call(state: BridgeState, name: str, default: Any) -> Any:
+    """Call an optional accessor on the CURRENT feed, or return `default`.
+
+    `state.feed` is swappable and may be any MissionFeed-shaped object (see
+    `create_app`'s `state_source`), which need not have the §6 accessors. An
+    absent or failing accessor is an honest empty answer, never a crash in an
+    in-process reader.
+    """
+    getter = getattr(state.feed, name, None)
+    if not callable(getter):
+        return default
+    try:
+        return getter()
+    except Exception:  # noqa: BLE001 - foreign state source; degrade to empty
+        return default
+
+
+def _godseye_context(*, state: BridgeState, hub: EventHub, feed, mcp: McpClient,
+                     adapter: AirSimAdapter, active_theater: Callable[[], dict],
+                     token: str, snapshot: Callable[[], dict]) -> SimpleNamespace:
+    """`app.state.godseye`: the in-process handle for readers OUTSIDE create_app.
+
+    CONTRACT §6. The single-process host builds its own routers (intel, chat)
+    from outside `create_app` - new routes inside it would break the pinned
+    route sets - and those readers need the bridge's caches without an HTTP
+    round trip to themselves. Everything here is a READ of state loop A/C
+    already hold; nothing on this namespace commands anything.
+
+    The callables read `state.feed` at CALL time, not the `feed` captured here:
+    the feed is swappable, and a reader that captured the original would keep
+    reading a feed nobody fills (the same reason the routes above do so).
+    `token` is here so a host can build its auth dependencies from the one
+    token this app checks; it is never serialized into any response.
+    """
+    def recent_events(limit: int = 50) -> list[dict]:
+        return [{**payload, "seq": seq}
+                for seq, payload in hub.recent_numbered(max(0, min(int(limit), 100)))]
+
+    return SimpleNamespace(
+        state=state, hub=hub, feed=feed, mcp=mcp, adapter=adapter,
+        active_theater=active_theater, token=token,
+        snapshot=snapshot,
+        theaters=lambda: theaters.as_payload(active=active_theater()),
+        sim_state=lambda: adapter.sim_state,
+        current_feed=lambda: state.feed,
+        intel=lambda: state.feed.intel(),
+        track_rows=lambda: _feed_call(state, "track_rows", []),
+        mission_details=lambda: _feed_call(state, "mission_details", {}),
+        threat_rings=lambda: _feed_call(state, "threat_rings", {}),
+        geofence_doc=lambda: _feed_call(state, "geofence_doc", None),
+        recent_events=recent_events,
+    )

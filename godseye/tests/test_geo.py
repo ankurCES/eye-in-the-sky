@@ -400,3 +400,46 @@ class TestCoarseApproximationErrorBound:
         for name, lat, lon, expected in theaters:
             err = abs(geo._coarse_undulation(lat, lon) - expected)
             assert err > 10.0, f"{name}: fallback error {err:.1f} m"
+
+
+def test_grid_lookups_on_threads_do_not_crash_forked_children():
+    """Per-thread transformers made every fork-path child segfault (-11).
+
+    Runs in a fresh interpreter so the parent test process is never at risk:
+    three threadpool-style lookups, then a fork-path subprocess and an asyncio
+    one (how the analyst spawns the Claude CLI). Both must exit 0.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent(
+        """
+        import asyncio, subprocess, sys, threading
+        from godseye_uav import geo
+        for i in range(3):
+            t = threading.Thread(target=geo._grid_undulation, args=(47.6 + i, -122.1))
+            t.start(); t.join()
+        rc = subprocess.run([sys.executable, "-c", "1"], preexec_fn=lambda: None).returncode
+        async def main():
+            p = await asyncio.create_subprocess_exec(sys.executable, "-c", "1")
+            return await p.wait()
+        print(rc, asyncio.run(main()))
+        """
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["0", "0"], out.stdout
+
+
+def test_grid_path_with_spaces_is_quoted(tmp_path, monkeypatch):
+    """PROJ splits +grids= on whitespace; the .app bundle path has spaces."""
+    import shutil
+
+    spaced = tmp_path / "Eye in the Sky.app" / "g.tif"
+    spaced.parent.mkdir()
+    shutil.copyfile(geo.GEOID_GRID_PATH, spaced)
+    monkeypatch.setattr(geo, "GEOID_GRID_PATH", str(spaced))
+    monkeypatch.setattr(geo, "_vgridshift", None)
+    assert abs(geo._grid_undulation(0.0, 0.0) - 17.16) < 0.5

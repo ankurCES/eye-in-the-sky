@@ -1,0 +1,1373 @@
+/*
+ * Analyst chat (UX spec §6): transcript, tool rows, chips, the order slip,
+ * composer. Imported at the top of ../console.css, which owns the tokens.
+ *
+ * Rules (§11.2): no @layer; every selector is scoped with :where(.ic-root) so
+ * it never leaks into GEV and costs no specificity; components are flat
+ * single ic- classes (0,1,0); state lives in attributes, ceiling (0,2,0);
+ * markdown uses :where() for its descendants; no backdrop-filter; no
+ * !important. Fallback values keep the partial readable if a token is absent.
+ *
+ * Order: components (alphabetical), states, container queries,
+ * prefers-reduced-motion, prefers-contrast, forced-colors.
+ */
+
+/* ---- components ------------------------------------------------------------ */
+
+:where(.ic-root) .ic-approvalbar {
+  display: flex;
+  align-items: center;
+  gap: var(--ic-s-4, 12px);
+  margin: 0 var(--ic-s-5, 16px);
+  padding: var(--ic-s-3, 8px) var(--ic-s-4, 12px);
+  border-left: 4px solid var(--ic-film, #e6ecef);
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-raised, #2a3945);
+  font: var(--ic-type-small);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-approvalbar__text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+:where(.ic-root) .ic-approvalbar__review[type='button'] {
+  min-height: var(--ic-target, 32px);
+  padding: 0 var(--ic-s-4, 12px);
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-film, #e6ecef);
+  color: var(--ic-ink, #12202a);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-assumed {
+  text-decoration: underline dotted var(--ic-pencil, #a3b0ba);
+  text-decoration-thickness: var(--ic-underline-w, 1px);
+  text-underline-offset: 3px;
+}
+
+:where(.ic-root) .ic-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--ic-analyst, #8cc8ff);
+  animation: ic-caret-blink 1s steps(1, end) infinite;
+}
+
+:where(.ic-root) .ic-chat {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  color: var(--ic-film, #e6ecef);
+  font: var(--ic-type-body);
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-chat__banner {
+  display: flex;
+  align-items: center;
+  gap: var(--ic-s-3, 8px);
+  margin: var(--ic-s-3, 8px) var(--ic-s-5, 16px) 0;
+  padding: var(--ic-s-2, 4px) var(--ic-s-4, 12px);
+  border-left: 3px solid var(--ic-pencil, #a3b0ba);
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-raised, #2a3945);
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-chat__column {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+:where(.ic-root) .ic-chat__cost {
+  flex: none;
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-caption);
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-chat__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ic-status-dot, var(--ic-pencil, #a3b0ba));
+}
+
+:where(.ic-root) .ic-chat__head {
+  position: relative;
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--ic-s-3, 8px);
+  min-height: var(--ic-header-h, 56px);
+  padding: 0 var(--ic-inset, 24px);
+  border-bottom: 1px solid var(--ic-hairline, rgba(230, 236, 239, 0.1));
+}
+
+/* One header line at every width: the model name gives way first. */
+:where(.ic-root) .ic-chat__model {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-chat__spacer {
+  flex: 1 1 0;
+}
+
+:where(.ic-root) .ic-chat__status {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  font: var(--ic-type-caption);
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-chat__title {
+  font: var(--ic-type-title);
+}
+
+:where(.ic-root) .ic-chip[type='button'] {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  min-height: 24px;
+  margin: 0 1px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: var(--ic-r-chip, 4px);
+  background: var(--ic-raised, #2a3945);
+  color: var(--ic-film, #e6ecef);
+  font: var(--ic-type-small);
+  vertical-align: baseline;
+  transition: border-color var(--ic-t-quick, 120ms) var(--ic-ease-out, ease);
+}
+
+:where(.ic-root) .ic-chip[type='button']::after {
+  /* A chip sits in running text at 24 px; its hit area reaches the target
+     size (32 px, 44 px narrow) without changing the line (spec §9). The
+     inset is from the padding box, 1 px inside the chip's border. */
+  content: '';
+  position: absolute;
+  inset: calc((22px - var(--ic-target, 32px)) / 2) -1px;
+}
+
+:where(.ic-root) .ic-chip:hover,
+:where(.ic-root) .ic-chip:focus-visible {
+  border-color: var(--ic-analyst, #8cc8ff);
+}
+
+:where(.ic-root) .ic-chip-pill {
+  display: inline-flex;
+  align-items: center;
+}
+
+:where(.ic-root) .ic-chip__glyph {
+  display: inline-flex;
+  flex: none;
+  width: 10px;
+  height: 10px;
+}
+
+:where(.ic-root) .ic-chip__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-chip__remove[type='button'] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--ic-target, 32px);
+  min-height: var(--ic-target, 32px);
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-icon.ic-chip__x {
+  font-size: 16px;
+}
+
+:where(.ic-root) .ic-composer {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ic-s-2, 4px);
+  padding: var(--ic-s-4, 12px) var(--ic-s-5, 16px) var(--ic-s-5, 16px);
+}
+
+:where(.ic-root) .ic-composer__about {
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-caption);
+}
+
+:where(.ic-root) .ic-composer__context {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ic-s-2, 4px);
+}
+
+:where(.ic-root) .ic-composer__counter {
+  align-self: flex-end;
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-caption);
+}
+
+:where(.ic-root) .ic-composer__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: max(40px, var(--ic-target, 32px));
+  max-height: calc(8 * 24px + 18px);
+  padding: 8px 12px;
+  border: 1px solid var(--ic-edge, #7a8b97);
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-slate, #1b2630);
+  color: var(--ic-film, #e6ecef);
+  font: var(--ic-type-body);
+  resize: none;
+  overflow-y: auto;
+}
+
+:where(.ic-root) .ic-composer__input::placeholder {
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-composer__notice {
+  color: var(--ic-film, #e6ecef);
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-composer__row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--ic-s-3, 8px);
+}
+
+:where(.ic-root) .ic-composer__send[type='button'] {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: max(40px, var(--ic-target, 32px));
+  height: max(40px, var(--ic-target, 32px));
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-film, #e6ecef);
+  color: var(--ic-ink, #12202a);
+}
+
+:where(.ic-root) .ic-composer__standing {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-caption);
+}
+
+:where(.ic-root) .ic-composer__revokes {
+  display: contents;
+}
+
+:where(.ic-root) .ic-directive {
+  max-width: var(--ic-measure, 68ch);
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-caption);
+}
+
+:where(.ic-root) .ic-divider {
+  display: flex;
+  align-items: center;
+  gap: var(--ic-s-3, 8px);
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-caption);
+}
+
+:where(.ic-root) .ic-divider::before,
+:where(.ic-root) .ic-divider::after {
+  content: '';
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--ic-hairline, rgba(230, 236, 239, 0.1));
+}
+
+:where(.ic-root) .ic-empty {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ic-s-4, 12px);
+  max-width: var(--ic-measure, 68ch);
+}
+
+:where(.ic-root) .ic-empty__heading {
+  font: var(--ic-type-body);
+}
+
+:where(.ic-root) .ic-empty__title {
+  margin-top: var(--ic-s-3, 8px);
+  font: var(--ic-type-body-strong);
+}
+
+:where(.ic-root) .ic-fold,
+:where(.ic-root) .ic-row {
+  border: 1px solid var(--ic-hairline, rgba(230, 236, 239, 0.1));
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-panel, #22303b);
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-fold__head[type='button'],
+:where(.ic-root) .ic-row__head[type='button'] {
+  display: flex;
+  align-items: center;
+  gap: var(--ic-s-3, 8px);
+  width: 100%;
+  min-height: var(--ic-target, 32px);
+  padding: 4px 8px;
+  text-align: left;
+}
+
+/* A tool row reads glyph, title, state, disclosure on its first line and
+   the request's segments on the line under the title: the column is too
+   narrow to squeeze segments between title and state (spec §6.3). */
+:where(.ic-root) .ic-row__head[type='button'] {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+
+:where(.ic-root) .ic-fold__rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ic-s-2, 4px);
+  padding: 0 var(--ic-s-3, 8px) var(--ic-s-3, 8px);
+}
+
+:where(.ic-root) .ic-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  max-width: var(--ic-measure, 68ch);
+  padding: var(--ic-s-2, 4px) 0 var(--ic-s-2, 4px) var(--ic-s-4, 12px);
+  border-left: 3px solid var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-line__hint {
+  flex-basis: 100%;
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-data);
+}
+
+:where(.ic-root) .ic-line__more {
+  flex-basis: 100%;
+}
+
+:where(.ic-root) .ic-log {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ic-s-5, 16px);
+  min-height: 0;
+  padding: var(--ic-s-5, 16px) var(--ic-inset, 24px);
+  overflow: hidden auto;
+  overscroll-behavior: contain;
+}
+
+:where(.ic-root) .ic-md {
+  max-width: var(--ic-measure, 68ch);
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root)
+  .ic-md
+  :where(p, ul, ol, pre, blockquote, .ic-md-table)
+  + :where(p, ul, ol, pre, blockquote, .ic-md-table, h1, h2, h3, h4) {
+  margin-top: var(--ic-s-3, 8px);
+}
+
+:where(.ic-root) .ic-md :where(h1, h2, h3, h4) {
+  margin-top: var(--ic-s-4, 12px);
+  font: var(--ic-type-body-strong);
+}
+
+:where(.ic-root) .ic-md :where(h1, h2) {
+  font: var(--ic-type-title);
+}
+
+:where(.ic-root) .ic-md :where(ul) {
+  padding-left: 1.25em;
+  list-style: disc;
+}
+
+:where(.ic-root) .ic-md :where(ol) {
+  padding-left: 1.5em;
+  list-style: decimal;
+}
+
+:where(.ic-root) .ic-md :where(code) {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--ic-raised, #2a3945);
+  font: var(--ic-type-data);
+}
+
+:where(.ic-root) .ic-md :where(pre) {
+  padding: var(--ic-s-3, 8px);
+  overflow-x: auto;
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-slate, #1b2630);
+}
+
+:where(.ic-root) .ic-md :where(pre code) {
+  padding: 0;
+  background: none;
+  white-space: pre;
+}
+
+:where(.ic-root) .ic-md :where(blockquote) {
+  padding-left: var(--ic-s-4, 12px);
+  border-left: 2px solid var(--ic-graticule, #3a4a56);
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-md :where(table) {
+  border-collapse: collapse;
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-md :where(th, td) {
+  padding: 2px var(--ic-s-3, 8px) 2px 0;
+  border-bottom: 1px solid var(--ic-graticule, #3a4a56);
+  text-align: left;
+  vertical-align: top;
+}
+
+:where(.ic-root) .ic-md :where([data-align='right']) {
+  text-align: right;
+}
+
+:where(.ic-root) .ic-md :where([data-align='center']) {
+  text-align: center;
+}
+
+:where(.ic-root) .ic-md :where(hr) {
+  border: 0;
+  border-top: 1px solid var(--ic-hairline, rgba(230, 236, 239, 0.1));
+}
+
+:where(.ic-root) .ic-md-table {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+:where(.ic-root) .ic-menu {
+  position: absolute;
+  top: calc(100% - 8px);
+  right: var(--ic-s-5, 16px);
+  z-index: var(--ic-z-popover, 10);
+  display: flex;
+  flex-direction: column;
+  min-width: 200px;
+  padding: var(--ic-s-2, 4px);
+  border-radius: var(--ic-r-popover, 10px);
+  background: var(--ic-raised, #2a3945);
+  box-shadow: var(--ic-shadow-e2);
+}
+
+:where(.ic-root) .ic-menu__item[type='button'] {
+  min-height: var(--ic-target, 32px);
+  padding: 0 var(--ic-s-4, 12px);
+  border-radius: var(--ic-r-control, 6px);
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-menu__item:hover {
+  background: var(--ic-panel, #22303b);
+}
+
+:where(.ic-root) .ic-mono {
+  font-family: var(--ic-font-mono);
+}
+
+:where(.ic-root) .ic-msg {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ic-s-2, 4px);
+}
+
+:where(.ic-root) .ic-msg__blocks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ic-s-3, 8px);
+}
+
+:where(.ic-root) .ic-msg__body {
+  font: var(--ic-msg-font, var(--ic-type-body));
+}
+
+:where(.ic-root) .ic-msg__context {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-caption);
+}
+
+:where(.ic-root) .ic-msg__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ic-analyst, #8cc8ff);
+}
+
+:where(.ic-root) .ic-msg__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--ic-s-3, 8px);
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-caption);
+}
+
+:where(.ic-root) .ic-msg__time {
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-msg__usage {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px var(--ic-s-4, 12px);
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-caption);
+}
+
+:where(.ic-root) .ic-noreading {
+  display: inline-block;
+  padding: 0 4px;
+  border: 1px dashed currentColor;
+  border-radius: 3px;
+}
+
+:where(.ic-root) .ic-prompt[type='button'] {
+  max-width: var(--ic-measure, 68ch);
+  min-height: var(--ic-target, 32px);
+  padding: 6px var(--ic-s-4, 12px);
+  border: 1px solid var(--ic-edge, #7a8b97);
+  border-radius: var(--ic-r-control, 6px);
+  font: var(--ic-type-small);
+  text-align: left;
+}
+
+:where(.ic-root) .ic-prompt:hover {
+  background: var(--ic-raised, #2a3945);
+}
+
+:where(.ic-root) .ic-prompts {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--ic-s-3, 8px);
+}
+
+:where(.ic-root) .ic-row__args {
+  max-height: calc(20 * 16px + 16px);
+  padding: var(--ic-s-3, 8px);
+  overflow: auto;
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-slate, #1b2630);
+  font: var(--ic-type-data-row);
+  white-space: pre;
+}
+
+:where(.ic-root) .ic-row__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ic-s-3, 8px);
+  padding: 0 var(--ic-s-3, 8px) var(--ic-s-3, 8px);
+}
+
+:where(.ic-root) .ic-icon.ic-row__chevron {
+  margin-left: 0;
+  color: var(--ic-pencil, #a3b0ba);
+  font-size: 18px;
+  transform: var(--ic-chevron, none);
+  transition: transform var(--ic-t-settle, 200ms) var(--ic-ease-out, ease);
+}
+
+:where(.ic-root) .ic-row__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+:where(.ic-root) .ic-icon.ic-row__glyph {
+  color: var(--ic-row-ink, var(--ic-pencil, #a3b0ba));
+  font-size: 18px;
+}
+
+:where(.ic-root) .ic-row__line {
+  padding: 0 var(--ic-s-3, 8px) var(--ic-s-2, 4px) 34px;
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-row__outcome:empty {
+  display: none;
+}
+
+:where(.ic-root) .ic-row__result,
+:where(.ic-root) .ic-row__summary {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0 var(--ic-s-4, 12px);
+  min-width: 0;
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-row__summary {
+  order: 10;
+  flex: 1 1 100%;
+  padding-left: 26px;
+}
+
+:where(.ic-root) .ic-row__summary:empty {
+  display: none;
+}
+
+:where(.ic-root) .ic-row__size {
+  font: var(--ic-type-data-row);
+}
+
+:where(.ic-root) .ic-row__state {
+  flex: none;
+  margin-left: 0;
+  color: var(--ic-pencil, #a3b0ba);
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-row__title {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-right: auto;
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-row__tool {
+  font: var(--ic-type-data-row);
+}
+
+:where(.ic-root) .ic-seg {
+  white-space: nowrap;
+}
+
+/* The order slip: night paper, the only light surface (spec §1, §6.5). */
+
+:where(.ic-root) .ic-slip {
+  --ic-slip-band: var(--ic-class-command-slip, #7e0f62);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ic-s-3, 8px);
+  /* The only element that breaks the transcript's text edge. */
+  margin: 0 calc(-1 * (var(--ic-inset, 24px) - var(--ic-s-5, 16px)));
+  padding: var(--ic-s-5, 16px) var(--ic-s-5, 16px) var(--ic-s-5, 16px) 22px;
+  border-radius: var(--ic-r-slip, 3px);
+  background: var(--ic-slip, #bcc3be);
+  box-shadow: var(--ic-shadow-slip);
+  color: var(--ic-ink, #12202a);
+  font: var(--ic-type-body);
+}
+
+/* Analyst- and server-written text can be one unbroken run (a 50 KB
+   consequence or arg): wrap it inside the slip instead of clipping it. */
+:where(.ic-root)
+  .ic-slip
+  :where(
+    .ic-slip__summary,
+    .ic-slip__list,
+    .ic-slip__failing,
+    .ic-slip__warnings,
+    .ic-slip__title,
+    .ic-slip__console,
+    td
+  ) {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-slip .ic-seg {
+  max-width: 100%;
+  white-space: normal;
+}
+
+:where(.ic-root) .ic-slip__ack,
+:where(.ic-root) .ic-slip__checkline {
+  display: flex;
+  align-items: center;
+  gap: var(--ic-s-3, 8px);
+  min-height: var(--ic-target, 32px);
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-slip__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ic-s-3, 8px);
+  margin-top: var(--ic-s-2, 4px);
+}
+
+:where(.ic-root) .ic-slip__approve[type='button'] {
+  position: relative;
+  margin-left: auto;
+  overflow: hidden;
+}
+
+:where(.ic-root) .ic-slip__approve::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  background: currentColor;
+  transform: scaleX(0);
+  transform-origin: left;
+}
+
+:where(.ic-root) .ic-slip__band {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--ic-band-w, 6px);
+  border-radius: var(--ic-r-slip, 3px) 0 0 var(--ic-r-slip, 3px);
+  background: var(--ic-slip-band);
+}
+
+:where(.ic-root) .ic-slip__btn[type='button'] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--ic-target, 32px);
+  padding: 0 var(--ic-s-5, 16px);
+  border: 1px solid var(--ic-ink, #12202a);
+  border-radius: var(--ic-r-control, 6px);
+  background: transparent;
+  color: var(--ic-ink, #12202a);
+  font: var(--ic-type-small);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-slip__caption,
+:where(.ic-root) .ic-slip__hint,
+:where(.ic-root) .ic-slip__policy {
+  color: var(--ic-ink-2, #2e3d48);
+  font: var(--ic-type-caption);
+}
+
+:where(.ic-root) .ic-slip__caveat,
+:where(.ic-root) .ic-slip__console {
+  font: var(--ic-type-small);
+  font-style: italic;
+}
+
+:where(.ic-root) .ic-slip__check {
+  /* Ink, not the system accent: on this console blue means the analyst. */
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--ic-ink, #12202a);
+}
+
+:where(.ic-root) .ic-slip__classline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px var(--ic-s-3, 8px);
+  color: var(--ic-slip-band);
+  font: var(--ic-type-caption);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-slip__conflict,
+:where(.ic-root) .ic-slip__stale {
+  padding: var(--ic-s-2, 4px) var(--ic-s-3, 8px);
+  border-left: 3px solid var(--ic-warn-slip, #6b4400);
+  background: rgba(107, 68, 0, 0.08);
+  color: var(--ic-warn-slip, #6b4400);
+  font: var(--ic-type-small);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-slip__blocked,
+:where(.ic-root) .ic-slip__error,
+:where(.ic-root) .ic-slip__failing {
+  color: var(--ic-critical-slip, #8f1a14);
+  font: var(--ic-type-small);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-slip__dryhead {
+  margin-left: var(--ic-s-3, 8px);
+  font: var(--ic-type-small);
+  font-weight: 400;
+}
+
+:where(.ic-root) .ic-slip__expiry {
+  margin-left: auto;
+  color: var(--ic-expiry-ink, var(--ic-ink-2, #2e3d48));
+  font-weight: var(--ic-expiry-weight, 600);
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-slip__extras {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ic-s-4, 12px);
+}
+
+:where(.ic-root) .ic-slip__filed {
+  display: flex;
+  align-items: center;
+  gap: var(--ic-s-3, 8px);
+}
+
+:where(.ic-root) .ic-icon.ic-slip__glyph {
+  font-size: 18px;
+}
+
+:where(.ic-root) .ic-slip__head {
+  margin-top: var(--ic-s-2, 4px);
+  font: var(--ic-type-small);
+  font-weight: 700;
+}
+
+:where(.ic-root) .ic-slip__link[type='button'] {
+  min-height: var(--ic-target, 32px);
+  color: var(--ic-slip-ink, var(--ic-ink, #12202a));
+  font: var(--ic-type-small);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+:where(.ic-root) .ic-slip__list,
+:where(.ic-root) .ic-slip__failing,
+:where(.ic-root) .ic-slip__warnings {
+  padding-left: 1.2em;
+  list-style: disc;
+}
+
+:where(.ic-root) .ic-slip__note {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--ic-ink-2, #2e3d48);
+  border-radius: var(--ic-r-control, 6px);
+  background: rgba(255, 255, 255, 0.35);
+  color: var(--ic-ink, #12202a);
+  font: var(--ic-type-small);
+  resize: vertical;
+}
+
+:where(.ic-root) .ic-slip__phrase {
+  color: var(--ic-ink, #12202a);
+}
+
+:where(.ic-root) .ic-slip__record {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: var(--ic-s-3, 8px);
+  min-width: 0;
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-slip__request {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ic-s-2, 4px);
+}
+
+:where(.ic-root) .ic-slip__args {
+  max-height: 240px;
+  padding: var(--ic-s-3, 8px);
+  overflow: auto;
+  border-radius: var(--ic-r-control, 6px);
+  background: rgba(18, 32, 42, 0.08);
+  font: var(--ic-type-data-row);
+  white-space: pre;
+}
+
+:where(.ic-root) .ic-slip__summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 var(--ic-s-4, 12px);
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-slip__table {
+  border-collapse: collapse;
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-slip__table :where(th, td) {
+  padding: 2px var(--ic-s-4, 12px) 2px 0;
+  border-bottom: 1px solid rgba(18, 32, 42, 0.18);
+  text-align: left;
+  vertical-align: top;
+}
+
+:where(.ic-root) .ic-slip__table :where(th) {
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-slip__title {
+  font: var(--ic-type-title);
+}
+
+:where(.ic-root) .ic-swatch {
+  display: flex;
+  align-items: center;
+  gap: var(--ic-s-3, 8px);
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-swatch__band {
+  width: 6px;
+  height: 20px;
+  border-radius: 2px;
+  background: var(--ic-row-ink, var(--ic-pencil, #a3b0ba));
+}
+
+:where(.ic-root) .ic-swatches {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ic-s-2, 4px);
+}
+
+/* Reading registers (§2.6), styled like the inspector's .ic-kit-reg: a 1 px
+   box in a quiet edge with caption ink, dotted only for Assumed; Measured is
+   plain text. Night-paper values; a filed (slate) slip swaps the tokens. */
+:where(.ic-root) .ic-tag {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 6px;
+  border: 1px solid var(--ic-tag-edge, rgba(18, 32, 42, 0.35));
+  border-radius: var(--ic-r-chip, 4px);
+  color: var(--ic-tag-ink, var(--ic-ink-2, #2e3d48));
+  font: var(--ic-type-caption);
+  font-style: normal;
+  white-space: nowrap;
+  vertical-align: baseline;
+}
+
+:where(.ic-root) .ic-tether {
+  position: absolute;
+  inset: 0;
+  z-index: var(--ic-z-tether, 5);
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+:where(.ic-root) .ic-thinking {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px var(--ic-s-3, 8px);
+  max-width: var(--ic-measure, 68ch);
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-small);
+  font-style: italic;
+}
+
+:where(.ic-root) .ic-thinking__text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-thinking__time {
+  flex: none;
+}
+
+:where(.ic-root) .ic-thinking__body {
+  flex-basis: 100%;
+  font-style: normal;
+}
+
+:where(.ic-root) .ic-thinking__toggle[type='button'] {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: var(--ic-target, 32px);
+  color: var(--ic-pencil, #a3b0ba);
+  font-style: normal;
+}
+
+:where(.ic-root) .ic-unavailable {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--ic-s-3, 8px);
+  margin: var(--ic-s-4, 12px) var(--ic-s-5, 16px) var(--ic-s-5, 16px);
+  padding: var(--ic-s-5, 16px);
+  border-radius: var(--ic-r-popover, 10px);
+  background: var(--ic-raised, #2a3945);
+}
+
+:where(.ic-root) .ic-unavailable__hint {
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-data);
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-unavailable__title {
+  font: var(--ic-type-body-strong);
+}
+
+/* ---- states ------------------------------------------------------------------ */
+
+:where(.ic-root) .ic-caret[data-steady='true'] {
+  animation: none;
+}
+
+:where(.ic-root) .ic-chat[data-status='thinking'],
+:where(.ic-root) .ic-chat[data-status='answering'],
+:where(.ic-root) .ic-chat[data-status='starting'] {
+  --ic-status-dot: var(--ic-analyst, #8cc8ff);
+}
+
+:where(.ic-root) .ic-chat[data-status='ready'] {
+  --ic-status-dot: var(--ic-ok, #5dd39b);
+}
+
+:where(.ic-root) .ic-chat[data-status='waiting-for-your-approval'] {
+  --ic-status-dot: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-chat[data-status='reconnecting'],
+:where(.ic-root) .ic-chat[data-status='close-to-the-usage-limit'],
+:where(.ic-root) .ic-chat[data-status='usage-limit-reached'],
+:where(.ic-root) .ic-chat[data-status='not-signed-in'],
+:where(.ic-root) .ic-chat[data-status='unavailable'] {
+  --ic-status-dot: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-chat__banner[data-tone='warn'] {
+  border-left-color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-chat__banner[data-tone='ok'] {
+  border-left-color: var(--ic-ok, #5dd39b);
+}
+
+:where(.ic-root) .ic-chip[data-missing='true'] {
+  border: 1px dashed var(--ic-pencil, #a3b0ba);
+  background: transparent;
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-composer__counter[data-over='true'],
+:where(.ic-root) .ic-line[data-tone='critical'] {
+  border-left-color: var(--ic-critical, #ff7b7b);
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-composer__notice[data-tone='warn'],
+:where(.ic-root) .ic-line[data-tone='warn'] {
+  border-left-color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-composer__send[aria-disabled='true'] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+:where(.ic-root) .ic-composer__send[data-mode='stop'] {
+  border: 1px solid var(--ic-film, #e6ecef);
+  background: transparent;
+  color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-fold__head[aria-expanded='true'],
+:where(.ic-root) .ic-row__head[aria-expanded='true'],
+:where(.ic-root) .ic-thinking__toggle[aria-expanded='true'] {
+  --ic-chevron: rotate(180deg);
+}
+
+:where(.ic-root) .ic-msg[data-role='you'] {
+  --ic-msg-font: var(--ic-type-body-strong);
+  padding-left: var(--ic-s-4, 12px);
+  border-left: 2px solid rgba(230, 236, 239, 0.4);
+}
+
+:where(.ic-root) .ic-msg[data-pending='true'] {
+  opacity: 0.8;
+}
+
+:where(.ic-root) .ic-row[data-class='sensor'],
+:where(.ic-root) .ic-swatch[data-class='sensor'] {
+  --ic-row-ink: var(--ic-class-sensor, #a4a9ff);
+}
+
+:where(.ic-root) .ic-row[data-class='command'],
+:where(.ic-root) .ic-swatch[data-class='command'] {
+  --ic-row-ink: var(--ic-class-command, #f27ad6);
+}
+
+:where(.ic-root) .ic-row[data-class='sim'],
+:where(.ic-root) .ic-swatch[data-class='sim'] {
+  --ic-row-ink: var(--ic-class-sim, #cdbc8c);
+}
+
+:where(.ic-root) .ic-row[data-class='safety_override'],
+:where(.ic-root) .ic-swatch[data-class='safety_override'] {
+  --ic-row-ink: var(--ic-class-override, #ff7b7b);
+}
+
+:where(.ic-root) .ic-row[data-state='rejected'],
+:where(.ic-root) .ic-row[data-state='not_run'],
+:where(.ic-root) .ic-row[data-state='no_result'] {
+  border-color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-row[data-state='failed'] {
+  border-color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-row__line[data-tone='warn'] {
+  color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-row__line[data-tone='critical'] {
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-slip[data-class='sensor'] {
+  --ic-slip-band: var(--ic-class-sensor-slip, #343899);
+}
+
+:where(.ic-root) .ic-slip[data-class='sim'] {
+  --ic-slip-band: var(--ic-class-sim-slip, #5a4812);
+}
+
+:where(.ic-root) .ic-slip[data-class='safety_override'] {
+  --ic-slip-band: var(--ic-class-override-slip, #8f1a14);
+  background-image: repeating-linear-gradient(
+    45deg,
+    var(--ic-class-override-slip, #8f1a14) 0 6px,
+    transparent 6px 12px
+  );
+  background-size: 100% 6px;
+  background-repeat: no-repeat;
+}
+
+:where(.ic-root) .ic-slip[data-urgent='true'] {
+  --ic-expiry-ink: var(--ic-warn-slip, #6b4400);
+  --ic-expiry-weight: 700;
+}
+
+:where(.ic-root) .ic-slip[data-state='filed'] {
+  --ic-band-w: 2px;
+  --ic-slip-ink: var(--ic-film, #e6ecef);
+  --ic-tag-ink: var(--ic-pencil, #a3b0ba);
+  --ic-tag-edge: var(--ic-graticule, #3a4a56);
+  --text-primary: #e6ecef;
+  margin: 0;
+  padding: var(--ic-s-3, 8px) var(--ic-s-4, 12px) var(--ic-s-3, 8px) 14px;
+  background: var(--ic-raised, #2a3945);
+  background-image: none;
+  box-shadow: none;
+  color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-slip__approve.is-primary {
+  border-color: var(--ic-ink, #12202a);
+  background: var(--ic-ink, #12202a);
+  color: var(--ic-slip, #bcc3be);
+}
+
+:where(.ic-root) .ic-slip__deny.is-primary {
+  border-color: var(--ic-ink, #12202a);
+  background: var(--ic-ink, #12202a);
+  color: var(--ic-slip, #bcc3be);
+}
+
+:where(.ic-root) .ic-slip__btn[aria-disabled='true'] {
+  cursor: not-allowed;
+}
+
+:where(.ic-root) .ic-slip__approve[aria-disabled='true'] {
+  opacity: 0.55;
+}
+
+/* Three buttons (a stale slip, or one without a dry run) keep one row at the
+   default column: [Deny] [Ask for a fresh dry run] [Approve anyway]. */
+:where(.ic-root .ic-slip__actions[data-count='3'])
+  .ic-slip__btn[type='button'] {
+  padding: 0 var(--ic-s-4, 12px);
+}
+
+:where(.ic-root) .ic-slip__approve[data-arming='a']::after {
+  animation: ic-arm-a var(--ic-t-arm, 800ms) linear forwards;
+}
+
+:where(.ic-root) .ic-slip__approve[data-arming='b']::after {
+  animation: ic-arm-b var(--ic-t-arm, 800ms) linear forwards;
+}
+
+:where(.ic-root) .ic-slip__dryhead[data-ok='false'] {
+  color: var(--ic-critical-slip, #8f1a14);
+  font-weight: 600;
+}
+
+/* While reasoning streams: one truncated line that never reflows the
+   transcript (spec §6.2); the elapsed time never wraps under it. */
+:where(.ic-root) .ic-thinking[data-open='true'] {
+  flex-wrap: nowrap;
+}
+
+:where(.ic-root) .ic-tag[data-register='assumed'] {
+  border-style: dotted;
+}
+
+:where(.ic-root) .ic-tag[data-register='measured'] {
+  padding: 0;
+  border-color: transparent;
+}
+
+/* ---- keyframes --------------------------------------------------------------- */
+
+@keyframes ic-arm-a {
+  to {
+    transform: scaleX(1);
+  }
+}
+
+@keyframes ic-arm-b {
+  to {
+    transform: scaleX(1);
+  }
+}
+
+@keyframes ic-caret-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* ---- narrow: slip buttons stack full width, Deny on top (spec §3c) ------------ */
+
+/* The narrow layout is a tab whose analyst column (~420 px) is wider than the
+   container breakpoint below, so the root's layout attribute decides there;
+   the container query still covers a narrow compact column. */
+:where(.ic-root[data-layout='narrow']) .ic-slip__actions {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+:where(.ic-root[data-layout='narrow']) .ic-slip__btn[type='button'] {
+  width: 100%;
+  min-height: 44px;
+}
+
+:where(.ic-root[data-layout='narrow']) .ic-slip__approve[type='button'] {
+  margin-left: 0;
+}
+
+/* ---- container queries: narrow analyst column (spec §3c) --------------------- */
+
+@container ic-analyst (max-width: 380px) {
+  :where(.ic-root) .ic-slip__actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  :where(.ic-root) .ic-slip__btn[type='button'] {
+    width: 100%;
+    min-height: 44px;
+  }
+
+  :where(.ic-root) .ic-slip__approve[type='button'] {
+    margin-left: 0;
+  }
+
+  :where(.ic-root) .ic-slip {
+    margin: 0;
+  }
+}
+
+/* ---- motion, contrast, forced colours ------------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  :where(.ic-root) .ic-caret {
+    animation: none;
+  }
+
+  :where(.ic-root) .ic-slip__approve[data-arming]::after {
+    animation: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :where(.ic-root) .ic-slip__caption,
+  :where(.ic-root) .ic-slip__hint,
+  :where(.ic-root) .ic-slip__policy {
+    color: var(--ic-ink, #12202a);
+  }
+
+  :where(.ic-root) .ic-chip[data-missing='true'] {
+    border-width: 2px;
+  }
+}
+
+@media (forced-colors: active) {
+  :where(.ic-root) .ic-slip__band,
+  :where(.ic-root) .ic-swatch__band {
+    background: CanvasText;
+    forced-color-adjust: none;
+  }
+
+  :where(.ic-root) .ic-slip__btn[type='button'],
+  :where(.ic-root) .ic-chip[type='button'],
+  :where(.ic-root) .ic-row,
+  :where(.ic-root) .ic-fold {
+    border: 1px solid ButtonText;
+  }
+
+  :where(.ic-root) .ic-slip__approve[aria-disabled='true'] {
+    color: GrayText;
+    border-color: GrayText;
+  }
+
+  :where(.ic-root) .ic-caret {
+    background: Highlight;
+  }
+
+  :where(.ic-root) .ic-slip__check {
+    accent-color: auto;
+  }
+}

@@ -207,3 +207,46 @@ test('panel bindings have a single owner and are inert after destruction', () =>
   assert.equal(collapsed, true);
   second.destroy();
 });
+
+test('Cockpit Escape exits even while a hidden utility popover holds an expanded nested panel', () => {
+  // Live E2E: the Parameters panel's collapse button sits inside the hidden
+  // DISPLAY popover with aria-expanded="true", and the old guard
+  // (`#cockpit-utility-controls [aria-expanded="true"]`) matched it, so Escape
+  // never left the cockpit. Only an OPEN disclosure may own Escape.
+  const keydown = cockpitKeyDown.toString();
+  assert.match(keydown, /#cockpit-utility-controls \[aria-expanded="true"\]:not\(\[hidden\] \*\)/);
+
+  const SELECTOR = '#cockpit-utility-controls [aria-expanded="true"]:not([hidden] *)';
+  const run = (controls) => {
+    const saved = globalThis.document;
+    globalThis.document = {
+      getElementById: () => null,
+      // Evaluate the one selector the handler asks for against a tiny model:
+      // expanded controls, some inside a [hidden] popover.
+      querySelector(selector) {
+        assert.equal(selector, SELECTOR);
+        return controls.find((c) => c.expanded && !c.insideHidden) || null;
+      },
+    };
+    let exited = 0;
+    let prevented = false;
+    const cockpit = { destroyed: false, active: true, context: null, signalStream: null, exit: () => { exited += 1; } };
+    try {
+      cockpitKeyDown.call(cockpit, {
+        key: 'Escape',
+        repeat: false,
+        isComposing: false,
+        target: { closest: () => null },
+        preventDefault: () => { prevented = true; },
+        stopImmediatePropagation: () => {},
+      });
+    } finally {
+      globalThis.document = saved;
+    }
+    return { exited, prevented };
+  };
+  // Parameters expanded inside the collapsed (hidden) DISPLAY popover: exit.
+  assert.deepEqual(run([{ id: 'param-panel-collapse-btn', expanded: true, insideHidden: true }]), { exited: 1, prevented: true });
+  // An open DISPLAY disclosure still owns the first Escape: no exit.
+  assert.deepEqual(run([{ id: 'cockpit-display-toggle-btn', expanded: true, insideHidden: false }]), { exited: 0, prevented: false });
+});

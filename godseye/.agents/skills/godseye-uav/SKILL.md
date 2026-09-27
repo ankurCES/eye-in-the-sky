@@ -204,6 +204,28 @@ as overlays, mission phase and progress in the HUD, contacts as numbered track m
 feed as a picture-in-picture, and alarms (BINGO, geofence proximity, lost link) as toasts. Announce
 mission phase transitions so the narration matches what they are watching.
 
+## 8. The in-app analyst
+
+The Eye in the Sky app has its own analyst in the console. It follows this same doctrine: its
+system prompt (`mcp/godseye_uav/analyst_prompt.md`) is distilled from this skill and its
+references, and it calls the same server tools, in-process rather than over `/mcp`. What differs:
+
+- **Approvals belong to the operator.** Reads and dry runs run at once. Every sensor, flight,
+  mission, sim or safety-override call waits for the operator to approve an order slip in the
+  console; only sensor tools can be allowed for a whole session. The analyst proposes, calls the
+  tool, and never says a command ran until its result says so. A denied or expired slip means the
+  call did not run.
+- It does not see `uav_list_tracks`, `sim_set_environment` or `uav_handoff_target` (use the intel
+  tools and `mission_handoff_track`), nor sim ground truth (`uav://targets`). It adds
+  `intel_overview`, `intel_search`, `intel_entity`, `read_intel_resource` and `ui_*` tools, and cites
+  entities as `[[type:id|label]]` chips.
+
+If you are an external harness connected to the app instead, the console's order slips do not
+gate your calls: the server's own gates still do, and the human who tasked you remains the command
+authority, so confirm with them before anything moves an aircraft. The app serves MCP at
+`http://127.0.0.1:8780/mcp` by default, with a per-launch token written to `<store>/../mcp.json`
+(mode 0600). The full contract is in `INTEL_CONSOLE.md`.
+
 ## References
 
 - `references/doctrine.md` — altitude/GSD tables, sensor selection detail, threat-ring geometry

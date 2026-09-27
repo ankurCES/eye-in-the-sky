@@ -27,7 +27,7 @@ import {
   fetchUavTheaters,
   normalizeContact,
 } from '../sources/live/uav.js';
-import { h, hasClass, setClass, setHidden } from './uavDom.js';
+import { h, hasClass, replaceKids, setClass, setHidden } from './uavDom.js';
 import {
   activeTheaterNote,
   createTheaterRegistry,
@@ -40,13 +40,35 @@ import { createUavMissionViews } from './uavMissionViews.js';
 
 export { THEATERS, SEED_POIS, OFFLINE_THEATERS } from './uavTheaters.js';
 
+/**
+ * Mission kinds the panel offers. The key is the selector value; `kind` is the
+ * wire name `uav_mission` dispatches on when it differs from the key.
+ *
+ * `track` used to go out as the kind "track" with the POI's lat/lon and no
+ * track id. The server's dispatch table has no such kind, so every Track
+ * launch came back `unknown_mission_kind` -- and the panel, which only checked
+ * `rejected`, said "Track queued". It now names `track_target` with the
+ * contact selected in the roster, and cannot be launched without one.
+ */
 export const MISSIONS = Object.freeze({
   orbit_poi: { label: 'Orbit POI', desc: 'Fixed-wing orbit over point' },
   recon_route: { label: 'Recon', desc: 'Lawnmower over AO' },
   grid_search: { label: 'Grid', desc: 'SAR grid over polygon' },
-  track: { label: 'Track', desc: 'Pursue contact' },
+  track: {
+    label: 'Track',
+    desc: 'Pursue contact',
+    kind: 'track_target',
+    needsTrack: true,
+  },
   assess: { label: 'Assess', desc: 'Cross-cue + SALUTE report' },
 });
+
+/** Why the Track option is unavailable until a contact is selected. */
+const TRACK_NEEDS_CONTACT = 'select a contact in the roster first';
+
+/** How long "Refuel 100%" waits for its confirming second press. */
+const REFUEL_CONFIRM_MS = 5000;
+const REFUEL_LABEL = 'Refuel 100%';
 
 const DEFAULT_VEHICLE = 'Drone1';
 const CONTROL_STATUS_EVERY = 5; // ticks between /control/status enrichment
@@ -171,6 +193,91 @@ export function unwrapMcp(payload) {
     }
   }
   return result;
+}
+
+/**
+ * Human text for a tool error, which arrives in two shapes: the server's
+ * structured `{code, message, retryable}` envelope, or the bridge's flattened
+ * string when the MCP call itself reported `isError`.
+ * @param {*} error the `error` field of a tool result
+ * @returns {string} display text, '' when there is nothing to say
+ */
+export function errorText(error) {
+  if (error == null || error === false) return '';
+  if (typeof error === 'string') return error.trim();
+  if (typeof error === 'object') {
+    const message = typeof error.message === 'string' ? error.message : '';
+    const code = typeof error.code === 'string' ? error.code : '';
+    if (message && code) return `${code}: ${message}`;
+    if (message || code) return message || code;
+  }
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+/**
+ * Classify a `/control/*` answer before telling the operator anything.
+ *
+ * Only `ok` may be reported as queued or done. A server gate rejection
+ * (`rejected:true`), a tool error (`{error}` -- structured or the bridge's
+ * `isError` string), a busy vehicle (`status:"busy"`) and an explicit
+ * `ok:false` are all "nothing was run". The panel used to check `rejected`
+ * alone, so an unknown mission kind or a malformed request read "queued".
+ * @param {*} result unwrapped tool result
+ * @returns {{state: 'ok'|'rejected'|'error'|'busy'|'not_run', message: string}}
+ */
+export function commandOutcome(result) {
+  if (!result || typeof result !== 'object')
+    return { state: 'error', message: 'the bridge returned no result' };
+  if (result.rejected) {
+    let gate = '';
+    try {
+      gate = result.gate ? JSON.stringify(result.gate) : '';
+    } catch {
+      gate = '';
+    }
+    return {
+      state: 'rejected',
+      message:
+        errorText(result.error) ||
+        errorText(result.reason) ||
+        gate ||
+        'rejected by the server gate',
+    };
+  }
+  if (result.error != null && result.error !== false)
+    return {
+      state: 'error',
+      message: errorText(result.error) || 'the tool reported an error',
+    };
+  if (result.status === 'busy') {
+    const current = result.current;
+    const busyWith =
+      current && typeof current === 'object'
+        ? current.tool || current.task_id || current.mission_id || ''
+        : typeof current === 'string'
+          ? current
+          : '';
+    return {
+      state: 'busy',
+      message: busyWith
+        ? `vehicle busy with ${busyWith}`
+        : 'vehicle busy with another task',
+    };
+  }
+  if (result.ok === false)
+    return {
+      state: 'not_run',
+      message:
+        errorText(result.reason) ||
+        errorText(result.message) ||
+        errorText(result.note) ||
+        'not accepted',
+    };
+  return { state: 'ok', message: '' };
 }
 
 /**
@@ -336,6 +443,12 @@ export function createUavMissionPanel({
   const launchBtn = h('button', {}, 'Launch');
   const abortBtn = h('button', { class: 'ghost' }, 'Abort');
   const cockpitBtn = h('button', { class: 'ghost' }, 'Cockpit');
+  // Arm the same position-gated cockpit follow a launch arms, for a drone that
+  // is already flying (or about to be): the view switches once it has a fix.
+  const liveViewBtn = h('button', { class: 'ghost' }, 'Live view');
+  // sim_set_fuel through the bridge's /control/command proxy. It clears the
+  // BINGO latch -- a safety override -- so it takes a confirming second press.
+  const refuelBtn = h('button', { class: 'ghost' }, REFUEL_LABEL);
   const statusEl = h('div', { class: 'status' });
   const teleEl = h('div', { class: 'tele' }, 'telemetry: —');
 
@@ -343,7 +456,12 @@ export function createUavMissionPanel({
   const hud = createUavMissionHud();
   const alarms = createUavAlarmSurface();
   const roster = createUavContactRoster({
-    onSelect: (contact) => focusContact(contact),
+    onSelect: (contact) => {
+      // The selection is also what a Track launch pursues, so the option's
+      // availability follows it.
+      syncTrackOption();
+      return focusContact(contact);
+    },
   });
 
   // Mission views: every mission actually in the air, and a way to put the
@@ -435,7 +553,7 @@ export function createUavMissionPanel({
     poiInput,
     poiSel,
     h('div', { class: 'row' }, launchBtn, abortBtn),
-    h('div', { class: 'row' }, cockpitBtn),
+    h('div', { class: 'row' }, cockpitBtn, liveViewBtn, refuelBtn),
     tacticalSec,
     statusEl,
   );
@@ -574,6 +692,7 @@ export function createUavMissionPanel({
     refreshPoiSeeds();
   });
   refreshTheaterOptions();
+  syncTrackOption();
 
   function parsePoi() {
     const t = theater();
@@ -609,9 +728,50 @@ export function createUavMissionPanel({
     return res.json();
   }
 
+  /** The contact a Track launch pursues: the roster's selection, if any. */
+  function selectedTrackId() {
+    const contact = roster.getSelected?.();
+    const id = contact?.trackId ?? contact?.track_id ?? contact?.id;
+    return typeof id === 'string' && id ? id : null;
+  }
+
+  /**
+   * Enable the Track option only while a contact is selected, and say why
+   * when it is not. The launch path re-checks, because a selector already
+   * sitting on Track stays there when its contact ages out of the roster.
+   */
+  function syncTrackOption() {
+    // Array.from: a live HTMLCollection has no find(); the test stub's
+    // children are a plain array.
+    const option = Array.from(missionSel.children || []).find(
+      (el) => el?.getAttribute?.('value') === 'track',
+    );
+    if (!option) return;
+    const track = MISSIONS.track;
+    const id = selectedTrackId();
+    if (id) {
+      option.removeAttribute?.('disabled');
+      option.removeAttribute?.('title');
+      replaceKids(option, [`${track.label} — ${track.desc} ${id}`]);
+    } else {
+      option.setAttribute('disabled', '');
+      option.setAttribute(
+        'title',
+        `Track needs a contact: ${TRACK_NEEDS_CONTACT}`,
+      );
+      replaceKids(option, [`${track.label} — ${TRACK_NEEDS_CONTACT}`]);
+    }
+  }
+
   function missionParams() {
     const kind = missionSel.value;
     const t = theater();
+    if (MISSIONS[kind]?.needsTrack) {
+      const trackId = selectedTrackId();
+      if (!trackId)
+        throw new Error(`Track needs a contact: ${TRACK_NEEDS_CONTACT}`);
+      return { track_id: trackId };
+    }
     if (kind === 'recon_route') {
       const c = t?.ao || [];
       return { waypoints: c.map(([lat, lon]) => ({ lat, lon, alt_m: 120 })) };
@@ -653,6 +813,11 @@ export function createUavMissionPanel({
     pendingCockpit = { vehicle: reference, tries: COCKPIT_FOLLOW_TRIES };
   }
 
+  /** Stop chasing the cockpit (the caller left tracking, or took over). */
+  function disarmCockpitFollow() {
+    pendingCockpit = null;
+  }
+
   /** Called every tick with the snapshot's records. */
   function followLaunchedMission(records) {
     if (!pendingCockpit) return;
@@ -687,22 +852,34 @@ export function createUavMissionPanel({
     launchBtn.disabled = true;
     try {
       const kind = missionSel.value;
-      setStatus(`submitting ${MISSIONS[kind].label}…`);
+      const mission = MISSIONS[kind];
+      if (!mission) throw new Error(`unknown mission kind ${kind}`);
+      // Build the params BEFORE saying anything is being submitted: a Track
+      // with no contact selected stops here, with the reason, and sends
+      // nothing.
+      const params = missionParams();
+      setStatus(`submitting ${mission.label}…`);
       const out = await post('/control/mission', {
         vehicle: vehicle(),
-        kind,
-        params: missionParams(),
+        kind: mission.kind || kind,
+        params,
       });
       const r = unwrapMcp(out);
-      if (r?.rejected) {
-        pendingCockpit = null;
-        setStatus(`rejected: ${r.error || JSON.stringify(r.gate || r)}`, true);
-      } else {
+      const outcome = commandOutcome(r);
+      if (outcome.state === 'ok') {
+        const task = r?.task_id || r?.mission_id || '';
         setStatus(
-          `${MISSIONS[kind].label} queued · task ${r?.task_id?.slice(0, 8) || '?'} · cockpit on position`,
+          `${mission.label} queued · task ${typeof task === 'string' && task ? task.slice(0, 8) : '?'} · cockpit on position`,
         );
         // Follow the drone that is actually flying this mission.
         armCockpitFollow(vehicle());
+      } else {
+        // Nothing was launched, so there is nothing to follow.
+        pendingCockpit = null;
+        setStatus(
+          `${outcome.state.replace('_', ' ')}: ${outcome.message}`,
+          true,
+        );
       }
     } catch (e) {
       setStatus(`launch failed: ${e.message}`, true);
@@ -714,11 +891,105 @@ export function createUavMissionPanel({
   async function abort() {
     try {
       pendingCockpit = null;
-      await post('/control/command', { tool: 'uav_abort', vehicle: vehicle() });
-      setStatus('aborted — hover');
+      const r = unwrapMcp(
+        await post('/control/command', {
+          tool: 'uav_abort',
+          vehicle: vehicle(),
+        }),
+      );
+      const outcome = commandOutcome(r);
+      if (outcome.state === 'ok') setStatus('aborted — hover');
+      else
+        setStatus(
+          `abort ${outcome.state.replace('_', ' ')}: ${outcome.message}`,
+          true,
+        );
     } catch (e) {
       setStatus(`abort failed: ${e.message}`, true);
     }
+  }
+
+  // ---- Refuel (safety override) and Live view ----------------------------
+  // Ported from the ObraMaestra panel with its defects fixed: the listeners
+  // are registered once, below, beside the other buttons (the original added
+  // them INSIDE the Cockpit button's click handler, so neither button worked
+  // until Cockpit had been pressed, and every Cockpit press stacked another
+  // pair); the fuel level travels in `arguments`, which is the only field the
+  // bridge forwards to the tool (a top-level `fuel_pct` was dropped and the
+  // tool's default happened to match); and an `{error}` answer is a failure,
+  // not a success with an odd message.
+  let refuelArmedFor = null;
+  let refuelTimer = null;
+
+  function disarmRefuel() {
+    refuelArmedFor = null;
+    clearTimeout(refuelTimer);
+    refuelTimer = null;
+    refuelBtn.textContent = REFUEL_LABEL;
+  }
+
+  async function refuel(reference) {
+    refuelBtn.disabled = true;
+    try {
+      setStatus(`refuel: setting ${reference} to 100%…`);
+      const r = unwrapMcp(
+        await post('/control/command', {
+          tool: 'sim_set_fuel',
+          vehicle: reference,
+          arguments: { vehicle: reference, fuel_pct: 100 },
+        }),
+      );
+      const outcome = commandOutcome(r);
+      if (outcome.state !== 'ok') {
+        setStatus(`refuel failed: ${outcome.message}`, true);
+        return false;
+      }
+      const fuel = Number.isFinite(r.fuel_pct) ? r.fuel_pct : 100;
+      const notes = [
+        r.bingo_was_latched ? 'BINGO latch cleared' : '',
+        r.relatch_expected ? 'BINGO re-latches on the next tick' : '',
+        r.safety_task_in_flight ? 'the return already flying continues' : '',
+      ].filter(Boolean);
+      setStatus(
+        [`refuel: ${r.vehicle || reference} at ${fuel}%`, ...notes].join(' · '),
+      );
+      return true;
+    } catch (e) {
+      setStatus(`refuel failed: ${e.message}`, true);
+      return false;
+    } finally {
+      refuelBtn.disabled = false;
+    }
+  }
+
+  /** First press arms (and explains); a second press on the same drone sends. */
+  function onRefuelPress() {
+    const reference = vehicle();
+    if (refuelArmedFor !== reference) {
+      disarmRefuel();
+      refuelArmedFor = reference;
+      refuelBtn.textContent = 'Confirm refuel';
+      setStatus(
+        `refuel ${reference} to 100%? This clears the BINGO safety latch; a return already flying continues. Press again within ${REFUEL_CONFIRM_MS / 1000} s to confirm.`,
+      );
+      refuelTimer = setTimeout(disarmRefuel, REFUEL_CONFIRM_MS);
+      return null;
+    }
+    disarmRefuel();
+    return refuel(reference);
+  }
+
+  /** Put the view on the selected drone now, or as soon as it has a fix. */
+  function liveView() {
+    const reference = vehicle();
+    if (onEnterCockpit?.(reference) === true) {
+      pendingCockpit = null;
+      setStatus(`live view: following ${reference}`);
+      return true;
+    }
+    armCockpitFollow(reference);
+    setStatus(`live view: waiting for ${reference} to report a position…`);
+    return false;
   }
 
   // ---- Tactical overlay state ------------------------------------------
@@ -1105,6 +1376,7 @@ export function createUavMissionPanel({
       ? snap.contacts || []
       : normalizeTargetsAsContacts(snap.targets);
     roster.update(contacts);
+    syncTrackOption();
     // Mission views list everything in the air, not just the selected vehicle,
     // so it takes the whole snapshot rather than the single chosen record.
     missionViews.update(snap);
@@ -1150,6 +1422,8 @@ export function createUavMissionPanel({
 
   launchBtn.addEventListener('click', launch);
   abortBtn.addEventListener('click', abort);
+  liveViewBtn.addEventListener('click', liveView);
+  refuelBtn.addEventListener('click', onRefuelPress);
   cockpitBtn.addEventListener('click', () => {
     const reference = vehicle();
     const ok = onEnterCockpit?.(reference);
@@ -1192,6 +1466,7 @@ export function createUavMissionPanel({
     destroy() {
       clearInterval(timer);
       timer = null;
+      disarmRefuel();
       events.stop();
       alarms.destroy();
       roster.destroy();
@@ -1224,9 +1499,16 @@ export function createUavMissionPanel({
     _alarms: alarms,
     _roster: roster,
     _missionViews: missionViews,
-    /** Arm the post-launch cockpit follow (tests). */
+    /** Arm the post-launch cockpit follow (also the tracking port's retry). */
     armCockpitFollow,
+    /** Stop a pending cockpit follow without entering. */
+    disarmCockpitFollow,
     isCockpitFollowArmed: () => pendingCockpit !== null,
+    /**
+     * One entry attempt through the SAME callback the panel uses: track the
+     * drone and report whether the cockpit really entered (=== true only).
+     */
+    enterCockpit: (reference) => onEnterCockpit?.(reference) === true,
     _followLaunchedMission: followLaunchedMission,
     _theaters: theaters,
     _events: events,

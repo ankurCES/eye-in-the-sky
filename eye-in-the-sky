@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# eye-in-the-sky — start the Eye in the Sky intelligence console.
+#
+# One process runs the sim, the MCP server, the telemetry bridge, the intel
+# graph, the AI analyst and the console UI on one origin
+# (python -m godseye_uav.app).
+#
+# Usage:
+#   ./eye-in-the-sky                  # native window if pywebview is installed, else browser
+#   ./eye-in-the-sky --window         # native window (pip install -e 'godseye[app]')
+#   ./eye-in-the-sky --browser        # open the console in the default browser
+#   ./eye-in-the-sky --headless       # serve only
+#   ./eye-in-the-sky --no-build ...   # do not (re)build the UI first
+#
+# Every other argument goes to godseye_uav.app, for example
+#   --theater ukraine-donbas  --port 8780  --real --sim-port 41451
+#   --no-chat  --model <id>  --store <dir>  --ui-dir <dir>  --token <tok>
+# Run `./eye-in-the-sky --help` for the full list.
+#
+# The UI is rebuilt (npm run build in gods-eye-view/) when gods-eye-view/dist
+# is missing or older than its sources.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GS="$REPO/godseye"
+GEV="$REPO/gods-eye-view"
+
+say() { printf '[eye-in-the-sky] %s\n' "$*"; }
+die() { printf '[eye-in-the-sky] FATAL: %s\n' "$*" >&2; exit 1; }
+
+BUILD=1
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --no-build) BUILD=0 ;;
+    *) ARGS+=("$arg") ;;
+  esac
+done
+
+# --- python ------------------------------------------------------------------
+PY="$GS/.venv/bin/python"
+[ -x "$PY" ] || PY="$(command -v python3 || true)"
+[ -n "$PY" ] && [ -x "$PY" ] || die "no python found. Run ./scripts/setup.sh first."
+
+# --- AirSim PythonClient (same resolver start.sh uses) -----------------------
+GS_ROOT="$GS"
+# shellcheck source=godseye/scripts/_airsim_client.sh
+. "$GS/scripts/_airsim_client.sh"
+if ! resolve_airsim_client; then
+  airsim_missing_help
+  exit 1
+fi
+export PYTHONPATH="$GS/mcp:$AIRSIM_CLIENT${PYTHONPATH:+:$PYTHONPATH}"
+
+# --- UI build ----------------------------------------------------------------
+ui_is_stale() {
+  local index="$GEV/dist/index.html"
+  [ -f "$index" ] || return 0
+  local newer
+  newer="$(find "$GEV/src" "$GEV/index.html" "$GEV/public" "$GEV/style.css" \
+             "$GEV/vite.config.js" "$GEV/package.json" \
+             -newer "$index" -print -quit 2>/dev/null || true)"
+  [ -n "$newer" ]
+}
+
+wants_help=0
+for arg in ${ARGS[@]+"${ARGS[@]}"}; do
+  case "$arg" in -h|--help) wants_help=1 ;; esac
+done
+
+if [ "$BUILD" = "1" ] && [ "$wants_help" = "0" ] && [ -d "$GEV" ] && ui_is_stale; then
+  if ! command -v npm >/dev/null 2>&1; then
+    if [ -f "$GEV/dist/index.html" ]; then
+      say "WARNING: npm not found; running the existing (older) UI build"
+    else
+      say "WARNING: npm not found; the UI cannot be built (the app will say so)"
+    fi
+  elif [ ! -d "$GEV/node_modules" ]; then
+    die "gods-eye-view has no node_modules. Run: (cd gods-eye-view && npm install), or pass --no-build"
+  else
+    say "building the UI (gods-eye-view: npm run build)…"
+    if ! (cd "$GEV" && npm run build); then
+      if [ -f "$GEV/dist/index.html" ]; then
+        say "WARNING: the UI build failed; running the previous build"
+      else
+        die "the UI build failed (see above). Fix it or pass --no-build"
+      fi
+    fi
+  fi
+fi
+
+exec "$PY" -m godseye_uav.app ${ARGS[@]+"${ARGS[@]}"}

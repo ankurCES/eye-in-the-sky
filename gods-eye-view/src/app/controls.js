@@ -4,8 +4,21 @@ import { StyleManager } from '../ui/composition.js';
 import { flyToAustin } from '../camera.js';
 import { initCockpitCloudEffects } from '../cockpitCloudEffects.js';
 import { createUavMissionPanel } from '../ui/uavMissionPanel.js';
+import { createUavSource } from '../sources/live/uav.js';
+import { getKeyholeGeometry } from '../celestialRing.js';
+import { uavBridgeToken, uavBridgeUrl } from './uavBridge.js';
+import { createTrackingPort } from './trackingPort.js';
+import { createUavAutoStart } from './uavAutoStart.js';
 
-/** Construct the existing controls and camera presentation. */
+/**
+ * Construct the existing controls and camera presentation.
+ *
+ * `intelConsole` is set when the intelligence console (src/console) owns the
+ * landing view: `{onTrackingPort(port|null)}` receives the tracking port the
+ * console drives, and the UAV mission drawer no longer pops open whenever the
+ * UAV layer is switched on (the console enables it for its own reasons). The
+ * first-run launcher is suppressed by the same option in the tools phase.
+ */
 export function createApplicationControls({
   scene: { viewer, mapStackController, operations },
   loaderStatus,
@@ -13,6 +26,8 @@ export function createApplicationControls({
   services,
   catalog,
   placeSearch,
+  intelConsole = null,
+  signal = null,
   defer,
 }) {
   // Initialize the style manager (post-processing, HUD, locations, share links)
@@ -43,16 +58,8 @@ export function createApplicationControls({
 
   // UAV Mission Control panel: theater + mission selection, MCP-gated launch.
   // Read-only God's Eye; the bridge /control proxy is the only command path.
-  const uavBridgeUrl = () =>
-    (typeof localStorage !== 'undefined' &&
-      localStorage.getItem('gev.uav.base')) ||
-    import.meta.env?.VITE_UAV_BRIDGE_URL ||
-    'http://localhost:8790';
-  const uavBridgeToken = () =>
-    (typeof localStorage !== 'undefined' &&
-      localStorage.getItem('gev.uav.token')) ||
-    import.meta.env?.VITE_UAV_BRIDGE_TOKEN ||
-    'dev-token';
+  // Origin and token come from the one resolver (./uavBridge.js): the in-app
+  // host's injected config, then localStorage, then the build env.
   const uavLayer = catalog?.get?.('uav');
   const uavMissionPanel = createUavMissionPanel({
     bridgeUrl: uavBridgeUrl,
@@ -96,7 +103,11 @@ export function createApplicationControls({
   // manager: `styleManager._dataManager` does not exist (verified at runtime --
   // the optional chaining elsewhere in this file hides that), so any
   // isEnabled('uav') probe silently answers null forever.
-  if (uavLayer && typeof uavLayer.enable === 'function') {
+  //
+  // Not when the intelligence console owns the view: it enables the layer at
+  // boot and on every Track, and the drawer is opened only on request there
+  // (trackingPort.openMissionPanel).
+  if (!intelConsole && uavLayer && typeof uavLayer.enable === 'function') {
     const layerEnable = uavLayer.enable.bind(uavLayer);
     uavLayer.enable = async (...args) => {
       const result = await layerEnable(...args);
@@ -113,6 +124,22 @@ export function createApplicationControls({
     });
   }
 
+  // The console's seam onto the map: cockpit tracking, map visibility, the
+  // dock inset and the keyhole. Always built (it is inert until asked), handed
+  // to the console only when one is mounted.
+  const trackingPort = createTrackingPort({
+    viewer,
+    getCockpit: () => styleManager._cockpitCoordinator?.cockpitView,
+    uavLayer,
+    missionPanel: uavMissionPanel,
+    keyholeGeometry: getKeyholeGeometry,
+  });
+  defer(() => trackingPort.destroy());
+  if (typeof intelConsole?.onTrackingPort === 'function') {
+    intelConsole.onTrackingPort(trackingPort);
+    defer(() => intelConsole.onTrackingPort(null));
+  }
+
   // If no share link state, do default fly-to Austin
   if (!styleManager.hasShareState) {
     loaderStatus.textContent = 'Flying to Austin, TX...';
@@ -121,5 +148,65 @@ export function createApplicationControls({
     loaderStatus.textContent = 'Restoring shared view...';
   }
 
-  return { styleManager, weatherEffects, cockpitCloudEffects };
+  // Once GEV is up, switch the UAV layer on and put the camera over the lead
+  // drone's theater (the Austin fly-in above is what shows until then, and
+  // what stays when the bridge is down). Runs once; see ./uavAutoStart.js.
+  let attachedData = null;
+  let uavStartSource = null;
+  const uavAutoStart = createUavAutoStart({
+    enableLayer: () =>
+      attachedData?.setEnabled('uav', true, {
+        origin: 'programmatic',
+      }),
+    getSnapshot: () => {
+      uavStartSource ||= createUavSource({
+        baseUrl: uavBridgeUrl,
+        token: uavBridgeToken,
+      });
+      return uavStartSource.getSnapshot({}, {});
+    },
+    // A share link is an explicit request for a view; never override it.
+    shouldFly: () => !styleManager.hasShareState && !viewer.isDestroyed?.(),
+    flyTo: ({ latitude, longitude, altitude }) => {
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(
+          longitude,
+          latitude,
+          altitude + 25000,
+        ),
+        duration: 3.0,
+      });
+    },
+    signal,
+  });
+
+  /**
+   * Called by the tools phase once the layer data manager exists: the port
+   * becomes ready (whenReady resolves) and the UAV start runs, after any
+   * share-link restoration has settled.
+   */
+  function attachData(dataManager) {
+    if (attachedData || !dataManager) return;
+    attachedData = dataManager;
+    const startup = Promise.resolve(styleManager.initialRestorePromise)
+      .catch(() => {
+        /* restoration reports its own outcome */
+      })
+      .then(() => (signal?.aborted ? null : uavAutoStart.start()))
+      .catch(() => {
+        /* the start is best effort; the layer rail still works */
+      });
+    // The port's enter() lets this start finish first: its setEnabled('uav')
+    // announces `visibility`, which would drop a cockpit that just opened.
+    trackingPort.attachData(dataManager, { startup });
+  }
+
+  return {
+    styleManager,
+    weatherEffects,
+    cockpitCloudEffects,
+    uavMissionPanel,
+    trackingPort,
+    attachData,
+  };
 }

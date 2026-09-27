@@ -1,0 +1,1625 @@
+/*
+ * Intelligence console panels: search and ask bar, entity inspector,
+ * situation rail (compact strip + drawer) and the operator Abort confirm.
+ * UX spec §5, §7.1, §7.2, §6.9. Owner: JS-SHELL-B.
+ *
+ * Imported at the top of console.css, which declares the tokens on .ic-root.
+ * Every token read here carries its spec value as a fallback, so the panels
+ * render correctly even before console.css defines a token.
+ *
+ * Specificity: every selector is scoped with `:where(.ic-root)` (zero weight),
+ * so components sit at (0,1,0) and state attributes at (0,2,0), the spec
+ * ceiling. No @layer (GEV's unlayered sheets would win), no backdrop-filter,
+ * no `transition: all` on focusables (GEV's global focus ring stays immediate).
+ *
+ * Order: kit (shared bits) → search → inspector → rail → abort confirm →
+ * states → container queries → reduced motion → contrast → forced colours.
+ */
+
+/* ---------------------------------------------------------------- kit */
+
+:where(.ic-root) .ic-kit-vh {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+:where(.ic-root) .ic-kit-mono {
+  font-family: var(
+    --ic-font-mono,
+    'Atkinson Hyperlegible Mono',
+    'JetBrains Mono',
+    ui-monospace,
+    'SF Mono',
+    Menlo,
+    Consolas,
+    monospace
+  );
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-kit-sym {
+  font-size: 18px;
+  line-height: 1;
+  flex: none;
+  user-select: none;
+}
+
+:where(.ic-root) .ic-kit-glyph {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+
+:where(.ic-root) .ic-kit-parts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  column-gap: 12px;
+  row-gap: 0;
+  min-width: 0;
+}
+
+:where(.ic-root) .ic-kit-part {
+  /* Segments stay whole where they fit: a flex item moves to the next line
+     before it breaks. One longer than the line wraps instead of being cut
+     off ("…Returning home; that can't be cancelled."). */
+  overflow-wrap: anywhere;
+}
+
+/* Buttons: 32 px targets (44 px at narrow, below). */
+:where(.ic-root) .ic-kit-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--ic-edge, #7a8b97);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ic-film, #e6ecef);
+  font: 500 13px/20px var(--ic-font-sans, inherit);
+  cursor: pointer;
+  transition:
+    background-color var(--ic-t-quick, 120ms) cubic-bezier(0.2, 0, 0, 1),
+    border-color var(--ic-t-quick, 120ms) cubic-bezier(0.2, 0, 0, 1),
+    color var(--ic-t-quick, 120ms) cubic-bezier(0.2, 0, 0, 1);
+}
+
+:where(.ic-root) .ic-kit-btn:hover {
+  background: rgba(230, 236, 239, 0.08);
+  border-color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-kit-btn--quiet {
+  border-color: transparent;
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-kit-btn--danger {
+  border-color: var(--ic-critical, #ff7b7b);
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-kit-btn--danger:hover {
+  background: rgba(255, 123, 123, 0.12);
+  border-color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-kit-btn--link {
+  min-height: 32px;
+  padding: 0;
+  border-color: transparent;
+  color: var(--ic-film, #e6ecef);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+:where(.ic-root) .ic-kit-btn--link:hover {
+  background: transparent;
+  border-color: transparent;
+}
+
+:where(.ic-root) .ic-kit-btn--icon {
+  width: 32px;
+  padding: 0;
+  justify-content: center;
+  border-color: transparent;
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-kit-btn[disabled],
+:where(.ic-root) .ic-kit-btn[aria-disabled='true'] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Entity chips (§6.4): a raised pill, radius 4, glyph + label. */
+:where(.ic-root) .ic-kit-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+:where(.ic-root) .ic-kit-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  max-width: 100%;
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: var(--ic-raised, #2a3945);
+  color: var(--ic-film, #e6ecef);
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+  cursor: pointer;
+  transition: border-color var(--ic-t-quick, 120ms) cubic-bezier(0.2, 0, 0, 1);
+}
+
+:where(.ic-root) .ic-kit-chip:hover {
+  border-color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-kit-chip[data-known='false'] {
+  border: 1px dashed var(--ic-edge, #7a8b97);
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-kit-chip__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-kit-idtag {
+  display: inline-block;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--ic-raised, #2a3945);
+  color: var(--ic-pencil, #a3b0ba);
+  font-size: 12px;
+  line-height: 20px;
+}
+
+/* Reading registers (§2.6). */
+:where(.ic-root) .ic-kit-reg {
+  display: inline-block;
+  padding: 0 6px;
+  border: 1px solid var(--ic-graticule, #3a4a56);
+  border-radius: 4px;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-kit-reg[data-register='assumed'] {
+  border-style: dotted;
+  border-color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-kit-reg[data-register='new'] {
+  border-color: var(--ic-critical, #ff7b7b);
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-kit-assumed {
+  text-decoration: underline dotted var(--ic-pencil, #a3b0ba);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+:where(.ic-root) .ic-kit-notassessed {
+  color: var(--ic-unknown, #bba7e0);
+  font-style: italic;
+}
+
+:where(.ic-root) .ic-kit-noreading {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  padding: 2px 8px;
+  border: 1px dashed var(--ic-edge, #7a8b97);
+  border-radius: 4px;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-kit-noreading__title {
+  color: var(--ic-film, #e6ecef);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-kit-note {
+  margin: 0;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-kit-line {
+  display: block;
+  flex-basis: 100%;
+}
+
+/* Status words and lines in panel text: colour always with the word. */
+:where(.ic-root) .ic-kit-line[data-status='critical'],
+:where(.ic-root) .ic-kit-status[data-status='critical'] {
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-kit-line[data-status='warn'],
+:where(.ic-root) .ic-kit-status[data-status='warn'] {
+  color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-kit-line[data-status='stale'],
+:where(.ic-root) .ic-kit-status[data-status='stale'] {
+  color: var(--ic-stale, #8a98a2);
+}
+
+:where(.ic-root) .ic-kit-list {
+  margin: 0;
+  padding-left: 18px;
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-kit-legend {
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-kit-num {
+  font: 500 22px/28px
+    var(
+      --ic-font-mono,
+      'Atkinson Hyperlegible Mono',
+      'JetBrains Mono',
+      ui-monospace,
+      monospace
+    );
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-kit-pct {
+  min-width: 4ch;
+  text-align: right;
+  font: 400 12px/16px
+    var(
+      --ic-font-mono,
+      'Atkinson Hyperlegible Mono',
+      'JetBrains Mono',
+      ui-monospace,
+      monospace
+    );
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-kit-fuelline {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Definition lists: label column + value column. */
+:where(.ic-root) .ic-kit-dl {
+  display: grid;
+  grid-template-columns: minmax(96px, max-content) minmax(0, 1fr);
+  gap: 6px 16px;
+  margin: 8px 0 0;
+}
+
+:where(.ic-root) .ic-kit-dl__row {
+  display: contents;
+}
+
+:where(.ic-root) .ic-kit-dl__term,
+:where(.ic-root) .ic-kit-cell__term {
+  margin: 0;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-kit-dl__def,
+:where(.ic-root) .ic-kit-cell__def {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  min-width: 0;
+  margin: 0;
+  color: var(--ic-film, #e6ecef);
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-kit-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* Fuel versus BINGO: 6 px bar, 2 px film-white BINGO tick. */
+:where(.ic-root) .ic-kit-fuel {
+  --ic-fuel-ink: var(--ic-stale, #8a98a2);
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--ic-graticule, #3a4a56);
+  overflow: visible;
+}
+
+:where(.ic-root) .ic-kit-fuel__fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--ic-fill, 0%);
+  border-radius: 3px;
+  background: var(--ic-fuel-ink);
+}
+
+:where(.ic-root) .ic-kit-fuel__tick {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  left: var(--ic-tick, 0%);
+  width: 2px;
+  margin-left: -1px;
+  background: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-kit-fuel[data-status='ok'] {
+  --ic-fuel-ink: var(--ic-ok, #5dd39b);
+}
+
+:where(.ic-root) .ic-kit-fuel[data-status='warn'] {
+  --ic-fuel-ink: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-kit-fuel[data-status='critical'] {
+  --ic-fuel-ink: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-kit-fuel[data-status='unknown'] {
+  --ic-fuel-ink: var(--ic-unknown, #bba7e0);
+}
+
+/* A fuel reading with no BINGO line yet: measured, but nothing to judge it by. */
+:where(.ic-root) .ic-kit-fuel[data-status='neutral'] {
+  --ic-fuel-ink: var(--ic-pencil, #a3b0ba);
+}
+
+/* Vertical 8×40 bar in the compact strip. */
+:where(.ic-root) .ic-kit-fuel[data-orient='vertical'] {
+  width: 8px;
+  height: 40px;
+  border-radius: 4px;
+}
+
+:where(.ic-root) .ic-kit-fuel__fill[data-orient='vertical'] {
+  inset: auto 0 0 0;
+  width: auto;
+  height: var(--ic-fill, 0%);
+  border-radius: 4px;
+}
+
+:where(.ic-root) .ic-kit-fuel__tick[data-orient='vertical'] {
+  top: auto;
+  bottom: var(--ic-tick, 0%);
+  left: -3px;
+  right: -3px;
+  width: auto;
+  height: 2px;
+  margin: 0 0 -1px;
+}
+
+/* Mission progress: magenta, because an aircraft flies on your authority. */
+:where(.ic-root) .ic-kit-progress {
+  position: relative;
+  display: block;
+  flex: 1 1 auto;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--ic-graticule, #3a4a56);
+}
+
+:where(.ic-root) .ic-kit-progress__fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--ic-fill, 0%);
+  border-radius: 2px;
+  background: var(--ic-magenta, #f27ad6);
+}
+
+/* Status and tone inks for text. Colour is never the only signal: a word
+   always accompanies it. */
+:where(.ic-root) .ic-kit-threat,
+:where(.ic-root) .ic-inspector__status,
+:where(.ic-root) .ic-search__status {
+  font-weight: 600;
+}
+
+:where(.ic-root)
+  :is(
+    .ic-kit-threat,
+    .ic-inspector__status,
+    .ic-search__status
+  )[data-tone='low'] {
+  color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root)
+  :is(
+    .ic-kit-threat,
+    .ic-inspector__status,
+    .ic-search__status
+  )[data-tone='ok'] {
+  color: var(--ic-ok, #5dd39b);
+}
+
+:where(.ic-root)
+  :is(
+    .ic-kit-threat,
+    .ic-inspector__status,
+    .ic-search__status
+  )[data-tone='warn'] {
+  color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root)
+  :is(
+    .ic-kit-threat,
+    .ic-inspector__status,
+    .ic-search__status
+  )[data-tone='critical'] {
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root)
+  :is(
+    .ic-kit-threat,
+    .ic-inspector__status,
+    .ic-search__status
+  )[data-tone='stale'] {
+  color: var(--ic-stale, #8a98a2);
+}
+
+:where(.ic-root)
+  :is(
+    .ic-kit-threat,
+    .ic-inspector__status,
+    .ic-search__status
+  )[data-tone='unknown'] {
+  color: var(--ic-unknown, #bba7e0);
+}
+
+:where(.ic-root)
+  :is(
+    .ic-kit-threat,
+    .ic-inspector__status,
+    .ic-search__status
+  )[data-tone='neutral'] {
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+/* ------------------------------------------------------------- search */
+
+:where(.ic-root) .ic-search {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--ic-film, #e6ecef);
+  font-family: var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-search__bar {
+  container: ic-searchbar / inline-size;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* 44 px at narrow (console.css sets the token there). */
+  height: var(--ic-searchbar-h, 40px);
+  padding: 0 8px 0 12px;
+  border: 1px solid var(--ic-edge, #7a8b97);
+  border-radius: 10px;
+  background: var(--ic-panel, #22303b);
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-search__bar:focus-within {
+  border-color: var(--ic-film, #e6ecef);
+}
+
+/* The input covers the whole bar (icon and shortcut hint sit on top of it,
+   click-through), so the shared focus ring follows the bar's rounded edge
+   instead of drawing a square inside it. */
+:where(.ic-root) .ic-search__input {
+  position: absolute;
+  inset: -1px;
+  z-index: 0;
+  width: auto;
+  height: auto;
+  min-width: 0;
+  padding: 0 72px 0 40px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ic-film, #e6ecef);
+  font: 400 15px/24px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-search__bar > .ic-kit-sym,
+:where(.ic-root) .ic-search__bar > .ic-search__kbd {
+  position: relative;
+  z-index: 1;
+  pointer-events: none;
+}
+
+:where(.ic-root) .ic-search__bar > .ic-search__kbd {
+  margin-left: auto;
+}
+
+:where(.ic-root) .ic-search__input::placeholder {
+  color: var(--ic-pencil, #a3b0ba);
+  opacity: 1;
+}
+
+:where(.ic-root) .ic-search__kbd {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--ic-graticule, #3a4a56);
+  border-radius: 4px;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/18px var(--ic-font-sans, inherit);
+  white-space: nowrap;
+}
+
+/* The kept filter hangs under the bar, over the stage: in the header's flow
+   it would push the 40 px bar up out of its 56 px band. */
+:where(.ic-root) .ic-search__pill {
+  position: absolute;
+  top: calc(var(--ic-searchbar-h, 40px) + 6px);
+  left: 0;
+  z-index: calc(var(--ic-z-popover, 10) - 1);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 0 2px 0 10px;
+  border-radius: 4px;
+  background: var(--ic-raised, #2a3945);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-search__pill-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-search__pill-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ic-pencil, #a3b0ba);
+  cursor: pointer;
+}
+
+:where(.ic-root) .ic-search__pop {
+  container: ic-searchpop / inline-size;
+  position: absolute;
+  top: calc(var(--ic-searchbar-h, 40px) + 6px);
+  left: 0;
+  right: 0;
+  z-index: var(--ic-z-popover, 10);
+  /* A narrow bar (compact at 200% zoom) must not squeeze the results: the
+     list may run past the bar's right edge. */
+  min-width: min(360px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: min(560px, 70vh);
+  padding: 8px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-radius: 10px;
+  background: var(--ic-raised, #2a3945);
+  box-shadow: 0 12px 32px rgba(5, 10, 14, 0.55);
+}
+
+:where(.ic-root) .ic-search__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+:where(.ic-root) .ic-search__chip {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--ic-edge, #7a8b97);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition:
+    background-color var(--ic-t-quick, 120ms) cubic-bezier(0.2, 0, 0, 1),
+    color var(--ic-t-quick, 120ms) cubic-bezier(0.2, 0, 0, 1);
+}
+
+:where(.ic-root) .ic-search__chip[aria-pressed='true'] {
+  border-color: var(--ic-film, #e6ecef);
+  background: var(--ic-film, #e6ecef);
+  color: var(--ic-slate, #1b2630);
+}
+
+:where(.ic-root) .ic-search__caption {
+  margin: 0;
+  padding: 0 4px;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-search__caption[data-tone='empty'] {
+  color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-search__caption[data-tone='stale'] {
+  color: var(--ic-stale, #8a98a2);
+}
+
+:where(.ic-root) .ic-search__list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Result row: two lines, 52 px, a 2 px status bar on the left. */
+:where(.ic-root) .ic-search__row {
+  --ic-row-ink: var(--ic-stale, #8a98a2);
+  position: relative;
+  display: grid;
+  /* The aside (reason, id) never takes more than 40% of the row: the name
+     and its details keep the room, and the id ellipsizes. */
+  grid-template-columns: 16px minmax(0, 1fr) fit-content(40%);
+  align-items: center;
+  gap: 2px 12px;
+  min-height: 52px;
+  padding: 6px 12px 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+:where(.ic-root) .ic-search__row::before {
+  content: '';
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 0;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--ic-row-ink);
+}
+
+:where(.ic-root) .ic-search__row[data-tone='ok'] {
+  --ic-row-ink: var(--ic-ok, #5dd39b);
+}
+
+:where(.ic-root) .ic-search__row[data-tone='low'] {
+  --ic-row-ink: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-search__row[data-tone='warn'] {
+  --ic-row-ink: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-search__row[data-tone='critical'] {
+  --ic-row-ink: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-search__row[data-tone='unknown'] {
+  --ic-row-ink: var(--ic-unknown, #bba7e0);
+}
+
+:where(.ic-root) .ic-search__row:hover {
+  background: rgba(230, 236, 239, 0.05);
+}
+
+/* The active option: operator ink (film white), 1 px ring. */
+/* The tint stays at the hover level so Pencil text on it keeps 4.5:1; the
+   ring is the active cue. */
+:where(.ic-root) .ic-search__row[aria-selected='true'] {
+  background: rgba(230, 236, 239, 0.05);
+  box-shadow: inset 0 0 0 1px var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-search__main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+:where(.ic-root) .ic-search__label {
+  overflow: hidden;
+  color: var(--ic-film, #e6ecef);
+  font: 500 15px/20px var(--ic-font-sans, inherit);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Matched characters: weight, not colour. */
+:where(.ic-root) .ic-search__hit {
+  font-weight: 700;
+}
+
+:where(.ic-root) .ic-search__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 12px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-search__aside {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0;
+  min-width: 0;
+  max-width: 100%;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+  text-align: right;
+}
+
+:where(.ic-root) .ic-search__id {
+  font-size: 12px;
+  line-height: 16px;
+}
+
+:where(.ic-root) .ic-search__reason,
+:where(.ic-root) .ic-search__id {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-search__ask {
+  --ic-row-ink: var(--ic-analyst, #8cc8ff);
+  color: var(--ic-analyst, #8cc8ff);
+}
+
+:where(.ic-root) .ic-search__ask[aria-disabled='true'] {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+:where(.ic-root) .ic-search__reason-off {
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-search__foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  padding: 0 4px;
+}
+
+/* ---------------------------------------------------------- inspector */
+
+:where(.ic-root) .ic-inspector {
+  container: ic-inspector / inline-size;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--ic-panel, #22303b);
+  color: var(--ic-film, #e6ecef);
+  font-family: var(--ic-font-sans, inherit);
+}
+
+/* Wide: a plate over the lower stage (the stage must be positioned). The
+   canvas never resizes; the orb moves up via orb.setViewport. */
+:where(.ic-root) .ic-inspector[data-layout='wide'] {
+  position: absolute;
+  left: 24px;
+  right: 24px;
+  /* Above the honesty footer, which the shell sizes with this token. */
+  bottom: var(--ic-plate-bottom, 16px);
+  z-index: var(--ic-z-popover, 10);
+  max-width: 1080px;
+  max-height: min(300px, 36%);
+  margin-inline: auto;
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(5, 10, 14, 0.55);
+}
+
+/* Compact: a sheet over the analyst column, same width, orb keeps its size. */
+:where(.ic-root) .ic-inspector[data-layout='compact'] {
+  position: fixed;
+  top: var(--ic-inspector-top, 0);
+  right: 0;
+  bottom: 0;
+  z-index: var(--ic-z-sheet, 30);
+  width: var(--ic-analyst-w, clamp(360px, 36vw, 420px));
+  border-left: 1px solid var(--ic-hairline, rgba(230, 236, 239, 0.1));
+}
+
+/* Narrow: a full-screen sheet with Back, under the always-visible narrow
+   bar (fuel vs BINGO, critical count, tabs, banners), which the shell
+   measures into --ic-narrowbar-h. */
+:where(.ic-root) .ic-inspector[data-layout='narrow'] {
+  position: fixed;
+  inset: 0;
+  top: var(--ic-narrowbar-h, 0px);
+  z-index: var(--ic-z-sheet, 30);
+}
+
+:where(.ic-root) .ic-inspector__head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 16px 8px;
+  background: var(--ic-panel, #22303b);
+}
+
+/* The pinned approval banner on a sheet (compact, narrow). */
+:where(.ic-root) .ic-inspector__approval {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: -12px -16px 8px;
+  padding: 6px 12px 6px 16px;
+  border-left: 4px solid var(--ic-film, #e6ecef);
+  background: var(--ic-raised, #2a3945);
+  font: 600 13px/20px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-inspector__approvaltext {
+  min-width: 0;
+  margin: 0;
+}
+
+:where(.ic-root) .ic-inspector__review {
+  flex: none;
+  border-color: var(--ic-film, #e6ecef);
+  background: var(--ic-film, #e6ecef);
+  color: var(--ic-slate, #1b2630);
+}
+
+:where(.ic-root) .ic-inspector__review:hover {
+  background: var(--ic-film, #e6ecef);
+  color: var(--ic-slate, #1b2630);
+}
+
+:where(.ic-root) .ic-inspector__back {
+  align-self: flex-start;
+  margin-left: -8px;
+  padding: 0 8px;
+}
+
+:where(.ic-root) .ic-inspector__titlebar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  min-width: 0;
+}
+
+:where(.ic-root) .ic-inspector__title {
+  min-width: 0;
+  margin: 0;
+  color: var(--ic-film, #e6ecef);
+  font: 600 17px/24px var(--ic-font-sans, inherit);
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-inspector__type {
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-inspector__status {
+  font-size: 12px;
+  line-height: 16px;
+}
+
+:where(.ic-root) .ic-inspector__id {
+  color: var(--ic-pencil, #a3b0ba);
+  font-size: 12px;
+  line-height: 16px;
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-inspector__subtitle-line {
+  color: var(--ic-pencil, #a3b0ba);
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-inspector__notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 0 16px 8px;
+}
+
+:where(.ic-root) .ic-inspector__loading {
+  margin: 0;
+  padding: 0 16px;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-inspector__line {
+  margin: 0;
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-inspector__line[data-status='critical'] {
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-inspector__line[data-status='stale'] {
+  color: var(--ic-stale, #8a98a2);
+}
+
+:where(.ic-root) .ic-inspector__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 16px 12px;
+}
+
+:where(.ic-root) .ic-inspector__salute {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px 16px;
+  margin: 0;
+}
+
+:where(.ic-root) .ic-inspector__section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+:where(.ic-root) .ic-inspector__subtitle {
+  margin: 0;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-inspector__related {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+:where(.ic-root) .ic-inspector__related-label {
+  margin: 0;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 400 12px/16px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-inspector__prose {
+  max-width: 68ch;
+  margin: 0;
+  font: 400 15px/24px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-inspector__rawtext {
+  max-height: 240px;
+  margin: 6px 0 0;
+  padding: 8px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--ic-slate, #1b2630);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: pre;
+}
+
+:where(.ic-root) .ic-inspector__actions {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: auto;
+  padding: 8px 16px 12px;
+  border-top: 1px solid var(--ic-hairline, rgba(230, 236, 239, 0.1));
+  background: var(--ic-panel, #22303b);
+}
+
+:where(.ic-root) .ic-inspector__actions > :last-child {
+  margin-left: auto;
+}
+
+/* --------------------------------------------------------------- rail */
+
+:where(.ic-root) .ic-rail {
+  container: ic-rail / inline-size;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  color: var(--ic-film, #e6ecef);
+  font-family: var(--ic-font-sans, inherit);
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-rail__body {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  min-height: 0;
+  padding: 16px var(--ic-col-inset, 24px) 24px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+/* Sections are separated by space, never boxes. */
+:where(.ic-root) .ic-rail__section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+:where(.ic-root) .ic-rail__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+:where(.ic-root) .ic-rail__title {
+  margin: 0;
+  color: var(--ic-film, #e6ecef);
+  font: 600 15px/24px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-rail__aside {
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-rail__theater {
+  margin: 0;
+  font: 600 17px/24px var(--ic-font-sans, inherit);
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-rail__place,
+:where(.ic-root) .ic-rail__line,
+:where(.ic-root) .ic-rail__updated,
+:where(.ic-root) .ic-rail__margin,
+:where(.ic-root) .ic-rail__link {
+  margin: 0;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-rail__muted {
+  color: var(--ic-stale, #8a98a2);
+}
+
+:where(.ic-root) .ic-rail__vehicle,
+:where(.ic-root) .ic-rail__mission {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+:where(.ic-root) .ic-rail__rowhead {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+}
+
+:where(.ic-root) .ic-rail__name {
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ic-film, #e6ecef);
+  font: 600 15px/24px var(--ic-font-sans, inherit);
+  text-align: left;
+  cursor: pointer;
+}
+
+:where(.ic-root) .ic-rail__name:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+:where(.ic-root) .ic-rail__id {
+  color: var(--ic-pencil, #a3b0ba);
+  font-size: 12px;
+}
+
+:where(.ic-root) .ic-rail__state {
+  margin-left: auto;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-rail__readout {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+}
+
+:where(.ic-root) .ic-rail__bingo {
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-rail__progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+:where(.ic-root) .ic-rail__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+:where(.ic-root) .ic-rail__scope {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+:where(.ic-root) .ic-rail__scope-btn {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--ic-edge, #7a8b97);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+  cursor: pointer;
+}
+
+:where(.ic-root) .ic-rail__scope-btn[aria-pressed='true'] {
+  border-color: var(--ic-film, #e6ecef);
+  color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-rail__caveats {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  /* One text edge for the whole rail (no marker, so no indent). */
+  padding-left: 0;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-rail__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 4px 0 0;
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+}
+
+/* Alarm rows: severity glyph + word, kind, Zulu time, message. */
+:where(.ic-root) .ic-rail-alarm {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 0 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ic-film, #e6ecef);
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+  text-align: left;
+  cursor: pointer;
+}
+
+:where(.ic-root) .ic-rail-alarm:hover {
+  background: rgba(230, 236, 239, 0.05);
+}
+
+:where(.ic-root) .ic-rail-alarm__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 6px;
+  min-width: 0;
+}
+
+:where(.ic-root) .ic-rail-alarm__sev {
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-rail-alarm__kind {
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-rail-alarm__time {
+  color: var(--ic-pencil, #a3b0ba);
+  font-size: 12px;
+  text-align: right;
+}
+
+/* The "New" tag gets its own line under the kind, never over the message. */
+:where(.ic-root) .ic-rail-alarm__new {
+  grid-column: 2 / -1;
+  justify-self: start;
+}
+
+:where(.ic-root) .ic-rail-alarm__msg {
+  grid-column: 2 / -1;
+  color: var(--ic-pencil, #a3b0ba);
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-rail-alarm[data-severity='critical'] {
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-rail-alarm[data-severity='warning'] {
+  color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-rail-alarm[data-severity='info'] {
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+/* Compact: the 64 px strip. */
+:where(.ic-root) .ic-rail[data-layout='compact'] {
+  position: relative;
+  width: 64px;
+}
+
+:where(.ic-root) .ic-rail-strip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  width: 64px;
+  height: 100%;
+  padding: 16px 0;
+  border: 0;
+  background: transparent;
+  color: var(--ic-film, #e6ecef);
+  font-family: var(--ic-font-sans, inherit);
+  cursor: pointer;
+}
+
+:where(.ic-root) .ic-rail-strip:hover {
+  background: rgba(230, 236, 239, 0.04);
+}
+
+:where(.ic-root) .ic-rail-strip__veh {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+:where(.ic-root) .ic-rail-strip__initial {
+  font: 600 12px/16px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-rail-strip__count {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+
+:where(.ic-root) .ic-rail-strip__num {
+  font: 500 15px/20px
+    var(
+      --ic-font-mono,
+      'Atkinson Hyperlegible Mono',
+      'JetBrains Mono',
+      ui-monospace,
+      monospace
+    );
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-rail-strip__cap {
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-rail-strip__alarms[data-severity='critical'] {
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-rail-strip__alarms[data-severity='warning'] {
+  color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-rail-strip__assumed {
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+/* The 300 px e2 drawer over the stage. */
+:where(.ic-root) .ic-rail-drawer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 64px;
+  z-index: var(--ic-z-sheet, 30);
+  display: flex;
+  flex-direction: column;
+  width: 300px;
+  background: var(--ic-raised, #2a3945);
+  box-shadow: 0 12px 32px rgba(5, 10, 14, 0.55);
+}
+
+:where(.ic-root) .ic-rail-drawer__close {
+  align-self: flex-end;
+  margin: 8px 8px 0;
+}
+
+/* ------------------------------------------------------ abort confirm */
+
+:where(.ic-root) .ic-abort-confirm {
+  position: fixed;
+  top: 18vh;
+  left: 50%;
+  z-index: calc(var(--ic-z-sheet, 30) + 5);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(420px, calc(100vw - 32px));
+  padding: 16px;
+  border: 1px solid var(--ic-critical, #ff7b7b);
+  border-radius: 10px;
+  background: var(--ic-raised, #2a3945);
+  box-shadow: 0 12px 32px rgba(5, 10, 14, 0.55);
+  color: var(--ic-film, #e6ecef);
+  font-family: var(--ic-font-sans, inherit);
+  transform: translateX(-50%);
+}
+
+:where(.ic-root) .ic-abort-confirm__title {
+  margin: 0;
+  font: 600 17px/24px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-abort-confirm__body,
+:where(.ic-root) .ic-abort-confirm__result {
+  margin: 0;
+  font: 400 15px/24px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-abort-confirm__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+:where(.ic-root) .ic-abort-confirm[data-anchored] {
+  /* Placed next to the Abort that opened it (situation.js placeNear). */
+  transform: none;
+}
+
+:where(.ic-root) .ic-abort-confirm[data-outcome='aborted'] {
+  border-color: var(--ic-ok, #5dd39b);
+}
+
+:where(.ic-root) .ic-abort-confirm[data-state='failed'] {
+  border-color: var(--ic-warn, #f2b544);
+}
+
+/* ------------------------------------------------------------- states */
+
+:where(.ic-root) .ic-rail__updated[data-status='warn'],
+:where(.ic-root) .ic-rail__margin[data-status='warn'],
+:where(.ic-root) .ic-rail__link[data-status='warn'],
+:where(.ic-root) .ic-rail__line[data-status='warn'] {
+  color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-rail__updated[data-status='critical'],
+:where(.ic-root) .ic-rail__margin[data-status='critical'],
+:where(.ic-root) .ic-rail__link[data-status='critical'],
+:where(.ic-root) .ic-rail__line[data-status='critical'] {
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-rail__updated[data-status='stale'],
+:where(.ic-root) .ic-rail__link[data-status='stale'],
+:where(.ic-root) .ic-rail__line[data-status='stale'] {
+  color: var(--ic-stale, #8a98a2);
+}
+
+:where(.ic-root) .ic-rail__link[data-status='ok'],
+:where(.ic-root) .ic-rail__margin[data-status='ok'],
+:where(.ic-root) .ic-rail__line[data-status='ok'] {
+  color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-rail__state[data-status='critical'] {
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-rail__state[data-status='warn'] {
+  color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-rail__state[data-phase='executing'],
+:where(.ic-root) .ic-rail__state[data-phase='rtb'] {
+  color: var(--ic-magenta, #f27ad6);
+}
+
+/* ---------------------------------------------------- container queries */
+
+/* A search bar under 240 px (compact at 200% zoom, narrow) keeps its text:
+   the shortcut hint goes and the input's right padding with it. */
+@container ic-searchbar (max-width: 240px) {
+  :where(.ic-root) .ic-search__bar > .ic-search__kbd {
+    display: none;
+  }
+
+  :where(.ic-root) .ic-search__input {
+    padding-right: 12px;
+  }
+}
+
+/* A result list under 300 px stacks the reason and id under the name. */
+@container ic-searchpop (max-width: 300px) {
+  :where(.ic-root) .ic-search__row {
+    grid-template-columns: 16px minmax(0, 1fr);
+  }
+
+  :where(.ic-root) .ic-search__aside {
+    grid-column: 2;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 0 8px;
+    align-items: baseline;
+    text-align: left;
+  }
+}
+
+/* Narrow: the results span the header band (bar and toggle), and the id,
+   which the inspector shows, gives its room to the name. */
+:where(.ic-root[data-layout='narrow']) .ic-search__pop {
+  right: auto;
+  width: calc(100vw - 2 * var(--ic-inset, 16px));
+}
+
+:where(.ic-root[data-layout='narrow']) .ic-search__id {
+  display: none;
+}
+
+@container ic-inspector (min-width: 560px) {
+  :where(.ic-root) .ic-inspector__salute {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@container ic-rail (max-width: 200px) {
+  :where(.ic-root) .ic-rail-alarm {
+    grid-template-columns: 18px minmax(0, 1fr);
+  }
+
+  :where(.ic-root) .ic-rail-alarm__time {
+    grid-column: 2;
+    text-align: left;
+  }
+}
+
+/* ---------------------------------------------------------- narrow targets */
+
+@media (max-width: 719px) {
+  :where(.ic-root) .ic-kit-btn,
+  :where(.ic-root) .ic-rail__name,
+  :where(.ic-root) .ic-rail__scope-btn,
+  :where(.ic-root) .ic-search__chip,
+  :where(.ic-root) .ic-rail-alarm {
+    min-height: 44px;
+  }
+
+  :where(.ic-root) .ic-kit-btn--icon,
+  :where(.ic-root) .ic-search__pill-clear {
+    width: 44px;
+    height: 44px;
+  }
+}
+
+/* ------------------------------------------------------- reduced motion */
+
+@media (prefers-reduced-motion: reduce) {
+  :where(.ic-root) .ic-kit-btn,
+  :where(.ic-root) .ic-kit-chip,
+  :where(.ic-root) .ic-search__chip {
+    transition: none;
+  }
+}
+
+/* ------------------------------------------------------------- contrast */
+
+@media (prefers-contrast: more) {
+  :where(.ic-root) .ic-inspector__actions,
+  :where(.ic-root) .ic-rail-drawer {
+    border-color: rgba(230, 236, 239, 0.35);
+  }
+
+  :where(.ic-root) .ic-kit-note,
+  :where(.ic-root) .ic-kit-dl__term,
+  :where(.ic-root) .ic-kit-cell__term,
+  :where(.ic-root) .ic-search__meta,
+  :where(.ic-root) .ic-search__aside,
+  :where(.ic-root) .ic-rail__line,
+  :where(.ic-root) .ic-rail__place,
+  :where(.ic-root) .ic-rail__caveats {
+    color: var(--ic-film, #e6ecef);
+  }
+
+  :where(.ic-root) .ic-kit-assumed {
+    text-decoration-thickness: 2px;
+  }
+}
+
+/* -------------------------------------------------------- forced colours */
+
+@media (forced-colors: active) {
+  :where(.ic-root) .ic-kit-fuel,
+  :where(.ic-root) .ic-kit-progress {
+    border: 1px solid CanvasText;
+  }
+
+  :where(.ic-root) .ic-kit-fuel__fill,
+  :where(.ic-root) .ic-kit-progress__fill,
+  :where(.ic-root) .ic-kit-fuel__tick {
+    background: Highlight;
+  }
+
+  :where(.ic-root) .ic-search__row[aria-selected='true'] {
+    outline: 2px solid Highlight;
+  }
+
+  :where(.ic-root) .ic-abort-confirm {
+    border: 2px solid CanvasText;
+  }
+}

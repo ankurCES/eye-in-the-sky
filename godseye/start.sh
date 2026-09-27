@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # start.sh — single startup for the Godseye UAV ISR sim.
 #
-# launch.py already starts: sim backend (fake or real), MCP server (:8791),
-# and the telemetry bridge (:8790). We only add the Gods-Eye-View UI (vite).
+# ONE Python process (godseye_uav.app --headless) runs the sim backend (fake
+# or real), the MCP server, the telemetry bridge, the intel graph, the AI
+# analyst and the built console UI, all on the bridge port (:8790). The same
+# app is ALSO served on the MCP port (:8791), so http://127.0.0.1:8791/mcp and
+# every other existing URL keep working. We add the Gods-Eye-View dev UI
+# (vite, :4173) for UI development.
+#
+# godseye_uav.launch (the older three-listener launcher) is unchanged and still
+# used by the tests; this script no longer starts it.
 #
 # For the full PLAN §8.1 experience — boot, wait for readiness, open the
 # browser and fly the scripted recon mission — use ./scripts/demo_laptop.sh,
@@ -14,6 +21,7 @@
 #   THEATER=ukraine-donbas ./start.sh
 #
 # Env overrides: THEATER SIM_BACKEND AIRSIM_PORT BRIDGE_PORT MCP_PORT UI_PORT TOKEN
+#                STORE (default: godseye/.godseye/store, absolute)
 #
 # THEATER ids come from godseye_uav/theaters.py — the single source of truth
 # for home, AO and demo geometry. This script does not keep its own list; an
@@ -29,6 +37,7 @@ BRIDGE_PORT="${BRIDGE_PORT:-8790}"
 MCP_PORT="${MCP_PORT:-8791}"
 UI_PORT="${UI_PORT:-4173}"
 TOKEN="${TOKEN:-dev-token}"
+STORE="${STORE:-$ROOT/.godseye/store}"
 
 # AirSim client: override, else sibling checkout, else the pinned copy that
 # scripts/setup.sh fetches. One resolver shared with demo_laptop.sh so the two
@@ -104,14 +113,20 @@ else
   REAL_FLAG=""
 fi
 
-# launch.py starts sim + MCP server + telemetry bridge in one process
+# godseye_uav.app starts sim + MCP + bridge + intel + analyst in one process,
+# serving the same app on the bridge port and the MCP port.
+#
+# The token goes in through the environment of that one process, NOT on its
+# command line: argv is readable by every local user (`ps`), a process's
+# environment only by its owner. app.py reads GODSEYE_TOKEN and removes it
+# from its own environment before anything (the analyst's CLI) is spawned.
 echo "[start] sim+MCP+bridge: theater=$THEATER sim=:$AIRSIM_PORT mcp=:$MCP_PORT bridge=:$BRIDGE_PORT"
-"$PY" -m godseye_uav.launch \
+GODSEYE_TOKEN="$TOKEN" "$PY" -m godseye_uav.app --headless \
   --theater "$THEATER" \
   --sim-port "$AIRSIM_PORT" \
+  --port "$BRIDGE_PORT" \
   --mcp-port "$MCP_PORT" \
-  --bridge-port "$BRIDGE_PORT" \
-  --token "$TOKEN" \
+  --store "$STORE" \
   $REAL_FLAG &
 PIDS+=($!)
 
@@ -130,10 +145,15 @@ echo "        sim      : $SIM_BACKEND (127.0.0.1:$AIRSIM_PORT)"
 echo "        MCP      : http://127.0.0.1:$MCP_PORT/mcp"
 echo "        bridge   : http://127.0.0.1:$BRIDGE_PORT/snapshot"
 echo "        UI       : http://localhost:$UI_PORT"
+echo "        console  : http://127.0.0.1:$BRIDGE_PORT/  (built UI, same origin; needs 'npm run build')"
 echo "        theater  : $THEATER"
+echo "        store    : $STORE"
 echo ""
+# Only the well-known dev default is echoed; a token you chose stays out of
+# the terminal and of any log this output is redirected into.
+if [ "$TOKEN" = "dev-token" ]; then TOKEN_SHOWN="dev-token"; else TOKEN_SHOWN='"$TOKEN"'; fi
 echo "[start] fly the scripted demo against this stack:"
-echo "        $PY $ROOT/scripts/demo_mission.py --mcp-url http://127.0.0.1:$MCP_PORT/mcp --token $TOKEN --theater $THEATER"
+echo "        $PY $ROOT/scripts/demo_mission.py --mcp-url http://127.0.0.1:$MCP_PORT/mcp --token $TOKEN_SHOWN --theater $THEATER"
 echo ""
 echo "[start] Ctrl-C to stop everything."
 

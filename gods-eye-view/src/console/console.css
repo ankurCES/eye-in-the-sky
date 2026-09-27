@@ -1,0 +1,1244 @@
+/*
+ * Eye in the Sky: intelligence console (UX spec §2, §3, §8, §11.2).
+ *
+ * Linked from index.html; never imported from JS (node:test cannot import
+ * CSS). The reset, then the per-owner partials, are imported first, so the
+ * partials beat the reset and rules here win ties.
+ *
+ * Rules (§11.2): no @layer (GEV's unlayered sheets would beat every layered
+ * rule); tokens live on .ic-root, never :root; components are flat single
+ * ic- classes, state lives in attributes, specificity ceiling (0,2,0); only
+ * the root switches layout, through grid areas and variables; never select a
+ * GEV id or class; no backdrop-filter anywhere; !important only on [hidden]
+ * and in the reduced-motion block.
+ *
+ * File order: tokens, fallback @font-face, reset, shell grid, components
+ * (alphabetical), states, container queries, layout media queries,
+ * prefers-reduced-motion, prefers-contrast, forced-colors.
+ */
+@import './reset.css';
+@import './orb/orb.css';
+@import './chat/chat.css';
+@import './panels.css';
+
+/* 1. Tokens ---------------------------------------------------------------- */
+
+.ic-root {
+  /* Core palette (§2.1) */
+  --ic-slate: #1b2630;
+  --ic-panel: #22303b;
+  --ic-raised: #2a3945;
+  --ic-film: #e6ecef;
+  --ic-pencil: #a3b0ba;
+  --ic-magenta: #f27ad6;
+  --ic-analyst: #8cc8ff;
+  --ic-slip: #bcc3be;
+  --ic-ink: #12202a;
+  --ic-ink-2: #2e3d48;
+  --ic-edge: #7a8b97;
+  --ic-graticule: #3a4a56;
+  --ic-hairline: rgba(230, 236, 239, 0.1);
+  --ic-body-glow: #243340;
+
+  /* Status (§2.2): on slate, and the -slip variants for night paper */
+  --ic-ok: #5dd39b;
+  --ic-ok-slip: #0f5230;
+  --ic-low: #e6ecef;
+  --ic-low-slip: #12202a;
+  --ic-warn: #f2b544;
+  --ic-warn-slip: #6b4400;
+  --ic-critical: #ff7b7b;
+  --ic-critical-slip: #8f1a14;
+  --ic-stale: #8a98a2;
+  --ic-stale-slip: #414f58;
+  --ic-unknown: #bba7e0;
+  --ic-unknown-slip: #4a3775;
+  --ic-critical-tint: rgba(255, 123, 123, 0.14);
+  --ic-warn-tint: rgba(242, 181, 68, 0.12);
+
+  /* Approval classes (§2.3): slate / slip */
+  --ic-class-read: #a3b0ba;
+  --ic-class-plan: #a3b0ba;
+  --ic-class-sensor: #a4a9ff;
+  --ic-class-sensor-slip: #343899;
+  --ic-class-command: #f27ad6;
+  --ic-class-command-slip: #7e0f62;
+  --ic-class-sim: #cdbc8c;
+  --ic-class-sim-slip: #5a4812;
+  --ic-class-override: #ff7b7b;
+  --ic-class-override-slip: #8f1a14;
+
+  /* Type (§2.4) */
+  --ic-font-sans:
+    'Atkinson Hyperlegible Next', 'Atkinson Hyperlegible', 'IC Sans Fallback',
+    -apple-system, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
+  --ic-font-mono:
+    'Atkinson Hyperlegible Mono', 'JetBrains Mono', ui-monospace, 'SF Mono',
+    Menlo, Consolas, monospace;
+  --ic-type-caption: 500 12px/16px var(--ic-font-sans);
+  --ic-type-small: 400 13px/20px var(--ic-font-sans);
+  --ic-type-body: 400 15px/24px var(--ic-font-sans);
+  --ic-type-body-strong: 600 15px/24px var(--ic-font-sans);
+  --ic-type-title: 600 17px/24px var(--ic-font-sans);
+  --ic-type-heading: 600 22px/28px var(--ic-font-sans);
+  --ic-heading-tracking: -0.01em;
+  --ic-type-readout: 500 22px/28px var(--ic-font-mono);
+  --ic-type-data: 400 13px/20px var(--ic-font-mono);
+  --ic-type-data-row: 400 12px/16px var(--ic-font-mono);
+  --ic-measure: 68ch;
+  --ic-underline-w: 1px;
+
+  /* Space (§2.5), 4 px baseline */
+  --ic-s-1: 2px;
+  --ic-s-2: 4px;
+  --ic-s-3: 8px;
+  --ic-s-4: 12px;
+  --ic-s-5: 16px;
+  --ic-s-6: 24px;
+  --ic-s-7: 32px;
+  --ic-s-8: 48px;
+  --ic-s-9: 64px;
+  --ic-inset: 24px;
+  --ic-col-inset: var(--ic-inset);
+  --ic-header-h: 56px;
+  --ic-plate-bottom: 40px;
+  --ic-target: 32px;
+
+  /* Radii, set by hierarchy */
+  --ic-r-column: 0;
+  --ic-r-slip: 3px;
+  --ic-r-chip: 4px;
+  --ic-r-control: 6px;
+  --ic-r-popover: 10px;
+
+  /* Elevation: lightness first */
+  --ic-shadow-e2: 0 12px 32px rgba(5, 10, 14, 0.55);
+  --ic-shadow-slip:
+    inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 2px 6px rgba(3, 8, 12, 0.4),
+    0 16px 40px rgba(3, 8, 12, 0.55);
+  --ic-scrim: rgba(14, 20, 26, 0.72);
+
+  /* Motion */
+  --ic-t-quick: 120ms;
+  --ic-t-settle: 200ms;
+  --ic-t-camera: 320ms;
+  --ic-t-travel: 600ms;
+  --ic-t-arm: 800ms;
+  --ic-t-ripple: 900ms;
+  --ic-t-notice: 3000ms;
+  --ic-t-fade: 200ms;
+  --ic-ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ic-ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ic-ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+
+  /* Layers inside .ic-root */
+  --ic-z-labels: 1;
+  --ic-z-tether: 5;
+  --ic-z-popover: 10;
+  --ic-z-banner: 20;
+  --ic-z-rail: 25;
+  --ic-z-sheet: 30;
+  --ic-z-toast: 40;
+
+  /* Layout variables: only the root switches them (§3). */
+  --ic-rail-w: clamp(248px, 17vw, 320px);
+  --ic-analyst-w: clamp(420px, 31vw, 520px);
+  --ic-main-cols: var(--ic-rail-w) minmax(0, 1fr);
+  --ic-stage-col: 2;
+  --ic-stage-left: var(--ic-rail-w);
+  --ic-rail-overflow: hidden auto;
+
+  /* GEV's global ring is `outline: 2px solid var(--text-primary)`: keep it
+     visible on slate (§9). The slip redefines it for night paper. */
+  --text-primary: #e6ecef;
+}
+
+.ic-slip {
+  --text-primary: #12202a;
+}
+
+/* 2. Offline fallback face, metrics matched so the late swap doesn't reflow. */
+
+@font-face {
+  font-family: 'IC Sans Fallback';
+  src: local('SF Pro Text'), local('Helvetica Neue'), local('Arial');
+  size-adjust: 103%;
+  ascent-override: 92%;
+  descent-override: 24%;
+}
+
+/* 3. Reset: ./reset.css, imported first so the partials win ties. ------- */
+
+/* 4. Shell grid ---------------------------------------------------------------- */
+
+.ic-root {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--ic-analyst-w);
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-areas:
+    'top top'
+    'main analyst';
+  overflow: hidden;
+  /* Nothing may scroll the console layer itself (a focus() or
+     scrollIntoView() inside it once shifted it up and uncovered GEV). */
+  overflow: clip;
+  isolation: isolate;
+  background: transparent;
+  color: var(--ic-film);
+  font: var(--ic-type-body);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  text-align: left;
+  -webkit-font-smoothing: antialiased;
+}
+
+.ic-main {
+  grid-area: main;
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--ic-main-cols);
+  grid-template-rows: minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  background: var(--ic-slate);
+  transition:
+    opacity var(--ic-t-fade) var(--ic-ease-out),
+    visibility 0s;
+}
+
+.ic-analyst {
+  grid-area: analyst;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--ic-panel);
+  border-left: 1px solid var(--ic-hairline);
+  container: ic-analyst / inline-size;
+}
+
+.ic-analyst__body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.ic-col {
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.ic-col--rail {
+  grid-column: 1;
+  position: relative;
+  /* Above the stage and its banner, so the compact drawer can cover them. */
+  z-index: var(--ic-z-rail);
+  overflow: var(--ic-rail-overflow);
+  background: var(--ic-panel);
+  border-right: 1px solid var(--ic-hairline);
+}
+
+/* A one-cell grid: the rail panel stretches to the column's full height,
+   so the compact drawer (top 0, bottom 0) spans the viewport. */
+.ic-railhost {
+  display: grid;
+  min-height: 100%;
+}
+
+.ic-stage {
+  grid-row: 1;
+  grid-column: var(--ic-stage-col);
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto var(--ic-header-h) auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--ic-slate);
+}
+
+/* Tracking: the map shows through; only the dock and banners take input. */
+.ic-root[data-mode='tracking'] {
+  --ic-stage-left: 0px;
+  pointer-events: none;
+}
+
+/* The chip tether is a full-root canvas: it must never take input, or it
+   covers the map and the dock (its own pointer-events:none loses to this). */
+.ic-root[data-mode='tracking'] > :where(:not(.ic-main, .ic-tether)) {
+  pointer-events: auto;
+}
+
+/* 5. Components (alphabetical) ---------------------------------------------- */
+
+.ic-backfloat {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: var(--ic-z-toast);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 0 14px 0 10px;
+  border-radius: var(--ic-r-popover);
+  background: var(--ic-panel);
+  box-shadow: var(--ic-shadow-e2);
+  font: var(--ic-type-body-strong);
+}
+
+.ic-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 40px;
+  padding: 4px 8px 4px 12px;
+  border-left: 4px solid var(--ic-critical);
+  background:
+    linear-gradient(var(--ic-critical-tint), var(--ic-critical-tint)),
+    var(--ic-panel);
+  color: var(--ic-film);
+  font: var(--ic-type-small);
+}
+
+.ic-banner__text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+}
+
+.ic-bannerhost {
+  z-index: var(--ic-z-banner);
+}
+
+.ic-btn {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: var(--ic-target);
+  padding: 0 12px;
+  border: 1px solid var(--ic-edge);
+  border-radius: var(--ic-r-control);
+  background: transparent;
+  color: var(--ic-film);
+  font: var(--ic-type-small);
+  font-weight: 600;
+  white-space: nowrap;
+  transition:
+    background-color var(--ic-t-quick) var(--ic-ease-out),
+    border-color var(--ic-t-quick) var(--ic-ease-out),
+    color var(--ic-t-quick) var(--ic-ease-out);
+}
+
+.ic-btn:hover {
+  background: var(--ic-raised);
+}
+
+.ic-btn[data-variant='primary'] {
+  border-color: var(--ic-film);
+  background: var(--ic-film);
+  color: var(--ic-ink);
+}
+
+.ic-btn:where([data-variant='primary']):hover {
+  background: #ffffff;
+}
+
+.ic-btn[data-variant='danger'] {
+  border-color: var(--ic-critical);
+  color: var(--ic-critical);
+}
+
+.ic-btn[data-variant='link'] {
+  position: relative;
+  min-height: 24px;
+  padding: 0 4px;
+  border-color: transparent;
+  color: var(--ic-film);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* A link sits in a line of text at 24 px; its hit area reaches the target
+   size (32 px, 44 px at narrow) without changing the line. */
+.ic-btn[data-variant='link']::after {
+  content: '';
+  position: absolute;
+  inset: calc((24px - var(--ic-target)) / 2) 0;
+}
+
+.ic-btn[data-variant='icon'] {
+  width: var(--ic-target);
+  padding: 0;
+  border-color: transparent;
+  color: var(--ic-pencil);
+}
+
+.ic-btn[data-variant='on-critical'] {
+  border-color: var(--ic-film);
+}
+
+.ic-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.ic-caption {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 4px 12px;
+  min-height: 32px;
+  max-width: 100%;
+  color: var(--ic-pencil);
+  font: var(--ic-type-small);
+}
+
+.ic-caption[data-kind='analyst'] {
+  color: var(--ic-analyst);
+}
+
+.ic-caption[data-kind='progress'] {
+  color: var(--ic-film);
+}
+
+.ic-caption__detail {
+  color: var(--ic-pencil);
+  font: var(--ic-type-data);
+}
+
+.ic-dock {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px var(--ic-inset) 12px;
+  border-bottom: 1px solid var(--ic-hairline);
+}
+
+.ic-dock__actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ic-dock__back {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 72px;
+  padding: 4px 8px 4px 4px;
+  border-radius: var(--ic-r-control);
+  font: var(--ic-type-title);
+  transition: background-color var(--ic-t-quick) var(--ic-ease-out);
+}
+
+.ic-dock__back:hover {
+  background: var(--ic-raised);
+}
+
+.ic-dock__badge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--ic-critical);
+  color: var(--ic-ink);
+  font: var(--ic-type-caption);
+  line-height: 18px;
+  text-align: center;
+}
+
+.ic-dock__fuel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ic-dock__kbd,
+.ic-kbd {
+  display: inline-block;
+  padding: 0 6px;
+  border: 1px solid var(--ic-edge);
+  border-radius: var(--ic-r-chip);
+  color: var(--ic-pencil);
+  font: var(--ic-type-data-row);
+}
+
+.ic-dock__line,
+.ic-dock__readout {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 12px;
+}
+
+.ic-dock__line {
+  font: var(--ic-type-body-strong);
+}
+
+.ic-dock__readout {
+  font: var(--ic-type-small);
+}
+
+.ic-dock__link {
+  color: var(--ic-pencil);
+  font: var(--ic-type-small);
+}
+
+.ic-dock__link[data-status='ok'] {
+  color: var(--ic-ok);
+}
+
+.ic-dock__link[data-status='warn'] {
+  color: var(--ic-warn);
+}
+
+.ic-dock__link[data-status='critical'] {
+  color: var(--ic-critical);
+}
+
+.ic-dock__mini {
+  display: grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+  color: var(--ic-pencil);
+}
+
+.ic-dock__miniwrap {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  overflow: visible;
+  background: radial-gradient(
+    circle at 35% 30%,
+    var(--ic-body-glow),
+    var(--ic-slate)
+  );
+  box-shadow: inset 0 0 0 1px rgba(230, 236, 239, 0.16);
+}
+
+.ic-dock__vehicle {
+  color: var(--ic-film);
+}
+
+.ic-docktab {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  z-index: var(--ic-z-sheet);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: 48px;
+  min-height: 160px;
+  padding: 12px 0;
+  border-radius: var(--ic-r-popover) 0 0 var(--ic-r-popover);
+  background: var(--ic-panel);
+  box-shadow: var(--ic-shadow-e2);
+  color: var(--ic-film);
+  transform: translateY(-50%);
+}
+
+.ic-docktab__badge,
+.ic-tab__badge {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--ic-film);
+  color: var(--ic-ink);
+  font: var(--ic-type-caption);
+  line-height: 18px;
+  text-align: center;
+}
+
+.ic-docktab__fuel {
+  display: flex;
+  justify-content: center;
+  height: 40px;
+}
+
+.ic-footer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  max-width: 100%;
+  color: var(--ic-pencil);
+  font: var(--ic-type-caption);
+  text-align: center;
+}
+
+.ic-footer__invite {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 4px 12px;
+  color: var(--ic-film);
+  font: var(--ic-type-body);
+}
+
+.ic-icon {
+  display: inline-block;
+  flex: none;
+  font-family: 'Material Symbols Outlined';
+  font-size: 20px;
+  font-style: normal;
+  font-weight: normal;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: nowrap;
+  direction: ltr;
+  font-feature-settings: 'liga';
+  -webkit-font-smoothing: antialiased;
+}
+
+.ic-listhost {
+  grid-row: 4;
+  grid-column: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--ic-s-5) var(--ic-inset) 80px;
+}
+
+.ic-live,
+.ic-vh {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.ic-mapbanner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: var(--ic-analyst-w);
+  padding: 8px var(--ic-inset) 0;
+}
+
+.ic-narrowbar {
+  grid-area: top;
+  position: relative;
+  z-index: var(--ic-z-banner);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px var(--ic-inset) 0;
+  border-bottom: 1px solid var(--ic-hairline);
+  background: var(--ic-panel);
+}
+
+.ic-narrowbar__approval {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+  padding: 4px 8px 4px 12px;
+  border-left: 4px solid var(--ic-film);
+  background: var(--ic-raised);
+  font: var(--ic-type-small);
+}
+
+.ic-narrowbar__crit {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  color: var(--ic-critical);
+  font: var(--ic-type-body-strong);
+}
+
+.ic-narrowbar__fleet {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  font: var(--ic-type-small);
+}
+
+/* §3c: fuel vs BINGO and the critical count share one line. */
+.ic-narrowbar__bar {
+  flex: 1 1 64px;
+  min-width: 48px;
+  max-width: 160px;
+}
+
+.ic-narrowbar__theater {
+  font: var(--ic-type-title);
+}
+
+.ic-narrowbar__vehicle {
+  font-weight: 600;
+}
+
+.ic-orba11y {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.ic-orbwrap {
+  grid-row: 4;
+  grid-column: 1;
+  position: relative;
+  min-height: 0;
+}
+
+.ic-panelerror {
+  padding: var(--ic-s-5) var(--ic-inset);
+  color: var(--ic-pencil);
+  font: var(--ic-type-small);
+}
+
+/* The inspector's host: never positioned, so the plate (absolute at wide)
+   is laid out against the stage; its height reserves the plate's room so the
+   caption sits above it and the honesty footer below. */
+.ic-plate {
+  width: 100%;
+  height: var(--ic-plate-h, 0px);
+}
+
+.ic-popover {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border-radius: var(--ic-r-popover);
+  background: var(--ic-raised);
+  box-shadow: var(--ic-shadow-e2);
+  color: var(--ic-film);
+}
+
+.ic-popover__body {
+  font: var(--ic-type-small);
+}
+
+.ic-popover__hint {
+  color: var(--ic-pencil);
+  font: var(--ic-type-data);
+  overflow-wrap: anywhere;
+}
+
+.ic-popover__title {
+  font: var(--ic-type-title);
+}
+
+.ic-searchband {
+  container: ic-searchband / inline-size;
+  grid-row: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--ic-header-h);
+  padding: 8px var(--ic-inset);
+  border-bottom: 1px solid var(--ic-hairline);
+}
+
+.ic-searchhost {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ic-sheet {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: var(--ic-z-sheet);
+  width: min(480px, calc(100% - 32px));
+  max-height: calc(100% - 64px);
+  overflow: auto;
+  padding: 16px 20px 20px;
+  border-radius: var(--ic-r-popover);
+  background: var(--ic-raised);
+  box-shadow: var(--ic-shadow-e2);
+  transform: translate(-50%, -50%);
+}
+
+.ic-sheet__desc {
+  color: var(--ic-film);
+  font: var(--ic-type-small);
+}
+
+.ic-sheet__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.ic-sheet__list {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px 16px;
+}
+
+.ic-sheet__title {
+  flex: 1 1 auto;
+  font: var(--ic-type-title);
+}
+
+.ic-skip {
+  min-height: 32px;
+  padding: 0 12px;
+  border-radius: var(--ic-r-control);
+  background: var(--ic-film);
+  color: var(--ic-ink);
+  font: var(--ic-type-small);
+  font-weight: 600;
+}
+
+.ic-skip:not(:focus) {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.ic-skips {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: var(--ic-z-toast);
+  display: flex;
+  gap: 8px;
+}
+
+.ic-spine {
+  display: flex;
+  flex: 1 1 auto;
+  justify-content: center;
+  width: 100%;
+  padding-top: 16px;
+  color: var(--ic-pencil);
+}
+
+.ic-spine:hover {
+  background: var(--ic-raised);
+  color: var(--ic-film);
+}
+
+.ic-spinepop {
+  position: absolute;
+  top: 16px;
+  right: calc(100% + 8px);
+  z-index: var(--ic-z-popover);
+  width: 360px;
+  max-width: calc(100vw - 88px);
+}
+
+.ic-stage__bottom {
+  grid-row: 4;
+  grid-column: 1;
+  align-self: end;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 0 var(--ic-inset) 12px;
+  pointer-events: none;
+}
+
+.ic-stage__bottom > * {
+  pointer-events: auto;
+}
+
+.ic-status {
+  grid-row: 3;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px var(--ic-inset);
+  border-bottom: 1px solid var(--ic-hairline);
+  color: var(--ic-film);
+  font: var(--ic-type-small);
+}
+
+.ic-status[data-tone='critical'] {
+  background: var(--ic-critical-tint);
+}
+
+.ic-status[data-tone='warn'] {
+  background: var(--ic-warn-tint);
+}
+
+.ic-status[data-tone='ok'] {
+  color: var(--ic-ok);
+}
+
+.ic-status__text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.ic-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 44px;
+  border-bottom: 2px solid transparent;
+  color: var(--ic-pencil);
+  font: var(--ic-type-body-strong);
+}
+
+.ic-tab[aria-selected='true'] {
+  border-bottom-color: var(--ic-film);
+  color: var(--ic-film);
+}
+
+.ic-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.ic-toast {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  max-width: 560px;
+  padding: 10px 12px 10px 16px;
+  border-left: 3px solid var(--ic-analyst);
+  border-radius: var(--ic-r-popover);
+  background: var(--ic-raised);
+  box-shadow: var(--ic-shadow-e2);
+  pointer-events: auto;
+  font: var(--ic-type-small);
+}
+
+.ic-toast[data-source='launch'] {
+  border-left-color: var(--ic-magenta);
+}
+
+.ic-toast[data-kind='error'] {
+  border-left-color: var(--ic-warn);
+}
+
+.ic-toast__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.ic-toast__text {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.ic-toasts {
+  position: absolute;
+  right: var(--ic-analyst-w);
+  bottom: 96px;
+  left: var(--ic-stage-left);
+  z-index: var(--ic-z-toast);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px;
+  pointer-events: none;
+}
+
+.ic-viewtoggle {
+  display: inline-flex;
+  flex: none;
+  overflow: hidden;
+  border: 1px solid var(--ic-edge);
+  border-radius: var(--ic-r-control);
+}
+
+.ic-viewtoggle__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: var(--ic-target);
+  padding: 0 10px;
+  color: var(--ic-pencil);
+  font: var(--ic-type-small);
+}
+
+.ic-viewtoggle__btn[aria-pressed='true'] {
+  background: var(--ic-raised);
+  color: var(--ic-film);
+}
+
+/* Reading registers (§2.6), shared by every panel. */
+
+.ic-reg-assumed {
+  text-decoration: underline dotted var(--ic-underline-w) var(--ic-pencil);
+  text-underline-offset: 3px;
+}
+
+.ic-reg-estimated::before {
+  content: '≈\00a0';
+}
+
+.ic-reg-not-assessed {
+  color: var(--ic-unknown);
+  font-style: italic;
+}
+
+.ic-reg-noreading {
+  display: inline-flex;
+  gap: 6px;
+  padding: 1px 6px;
+  border: 1px dashed var(--ic-stale);
+  border-radius: var(--ic-r-chip);
+  color: var(--ic-pencil);
+  font: var(--ic-type-caption);
+}
+
+.ic-reg-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  border: 1px solid var(--ic-graticule);
+  border-radius: var(--ic-r-chip);
+  color: var(--ic-pencil);
+  font: var(--ic-type-caption);
+}
+
+.ic-segs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  column-gap: 12px;
+}
+
+/* 6. States ---------------------------------------------------------------- */
+
+/* The iris (§8): a hole in .ic-main from the vehicle node to the keyhole. */
+.ic-main[data-iris] {
+  -webkit-mask-image: radial-gradient(
+    circle at var(--ic-iris-x, 50%) var(--ic-iris-y, 50%),
+    transparent var(--ic-iris-r, 0px),
+    #000 calc(var(--ic-iris-r, 0px) + 1px)
+  );
+  mask-image: radial-gradient(
+    circle at var(--ic-iris-x, 50%) var(--ic-iris-y, 50%),
+    transparent var(--ic-iris-r, 0px),
+    #000 calc(var(--ic-iris-r, 0px) + 1px)
+  );
+}
+
+.ic-main[data-fade='out'] {
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity var(--ic-t-fade) var(--ic-ease-in),
+    visibility 0s linear var(--ic-t-fade);
+}
+
+.ic-root[data-spine='on'] {
+  --ic-analyst-w: 56px;
+}
+
+.ic-root[data-dock='collapsed'] {
+  --ic-analyst-w: 0px;
+}
+
+.ic-root[data-icons='off'] :where(.ic-icon, .material-symbols-outlined) {
+  display: none;
+}
+
+/* 7. Container queries ------------------------------------------------------- */
+
+@container ic-analyst (max-width: 380px) {
+  .ic-dock__kbd {
+    display: none;
+  }
+}
+
+/* A stage under 360 px (compact at 200% zoom): Orb | List keep their names
+   for assistive tech but show icons only, so the search bar keeps its room. */
+@container ic-searchband (max-width: 360px) {
+  .ic-viewtoggle__label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+/* F6 regions: GEV's ring is drawn inside the region, where the column edges
+   and neighbours can't clip it (only outline-offset changes; the ring
+   itself stays GEV's). */
+:where(.ic-root) .ic-railhost:focus-visible,
+:where(.ic-root) .ic-stage:focus-visible,
+:where(.ic-root) .ic-analyst__body:focus-visible,
+:where(.ic-root) .ic-plate:focus-visible,
+:where(.ic-root) .ic-inspector:focus-visible {
+  outline-offset: -2px;
+}
+
+/* 8. Layout (the root's data-layout, set by a ResizeObserver) ------------------ */
+
+.ic-root[data-layout='compact'] {
+  --ic-rail-w: 64px;
+  --ic-rail-overflow: visible;
+  --ic-analyst-w: clamp(360px, 36vw, 420px);
+  --ic-inset: 16px;
+  /* The inspector sheet leaves the analyst header uncovered, so its status
+     word ("Waiting for your approval") stays in view (§3a). */
+  --ic-inspector-top: var(--ic-header-h);
+}
+
+/* The unavailable spine and the collapsed dock beat the compact width
+   (same specificity, later in the file). */
+.ic-root[data-spine='on']:where([data-layout='compact']) {
+  --ic-analyst-w: 56px;
+}
+
+.ic-root[data-dock='collapsed']:where([data-layout='compact']) {
+  --ic-analyst-w: 0px;
+}
+
+.ic-root[data-layout='narrow'] {
+  --ic-rail-w: 0px;
+  --ic-analyst-w: 0px;
+  --ic-main-cols: minmax(0, 1fr);
+  --ic-stage-col: 1;
+  --ic-stage-left: 0px;
+  --ic-inset: 16px;
+  --ic-target: 44px;
+  --ic-searchbar-h: 44px;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    'top'
+    'main';
+}
+
+.ic-root[data-layout='narrow'] :where(.ic-analyst) {
+  grid-area: main;
+  border-left: 0;
+}
+
+/* Narrow tracking: the map is full screen; the dock is a bottom sheet. */
+.ic-root[data-mode='tracking']:where([data-layout='narrow'])
+  :where(.ic-analyst) {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  max-height: 50vh;
+  border-radius: var(--ic-r-popover) var(--ic-r-popover) 0 0;
+  box-shadow: var(--ic-shadow-e2);
+}
+
+.ic-root[data-layout='narrow'] :where(.ic-toasts) {
+  bottom: 24px;
+}
+
+/* 44 px controls in the 56 px band: less padding, same band. */
+.ic-root[data-layout='narrow'] :where(.ic-searchband) {
+  padding-block: 4px;
+}
+
+/* Narrow tracking: the critical banner starts under the floating Back to
+   console (12 px + 44 px + 8 px), never beneath it. */
+.ic-root[data-mode='tracking']:where([data-layout='narrow'])
+  :where(.ic-mapbanner) {
+  top: 64px;
+}
+
+/* Before the first measurement: the same breakpoints as media queries. */
+@media (max-width: 1279px) {
+  .ic-root:not([data-layout]) {
+    --ic-rail-w: 64px;
+    --ic-analyst-w: clamp(360px, 36vw, 420px);
+    --ic-inset: 16px;
+  }
+}
+
+@media (max-width: 719px) {
+  .ic-root:not([data-layout]) {
+    --ic-rail-w: 0px;
+    --ic-analyst-w: 0px;
+    --ic-target: 44px;
+  }
+}
+
+/* 9. Reduced motion: no travel, but the arming delay and the 3 s notice stay
+   (safety features); the iris becomes a 150 ms crossfade. */
+
+@media (prefers-reduced-motion: reduce) {
+  .ic-root {
+    --ic-t-quick: 1ms !important;
+    --ic-t-settle: 1ms !important;
+    --ic-t-camera: 1ms !important;
+    --ic-t-travel: 1ms !important;
+    --ic-t-ripple: 1ms !important;
+    --ic-t-fade: 150ms;
+  }
+}
+
+/* 10. More contrast ------------------------------------------------------------ */
+
+@media (prefers-contrast: more) {
+  .ic-root {
+    --ic-hairline: rgba(230, 236, 239, 0.35);
+    --ic-pencil: #e6ecef;
+    --ic-underline-w: 2px;
+  }
+}
+
+/* 11. Forced colours ------------------------------------------------------------- */
+
+@media (forced-colors: active) {
+  .ic-root {
+    --ic-hairline: CanvasText;
+  }
+
+  .ic-slip,
+  .ic-banner,
+  .ic-docktab,
+  .ic-popover,
+  .ic-sheet,
+  .ic-toast {
+    border: 1px solid CanvasText;
+  }
+
+  .ic-btn {
+    border-color: ButtonText;
+  }
+
+  .ic-main[data-iris] {
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+}

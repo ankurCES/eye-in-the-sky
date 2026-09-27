@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Eye in the Sky app icon: an eye whose iris sits on the intel orb (a globe).
+       Rendered to .icns by scripts/build_desktop.sh (qlmanage + sips + iconutil).
+       Canvas follows the macOS icon grid: 824 px body at 100 px, corner radius 185. -->
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="36%" r="78%">
+      <stop offset="0" stop-color="#16283a"/>
+      <stop offset="1" stop-color="#05070a"/>
+    </radialGradient>
+    <radialGradient id="iris" cx="46%" cy="42%" r="62%">
+      <stop offset="0" stop-color="#9ffcff"/>
+      <stop offset="0.5" stop-color="#00d9e8"/>
+      <stop offset="1" stop-color="#00606b"/>
+    </radialGradient>
+    <clipPath id="eye">
+      <path d="M200 512C292 354 408 282 512 282S732 354 824 512C732 670 616 742 512 742S292 670 200 512Z"/>
+    </clipPath>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <rect x="101" y="101" width="822" height="822" rx="184" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="2"/>
+  <g clip-path="url(#eye)">
+    <rect x="200" y="282" width="624" height="460" fill="#0a1824"/>
+    <g fill="none" stroke="#00f6ff" stroke-opacity="0.30" stroke-width="5">
+      <circle cx="512" cy="512" r="196"/>
+      <ellipse cx="512" cy="512" rx="82" ry="196"/>
+      <ellipse cx="512" cy="512" rx="152" ry="196"/>
+      <path d="M316 512H708M350 402H674M350 622H674"/>
+    </g>
+    <circle cx="512" cy="512" r="118" fill="url(#iris)"/>
+    <circle cx="512" cy="512" r="118" fill="none" stroke="#00f6ff" stroke-width="6"/>
+    <circle cx="512" cy="512" r="46" fill="#05070a"/>
+    <circle cx="545" cy="480" r="16" fill="#ffffff" fill-opacity="0.9"/>
+    <circle cx="698" cy="560" r="15" fill="#ffb547"/>
+    <circle cx="352" cy="430" r="12" fill="#00f6ff"/>
+    <circle cx="430" cy="664" r="11" fill="#ff5d6c"/>
+    <circle cx="640" cy="372" r="10" fill="#00f6ff"/>
+  </g>
+  <path d="M200 512C292 354 408 282 512 282S732 354 824 512C732 670 616 742 512 742S292 670 200 512Z" fill="none" stroke="#4d9bd6" stroke-width="20" stroke-linejoin="round"/>
+</svg>

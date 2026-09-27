@@ -1,0 +1,338 @@
+/*
+ * Information orb (JS-ORB). @imported at the top of src/console/console.css,
+ * which declares the tokens on .ic-root. Scoped under the root with a
+ * zero-specificity :where(.ic-root), so every component selector stays a flat
+ * single class (0,1,0) and state variants stay at (0,2,0) (UX spec §11.2).
+ * No backdrop filters, no cascade layers, no animation: the canvas renders on demand.
+ */
+
+/* The canvas fills its (positioned) stage box and never contributes intrinsic
+   size: an in-flow canvas whose backing store follows its CSS size can grow
+   its own container on every ResizeObserver tick. */
+:where(.ic-root) .ic-orb-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* The accessible twin: focusable, visually hidden; its focus ring is drawn
+   around the orb on the canvas. */
+:where(.ic-root) .ic-orb-twin,
+:where(.ic-root) .ic-orb-vh {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Margin labels (wide layout): pooled DOM in the 96 px gutters. */
+:where(.ic-root) .ic-orb-labels {
+  position: absolute;
+  z-index: 1;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+:where(.ic-root) .ic-orb-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  color: var(--ic-film, #e6ecef);
+  font-family: var(
+    --ic-font-sans,
+    'Atkinson Hyperlegible Next',
+    'Atkinson Hyperlegible',
+    'IC Sans Fallback',
+    -apple-system,
+    'SF Pro Text',
+    'Segoe UI',
+    system-ui,
+    sans-serif
+  );
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  text-align: left;
+  white-space: nowrap;
+}
+
+/* Right-aligned in the left gutter. Text that does not fit is start-aligned
+   by CSS and ellipsised at its end, so the beginning always shows. */
+:where(.ic-root) .ic-orb-label[data-side='left'] {
+  text-align: right;
+}
+
+:where(.ic-root) .ic-orb-label[data-ink='analyst'] {
+  color: var(--ic-analyst, #8cc8ff);
+}
+
+:where(.ic-root) .ic-orb-label__title {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: top;
+}
+
+:where(.ic-root) .ic-orb-label__new {
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--ic-raised, #2a3945);
+  color: var(--ic-film, #e6ecef);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+:where(.ic-root) .ic-orb-label__sub {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ic-pencil, #a3b0ba);
+  font-weight: 400;
+}
+
+/* console.css hides [hidden] globally; this keeps pooled labels correct even
+   where a display value above would otherwise win. */
+:where(.ic-root) .ic-orb-label[hidden],
+:where(.ic-root) .ic-orb-more[hidden],
+:where(.ic-root) .ic-orb-label__new[hidden],
+:where(.ic-root) .ic-orb-list__empty[hidden] {
+  display: none;
+}
+
+/* Server segments ("probable · 2 sightings") render with a 12 px gap. */
+:where(.ic-root) .ic-orb-seg + .ic-orb-seg {
+  margin-left: 12px;
+}
+
+:where(.ic-root) .ic-orb-more {
+  position: absolute;
+  top: 0;
+  left: 0;
+  color: var(--ic-pencil, #a3b0ba);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+}
+
+/* Inline glyphs from orb/glyphs.js glyphSvg() (chips, search rows, inspector). */
+:where(.ic-root) .ic-glyph {
+  display: inline-block;
+  flex: none;
+  vertical-align: -2px;
+}
+
+/* List view (L): the full visual alternative to the orb. */
+:where(.ic-root) .ic-orb-list {
+  height: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+:where(.ic-root) .ic-orb-list__table {
+  width: 100%;
+  border-collapse: collapse;
+  color: var(--ic-film, #e6ecef);
+  font-size: 13px;
+  line-height: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-orb-list__th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 0;
+  background: var(--ic-panel, #22303b);
+  border-bottom: 1px solid var(--ic-graticule, #3a4a56);
+  color: var(--ic-pencil, #a3b0ba);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-orb-list__th--num {
+  text-align: right;
+}
+
+:where(.ic-root) .ic-orb-list__th[aria-sort='ascending']::after {
+  content: '\2191';
+  padding-right: 8px;
+  color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-orb-list__th[aria-sort='descending']::after {
+  content: '\2193';
+  padding-right: 8px;
+  color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-orb-list__sort {
+  min-height: 32px;
+  padding: 8px 12px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
+  cursor: pointer;
+}
+
+:where(.ic-root) .ic-orb-list__sort:hover {
+  color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-orb-list__row:hover {
+  background: var(--ic-raised, #2a3945);
+}
+
+:where(.ic-root) .ic-orb-list__td {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--ic-graticule, #3a4a56);
+  vertical-align: top;
+}
+
+:where(.ic-root) .ic-orb-list__num {
+  font-family: var(
+    --ic-font-mono,
+    'Atkinson Hyperlegible Mono',
+    'JetBrains Mono',
+    ui-monospace,
+    'SF Mono',
+    Menlo,
+    Consolas,
+    monospace
+  );
+  font-size: 12px;
+  line-height: 16px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-orb-list__open {
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ic-film, #e6ecef);
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+:where(.ic-root) .ic-orb-list__open:hover {
+  text-decoration: underline;
+}
+
+:where(.ic-root) .ic-orb-list__id {
+  display: block;
+  color: var(--ic-pencil, #a3b0ba);
+  font-family: var(
+    --ic-font-mono,
+    'Atkinson Hyperlegible Mono',
+    'JetBrains Mono',
+    ui-monospace,
+    'SF Mono',
+    Menlo,
+    Consolas,
+    monospace
+  );
+  font-size: 12px;
+  line-height: 16px;
+}
+
+:where(.ic-root) .ic-orb-list__seg {
+  display: inline-block;
+  margin-right: 12px;
+  color: var(--ic-pencil, #a3b0ba);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+:where(.ic-root) .ic-orb-list__register {
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+/* Status words carry the meaning; colour only reinforces it. "ok" stays
+   film white so a contact is never green. */
+:where(.ic-root) .ic-orb-list__status[data-status='warn'] {
+  color: #f2b544;
+}
+
+:where(.ic-root) .ic-orb-list__status[data-status='critical'] {
+  color: #ff7b7b;
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-orb-list__status[data-status='stale'] {
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-orb-list__status[data-status='unknown'] {
+  color: #bba7e0;
+  font-style: italic;
+}
+
+:where(.ic-root) .ic-orb-list__empty {
+  margin: 0;
+  padding: 16px 12px;
+  color: var(--ic-pencil, #a3b0ba);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+@media (max-width: 719px) {
+  :where(.ic-root) .ic-orb-list__sort,
+  :where(.ic-root) .ic-orb-list__open {
+    min-height: 44px;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :where(.ic-root) .ic-orb-label__sub,
+  :where(.ic-root) .ic-orb-more,
+  :where(.ic-root) .ic-orb-list__id,
+  :where(.ic-root) .ic-orb-list__seg,
+  :where(.ic-root) .ic-orb-list__register {
+    color: var(--ic-film, #e6ecef);
+  }
+
+  :where(.ic-root) .ic-orb-list__td,
+  :where(.ic-root) .ic-orb-list__th {
+    border-bottom-color: rgba(230, 236, 239, 0.35);
+  }
+}
+
+@media (forced-colors: active) {
+  :where(.ic-root) .ic-orb-label,
+  :where(.ic-root) .ic-orb-label__sub,
+  :where(.ic-root) .ic-orb-more {
+    color: CanvasText;
+  }
+
+  :where(.ic-root) .ic-orb-label__new {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+}

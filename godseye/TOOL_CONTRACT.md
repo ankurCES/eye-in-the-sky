@@ -4,7 +4,7 @@ This is the contract Wave-2 implementers and the `godseye-uav` skill both build 
 It is PLAN.md §4.1–§4.8 made concrete. Where the shipped code deviates, this document wins.
 
 **Baseline measured before the work started:** 19 tools, **0 resources**, 0 prompts.
-**Shipped now:** 45 tools, 8 resources (3 concrete + 5 templates) — verified over the real transport.
+**Shipped now:** 46 tools, 8 resources (3 concrete + 5 templates) — verified over the real transport.
 
 ## Conventions (apply to every tool)
 
@@ -81,8 +81,9 @@ Doctrine that must be *server-derived*, never taken from the caller (M1–M7):
   would corrupt every derived lane spacing.
 - **M1 grid spacing**: `swath = 2·alt_agl·tan(HFOV/2)`, `spacing = swath·(1−overlap_fraction)`. The caller
   supplies `overlap_pct`, never `lane_spacing`. **If the plan is capped or truncated for any reason, the
-  return must report the coverage ACTUALLY achieved** — the current code caps at 12 lanes and then
-  reports the uncapped spacing, which overstates coverage by ~4×.
+  return must report the coverage ACTUALLY achieved.** (An earlier version capped at 12 lanes and
+  reported the uncapped spacing, overstating coverage by ~4×; a truncated plan now reports the
+  spacing and coverage it actually flies, and why it was truncated.)
 - **M2 recon captures**: distance-triggered every `swath·(1−forward_overlap_pct)` metres. A time
   interval may only act as a max-rate clamp.
 - **M5 track standoff**: derived from the track's threat ring + the narrow-FOV pixel density needed for
@@ -104,9 +105,35 @@ Doctrine that must be *server-derived*, never taken from the caller (M1–M7):
 | `sim_set_link_state` | vehicle, degraded/lost, duration_s | ok — exercises the lost-link plan (M9) |
 | `sim_set_gps_degradation` | vehicle, error_m / denial | ok (M16) |
 | `sim_reset` | — | ok — **must NOT wipe the track store or pattern-of-life** (M12) |
+| `sim_set_fuel` | vehicle, fuel_pct (0–100, default 100), idempotency_key | **SAFETY OVERRIDE** (operator approval only): sets the fuel clock to `fuel_pct` (a new tank: burn integral restarts) and clears the BINGO latch with `operator_override`. Returns `fuel_pct`, `fuel_pct_before`, the **current** `bingo_fuel_pct` line (priced from position like `uav_get_telemetry`, with `bingo_fuel_pct_basis`; last tick's line, labelled, if telemetry is down), `margin_pct`, `bingo_tripped`, `bingo_was_latched`, `relatch_expected` (fuel at/below the line re-latches on the next tick), `safety_task_in_flight` (a forced RTB already flying is **not** cancelled) and `note`. Unknown vehicle → `unknown_vehicle`; out-of-range/non-finite fuel → `invalid_parameter`. Journaled to `fuel.jsonl` (survives a restart) and audited as `fuel_reset`. `mission_status` is left as a record. |
 
-`sim_spawn_target`'s altitude default of `0.0` currently buries targets ~1550 m underground in the
-shipped theaters, making them undetectable. Default to the terrain height at the point.
+`sim_spawn_target`'s altitude defaults to the ground under the point: measured terrain when the
+real-data layer has it, else the running theater's ground elevation (the return says which). An
+earlier default of `0.0` buried targets ~1550 m underground in the shipped theaters.
+
+## Also shipped (not in the tables above)
+
+These tools are registered by the server and listed by `tools/list`; their descriptions there are
+authoritative.
+
+| Tool | Params | What it does |
+|---|---|---|
+| `uav_task_status` | vehicle, task_id? | One vehicle's queue or one task; progress derived server-side from telemetry |
+| `uav_mission` | vehicle, kind, params?, speed_mps?, idempotency_key, dry_run? | Thin dispatcher for the GEV panel; forwards to the discrete mission tools (kinds `recon_route`, `grid_search`, `orbit_poi`, `track_target`, `identify`, `assess`) |
+| `uav_scan_targets` | vehicle, camera? | Pull detections, correlate into persistent tracks with measured pixels on target, classify, update pattern-of-life; returns SALUTE reports |
+| `uav_identify_target` | track_id | SALUTE report for one track, with element aggregation over the track store (no sensor tasking) |
+| `uav_assess_threat` | vehicle, track_id?, defended?, area_polygon? | Deterministic order-of-battle threat assessment; ISR-only |
+| `uav_list_ob_classes` | — | Order-of-battle library keys, with category, role, envelope and unit size |
+| `uav_deconflict_airspace` | vehicle? (default Drone1), lat?, lon?, alt_hae_m?, horizontal_m?, vertical_m? | Real aircraft inside the separation box, nearest first; an empty list is an empty feed, not clear airspace |
+| `uav_real_data_status` | include_feeds? | What the server measures and what it assumes, per real-data feed |
+| `uav_handoff_target` | track_id, from_vehicle, to_vehicle, idempotency_key | The GEV panel's handoff; same implementation as `mission_handoff_track` without `dry_run` and altitude |
+| `sim_hydrate_real_data` | apply_weather?, allow_network?, background?, load_ao_terrain?, terrain_grid_m?, idempotency_key | Ingest terrain, mapped sites, air traffic and weather for the theater (network; between missions) |
+| `sim_spawn_order_of_battle` | limit?, categories?, idempotency_key | Spawn ground truth from mapped military sites (context only, not authoritative); needs `sim_hydrate_real_data` first |
+| `sim_set_environment` | wind_north/east/down? (default 0), gps_denied?, gps_noise_m?, det_false_neg?, det_false_pos?, idempotency_key | Legacy realism switch (wind, GPS, detection error); omitting the wind sets it to zero |
+
+The in-app analyst does not see `uav_list_tracks`, `sim_set_environment` or `uav_handoff_target`;
+its approval class for every tool is in `mcp/godseye_uav/analyst_policy.py` (see
+`INTEL_CONSOLE.md`).
 
 ## Report size — summary by default, full traces on request
 
@@ -130,7 +157,7 @@ would be the coverage-overstatement defect (M1) in another costume.
 An unrecognised `detail` value is **refused**, not guessed — the wrong guess silently changes what an
 ISR report contains.
 
-## §4.8 Resources (currently ZERO exist — all 8 are missing)
+## §4.8 Resources (all 8 shipped: 3 concrete, 5 templates)
 
 `uav://{vehicle}/telemetry` · `uav://{vehicle}/camera/{name}/{type}` · `uav://mission/{id}` ·
 `uav://tracks` · `uav://targets` · `uav://safety/geofence` · `uav://reports/{id}` ·
@@ -139,9 +166,9 @@ ISR report contains.
 `uav://safety/geofence` matters most for the skill: PLAN §4.5 says "skill ROE may only be stricter",
 which the skill cannot honour without being able to read the envelope it must stay inside.
 
-## Watchdog (T2) — currently fatal
+## Watchdog (T2)
 
-The task watchdog is a flat 120 s on total duration. A single AO crossing in the shipped theaters takes
-~1100 s, so **every realistic mission leg fails today**. The watchdog must key on *lack of progress*
-(no telemetry movement toward the target), not total duration, and on timeout must fail the handle and
-recover to hover.
+The task watchdog keys on *lack of progress*, not total duration (`tasking.py`): a task is failed only
+when nothing has reported forward movement for its watchdog window (120 s by default), and the
+recovery hook then hovers the vehicle. A ~1100 s AO crossing that keeps closing on its target
+survives. (The original flat 120 s cap on total duration failed every realistic mission leg.)

@@ -183,7 +183,23 @@ COARSE_MAX_ERROR_M = 115.0
 #: vehicle's per-sample lookup into a cache hit.
 _CACHE_DECIMALS = 4
 
-_local = threading.local()  # pyproj Transformers are not thread-safe
+# pyproj is imported HERE, at module import (normally the main thread), not
+# lazily inside the first lookup. Letting PROJ initialise on a short-lived
+# worker thread (a uvicorn threadpool call, say) is fatal later: once that
+# thread exits, every fork-path child segfaults (-11) -- asyncio subprocesses
+# included, which is how the analyst starts the Claude CLI. Reproduced with
+# PROJ 9.8.1 / pyproj 3.8.0; importing on the main thread first prevents it.
+# Missing pyproj stays non-fatal: the grid source raises and the chain falls
+# through to the egm96 wheel, loudly, as before.
+try:
+    import pyproj  # type: ignore
+except ImportError:  # pragma: no cover - pyproj is a declared dependency
+    pyproj = None
+
+# One process-wide vgridshift transformer behind a lock (pyproj Transformers
+# are not thread-safe); it replaces a per-thread cache.
+_vgridshift = None
+_vgridshift_lock = threading.Lock()
 _active_source: str | None = None
 _reported_failures: set[str] = set()
 
@@ -217,19 +233,22 @@ def _validate_geodetic(lat_deg: float, lon_deg: float) -> tuple[float, float]:
 
 def _grid_undulation(lat_deg: float, lon_deg: float) -> float:
     """N from the shipped NGA 15' grid via PROJ vgridshift (T1)."""
-    tr = getattr(_local, "vgridshift", None)
-    if tr is None:
-        import pyproj  # type: ignore
-
-        if not os.path.isfile(GEOID_GRID_PATH):
-            raise FileNotFoundError(f"EGM96 grid missing: {GEOID_GRID_PATH}")
-        # Absolute path + no datadir mutation: see the note above.
-        tr = pyproj.Transformer.from_pipeline(
-            f"+proj=vgridshift +grids={GEOID_GRID_PATH} +multiplier=1"
-        )
-        _local.vgridshift = tr
-    # Forward vgridshift on z=0 (geoid-referenced) yields exactly N.
-    _, _, n = tr.transform(lon_deg, lat_deg, 0.0)
+    global _vgridshift
+    with _vgridshift_lock:
+        if _vgridshift is None:
+            if pyproj is None:
+                raise ImportError("pyproj is not installed")
+            if not os.path.isfile(GEOID_GRID_PATH):
+                raise FileNotFoundError(f"EGM96 grid missing: {GEOID_GRID_PATH}")
+            # Absolute path + no datadir mutation: see the note above. QUOTED,
+            # because PROJ splits +grids= on whitespace: inside
+            # "Eye in the Sky.app" an unquoted path is ProjError 1029 and the
+            # lookup silently falls through to the wheel.
+            _vgridshift = pyproj.Transformer.from_pipeline(
+                f'+proj=vgridshift +grids="{GEOID_GRID_PATH}" +multiplier=1'
+            )
+        # Forward vgridshift on z=0 (geoid-referenced) yields exactly N.
+        _, _, n = _vgridshift.transform(lon_deg, lat_deg, 0.0)
     return _validate_undulation(float(n))
 
 

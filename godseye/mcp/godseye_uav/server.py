@@ -167,6 +167,32 @@ WEATHER_PARAMS: dict[str, int] = {"rain": 0, "snow": 2, "dust": 6, "fog": 7}
 #: Datalink states `sim_set_link_state` accepts (M9).
 LINK_STATES = ("nominal", "degraded", "lost")
 
+#: Where the MCP endpoint is advertised when nothing better is known: the
+#: legacy three-listener stack's MCP port. `serve()` and the single-process
+#: host (`GodseyeUavServer.advertise_at`) replace it with the real address.
+LEGACY_MCP_BASE_URL = "http://127.0.0.1:8791"
+
+
+def mcp_auth_settings(base_url: str) -> AuthSettings:
+    """The MCP auth block advertised at ``base_url`` (scheme://host:port).
+
+    ``resource_server_url`` feeds the 401's ``WWW-Authenticate:
+    resource_metadata=...`` (RFC 9728) and ``issuer_url`` the metadata's
+    authorization server. Neither is ever called by a client that sends the
+    shared bearer token; they only have to name the port the client reached.
+    """
+    base = base_url.rstrip("/")
+    return AuthSettings(
+        issuer_url=base,
+        resource_server_url=base,
+        required_scopes=["uav"],
+        # StaticBearerVerifier checks the shared token itself and its
+        # AccessToken carries no RFC 8707 `resource`. Stated, not left to the
+        # default: unset warns on every boot and becomes True in mcp 3.0,
+        # which would refuse every token.
+        validate_token_resource=False,
+    )
+
 #: Fuel-journal field -> the `FuelModel.from_dict` field it restores (T4c).
 #:
 #: `Store.log_fuel` writes what `FuelModel.fuel_record()` produces, and that
@@ -329,6 +355,34 @@ BLIND_LAND_S = 20.0
 NOMINAL_DESCENT_MPS = 2.0
 #: Default takeoff height, metres AGL above the launch terrain.
 DEFAULT_TAKEOFF_AGL_M = 30.0
+
+#: The defaults the mission dispatcher (`uav_mission`, `mission_dry_run`)
+#: applies per canonical kind -- the ONE table `_dispatch_mission` reads. They
+#: must equal the defaults of the matching discrete tool (`mission_grid_search`,
+#: `uav_orbit_poi`, ...; tests/test_server.py pins that): a dry run through
+#: one path is shown to the operator as the preview of a live call through
+#: the other. They once differed (orbit radius 80 m here, 150 m on
+#: `uav_orbit_poi`), so an approval card previewed a smaller, cheaper orbit
+#: than the one it approved. The analyst console reads this table (via
+#: `GodseyeUavServer.MISSION_PARAM_DEFAULTS`) to compare the EFFECTIVE plans.
+MISSION_PARAM_DEFAULTS: dict[str, dict[str, Any]] = {
+    "grid_search": {"alt_agl_m": 60.0, "overlap_pct": 20.0, "pattern": "lawnmower",
+                    "speed_mps": 8.0, "max_lanes": None, "legs": 12, "camera": "0"},
+    "recon_route": {"alt_agl_m": 60.0, "forward_overlap_pct": 20.0, "speed_mps": 10.0,
+                    "max_capture_rate_hz": 1.0, "camera": "0"},
+    "track_target": {"alt_agl_m": 120.0, "speed_mps": 12.0, "points": 12,
+                     "allow_unverified": False, "camera": "0"},
+    "identify_target": {"alt_agl_m": 120.0, "orbit_first": True, "speed_mps": 10.0,
+                        "max_id_alt_agl_m": None, "allow_unverified": False, "camera": "0"},
+    "threat_assessment": {"area_polygon": None, "defended": None, "survey": False,
+                          "alt_agl_m": 60.0, "overlap_pct": 20.0, "speed_mps": 8.0,
+                          "camera": "0"},
+    "orbit_poi": {"radius_m": 150.0, "alt_agl_m": 60.0, "direction": "cw", "laps": 1,
+                  "points": 12, "camera_track": True, "sun_side": True, "speed_mps": 10.0,
+                  "camera": "0"},
+    # Legacy GEV point-assess; no discrete tool.
+    "assess": {"radius_m": 50.0, "alt_agl_m": 45.0, "speed_mps": 8.0, "camera": "0"},
+}
 
 #: The highest progress an EXECUTOR may report. 100 % is written by the queue,
 #: and only as the task becomes terminal (`tasking._execute_one`), so
@@ -1261,6 +1315,9 @@ class UavBackend:
 class GodseyeUavServer:
     """Wires safety + tasking + store + backend into the MCP tool catalog."""
 
+    #: Published for in-process consumers (the analyst console's approval card).
+    MISSION_PARAM_DEFAULTS = MISSION_PARAM_DEFAULTS
+
     def __init__(
         self,
         backend: UavBackend,
@@ -1272,6 +1329,7 @@ class GodseyeUavServer:
         theater: Theater | str | None = None,
         lost_link_plan: LostLinkPlan | dict | None = None,
         real_data: Any = None,
+        public_url: str | None = None,
     ):
         self.backend = backend
         self.store = store
@@ -1414,17 +1472,31 @@ class GodseyeUavServer:
         self.mcp = MCPServer(
             "godseye-uav",
             token_verifier=StaticBearerVerifier(token),
-            auth=AuthSettings(
-                issuer_url="http://127.0.0.1:8791",
-                resource_server_url="http://127.0.0.1:8791",
-                required_scopes=["uav"],
-            ),
+            auth=mcp_auth_settings(public_url or LEGACY_MCP_BASE_URL),
         )
+        #: An explicit `public_url` is kept by `serve()`; the legacy default
+        #: is replaced there by the address actually being served.
+        self._public_url_pinned = public_url is not None
         self._register_tools()
         self._register_resources()
         # T4c: restart = replay -> resume-or-abort-and-RTH. Runs at boot so the
         # decision exists before the first command is accepted.
         self.recovery = self._boot_replay()
+
+    # ---- where clients reach the MCP endpoint ----
+    @property
+    def public_url(self) -> str:
+        """The base URL the MCP auth metadata currently advertises."""
+        return str(self.mcp.settings.auth.resource_server_url).rstrip("/")
+
+    def advertise_at(self, base_url: str) -> None:
+        """Advertise the MCP endpoint at ``base_url`` (scheme://host:port).
+
+        Only takes effect for an ASGI app built AFTER this call
+        (``mcp.streamable_http_app()`` reads the settings when it builds).
+        """
+        self.mcp.settings.auth = mcp_auth_settings(base_url)
+        self._public_url_pinned = True
 
     # ---- per-vehicle safety state ----
     def _new_link_monitor(self):
@@ -3553,10 +3625,17 @@ class GodseyeUavServer:
             await asyncio.sleep(interval_s)
 
     # ---- intel helpers ----
-    async def _sensor_conditions(self, vehicle: str, camera: str = "0") -> dict:
-        """What the sensor actually saw through (M18/INTREP §4.7)."""
+    async def _sensor_conditions(self, vehicle: str, camera: str = "0", *,
+                                 with_camera: bool = True) -> dict:
+        """What the sensor actually saw through (M18/INTREP §4.7).
+
+        ``with_camera=False`` reads only scene-level conditions (light,
+        weather, wind, GPS) and makes no per-vehicle call: FakeAirSim mints
+        any vehicle a camera read names, so a read for a name that is not in
+        the roster used to create a phantom aircraft.
+        """
         env = await self.backend.environment()
-        fov = await self.backend.camera_fov_deg(vehicle, camera)
+        fov = await self.backend.camera_fov_deg(vehicle, camera) if with_camera else None
         weather = (env or {}).get("weather") or {}
         light = None
         if env is not None:
@@ -3607,6 +3686,160 @@ class GodseyeUavServer:
                 self._idem_results[f"{tool}:{key}"] = dict(result)
             result = {**result, "idempotency_key": key}
         return result
+
+    # ---- operator refuel: the `sim_set_fuel` safety override ----
+    async def _set_fuel(self, vehicle: str, fuel_pct: Any) -> dict:
+        """Refill one vehicle's fuel clock and clear BINGO by operator override.
+
+        Why it exists: the fuel integrator burns on the ground, `sim_reset`
+        keeps fuel, and the clock AND the latched BINGO survive a restart
+        (`_restore_persisted_state`), so a long-lived store ends with a
+        vehicle every movement gate rejects forever. This is the one way back,
+        and it is an OVERRIDE of a safety latch - the only caller allowed to
+        pass `operator_override=True` to `BingoLatch.clear`.
+
+        Ported from the ObraMaestra stack with its defects fixed:
+
+        * it returned `bingo_pct_at_trip` as `bingo_fuel_pct` - read AFTER the
+          clear, which sets it to None, so the answer was always null. The
+          BINGO line is a function of position (return leg + reserve), so it
+          is priced NOW, the way `uav_get_telemetry` prices it, and the basis
+          says so; without telemetry the last safety tick's line is returned
+          and labelled as such, and with neither it is None with a reason;
+        * no idempotency_key (TOOL_CONTRACT: every mutating tool takes one);
+        * a vehicle was "validated" only by the lazily-minted monitor map, so
+          a typo was `not_found` while a real-but-unticked aircraft was too.
+          The sim roster is the authority, as for `uav_list_vehicles`;
+        * the reset lived only in memory: a restart before the next tick
+          restored the old empty, LATCHED clock from `fuel.jsonl`. A fuel row
+          is journaled here, and the audit row carries the before/after.
+
+        What it deliberately does NOT do: cancel a safety RTB already in flight
+        (the uncancellable task finishes; the answer names it), or rewrite
+        `mission_status` (how the last mission ended is a record, not a lock).
+        A `fuel_pct` at or below the current BINGO line is accepted and says it
+        will re-latch on the next tick - the override clears a latch, it does
+        not suspend the rule.
+        """
+        if (isinstance(fuel_pct, bool) or not isinstance(fuel_pct, (int, float))
+                or not math.isfinite(float(fuel_pct))
+                or not 0.0 <= float(fuel_pct) <= 100.0):
+            return error("invalid_parameter",
+                         f"fuel_pct must be a number from 0 to 100, got {fuel_pct!r}")
+        vehicle = str(vehicle or "").strip()
+        if not vehicle:
+            return error("missing_parameter", "name the vehicle to refuel")
+        try:
+            roster: list[str] | None = list(await self.backend.list_vehicles())
+            roster_err = None
+        except Exception as exc:  # noqa: BLE001 - reported, never guessed
+            roster, roster_err = None, f"{type(exc).__name__}: {exc}"
+        if roster is not None and vehicle not in roster:
+            return error("unknown_vehicle",
+                         f"{vehicle!r} is not in the sim roster {sorted(roster)}; "
+                         "no fuel was changed")
+        if roster is None and vehicle not in self.monitors:
+            return error("unknown_vehicle",
+                         f"the sim roster could not be read ({roster_err}) and this "
+                         f"server has no fuel clock for {vehicle!r}; no fuel was "
+                         "changed", retryable=True)
+
+        fm = self.monitor_for(vehicle).fuel
+        # Every await happens BEFORE the override takes effect. The analyst
+        # runs this in a task that is cancelled on session close, host
+        # shutdown or a CLI cancel; cancelled at an await between clearing
+        # the latch and journaling it, the override used to stand in memory
+        # with no fuel row and no audit row (and a restart restored the old
+        # latched clock). From here to the return there is no await: the
+        # mutation, the journal and the audit are one synchronous step. The
+        # BINGO line is a function of position, wind and home, not of the
+        # fuel state, so pricing it first gives the same number.
+        line, basis = await self._bingo_line_now(vehicle, fm)
+        fuel_before = round(fm.fuel_pct, 3)
+        bingo_before = fm.bingo.to_dict()
+        was_latched = fm.bingo.tripped
+        fm.fuel_pct = float(fuel_pct)
+        # A new tank: the burn integral restarts, and the next tick only primes
+        # the clock, so the refuel is never charged for the time before it.
+        fm.burned_pct = 0.0
+        fm.elapsed_s = 0.0
+        fm.ticks = 0
+        fm._last_ts = None
+        fm._last_alt = None
+        fm.bingo.clear(operator_override=True)
+
+        relatch = line is not None and fm.fuel_pct <= line
+        current = self.tasking.status(vehicle).get("current")
+        safety_task = (current if isinstance(current, dict)
+                       and current.get("uncancellable")
+                       and current.get("state") not in ("done", "failed", "cancelled")
+                       else None)
+        notes: list[str] = [
+            "operator override: the BINGO latch was cleared" if was_latched
+            else "BINGO was not latched; only the fuel state changed"]
+        if relatch:
+            notes.append(f"fuel {fm.fuel_pct:.1f}% is at or below the current BINGO "
+                         f"line {line:.1f}%, so BINGO re-latches on the next safety "
+                         "tick and forces an RTB")
+        if safety_task:
+            notes.append(f"a safety task ({safety_task.get('tool')}, "
+                         f"{safety_task.get('task_id')}) is already flying and was NOT "
+                         "cancelled; it runs to completion")
+        if self.mission_flags.get(vehicle):
+            notes.append(f"mission_status {self.mission_flags[vehicle]!r} records how "
+                         "the last mission ended; it is not a lock and is unchanged")
+
+        record = fm.fuel_record(reason="operator_fuel_reset")
+        if line is not None:
+            record["bingo_fuel_pct"] = line
+        self.store.log_fuel(vehicle, **record)
+        self.store.log_audit(
+            "fuel_reset",
+            f"{vehicle} fuel {fuel_before}% -> {fm.fuel_pct}% by operator override"
+            + ("; BINGO latch cleared" if was_latched else ""),
+            vehicle=vehicle, fuel_pct=fm.fuel_pct, fuel_pct_before=fuel_before,
+            bingo_before=bingo_before, bingo_fuel_pct=line, bingo_basis=basis,
+            relatch_expected=relatch, operator_override=True,
+            safety_task_in_flight=(safety_task or {}).get("task_id"))
+        self.store.sync()
+        return {
+            "ok": True, "status": "accepted", "vehicle": vehicle,
+            "fuel_pct": round(fm.fuel_pct, 3), "fuel_pct_before": fuel_before,
+            "bingo_fuel_pct": line, "bingo_fuel_pct_basis": basis,
+            "margin_pct": None if line is None else round(fm.fuel_pct - line, 2),
+            "bingo_tripped": fm.bingo.tripped, "bingo_was_latched": was_latched,
+            "relatch_expected": relatch,
+            "safety_task_in_flight": safety_task,
+            "mission_status": self.mission_flags.get(vehicle),
+            "operator_override": True,
+            "note": "; ".join(notes),
+        }
+
+    async def _bingo_line_now(self, vehicle: str, fm: FuelModel) -> tuple[float | None, str]:
+        """The BINGO line for `vehicle` now, and where the number came from.
+
+        Priced exactly as `_telemetry_payload` prices it (return leg from the
+        current position at the launch-datum height, with the current wind,
+        plus the reserve), so the refuel answer and the telemetry agree.
+        """
+        try:
+            tele = await self._telemetry(vehicle)
+            wind_ne, _ = await self.backend.wind_ne()
+            line = fm.bingo_fuel_pct((tele["lat"], tele["lon"]),
+                                     self.commanded_agl(tele), wind_ne=wind_ne)
+            return round(line, 2), ("priced now from the vehicle's position and "
+                                    "launch-datum height, as uav_get_telemetry does")
+        except Exception as exc:  # noqa: BLE001 - fall back, labelled
+            why = f"{type(exc).__name__}: {exc}"
+        tick = self.ticks.get(vehicle) or {}
+        bingo = tick.get("bingo") if isinstance(tick.get("bingo"), dict) else {}
+        prior = bingo.get("bingo_fuel_pct")
+        if isinstance(prior, (int, float)) and not isinstance(prior, bool):
+            return round(float(prior), 2), (
+                f"telemetry unavailable ({why}); this is the line the last safety "
+                "tick priced, at that tick's position")
+        return None, (f"unknown: telemetry unavailable ({why}) and no safety tick "
+                      f"has priced a BINGO line for {vehicle} yet")
 
     # ---- sun (M6) ----
     async def sun_state(self, vehicle: str) -> dict | None:
@@ -4166,80 +4399,98 @@ class GodseyeUavServer:
         kw.pop("speed_mps", None)
         common = {"lost_link_plan": link_plan, "dry_run": dry_run,
                   "idempotency_key": idempotency_key, "camera": camera}
+
+        def dflt(k: str) -> dict:
+            return MISSION_PARAM_DEFAULTS[k]
+
         try:
             if kind == "grid_search":
+                d = dflt("grid_search")
                 return await self._mission_grid_search(
                     vehicle, polygon=kw.get("polygon") or [],
-                    alt_agl_m=(60.0 if alt is None else float(alt)),
+                    alt_agl_m=(d["alt_agl_m"] if alt is None else float(alt)),
                     overlap_pct=float(kw.get("overlap_pct",
-                                             kw.get("overlap", 20.0))),
-                    pattern=kw.get("pattern", "lawnmower"),
-                    speed_mps=(8.0 if speed is None else float(speed)),
-                    max_lanes=kw.get("max_lanes"), legs=int(kw.get("legs", 12)),
+                                             kw.get("overlap", d["overlap_pct"]))),
+                    pattern=kw.get("pattern", d["pattern"]),
+                    speed_mps=(d["speed_mps"] if speed is None else float(speed)),
+                    max_lanes=kw.get("max_lanes", d["max_lanes"]),
+                    legs=int(kw.get("legs", d["legs"])),
                     **common)
             if kind == "recon_route":
+                d = dflt("recon_route")
                 return await self._mission_recon_route(
                     vehicle, waypoints=kw.get("waypoints") or [],
-                    alt_agl_m=(60.0 if alt is None else float(alt)),
+                    alt_agl_m=(d["alt_agl_m"] if alt is None else float(alt)),
                     forward_overlap_pct=float(
-                        kw.get("forward_overlap_pct", kw.get("overlap", 20.0))),
-                    speed_mps=(10.0 if speed is None else float(speed)),
-                    max_capture_rate_hz=float(kw.get("max_capture_rate_hz", 1.0)),
+                        kw.get("forward_overlap_pct",
+                               kw.get("overlap", d["forward_overlap_pct"]))),
+                    speed_mps=(d["speed_mps"] if speed is None else float(speed)),
+                    max_capture_rate_hz=float(kw.get("max_capture_rate_hz",
+                                                     d["max_capture_rate_hz"])),
                     **common)
             if kind == "track_target":
+                d = dflt("track_target")
                 return await self._mission_track_target(
                     vehicle, track_id=kw.get("track_id"), track=kw.get("track"),
-                    alt_agl_m=(120.0 if alt is None else float(alt)),
-                    speed_mps=(12.0 if speed is None else float(speed)),
-                    points=int(kw.get("points", 12)),
-                    allow_unverified=bool(kw.get("allow_unverified", False)),
+                    alt_agl_m=(d["alt_agl_m"] if alt is None else float(alt)),
+                    speed_mps=(d["speed_mps"] if speed is None else float(speed)),
+                    points=int(kw.get("points", d["points"])),
+                    allow_unverified=bool(kw.get("allow_unverified",
+                                                 d["allow_unverified"])),
                     **common)
             if kind in ("identify", "identify_target"):
                 # `max_id_alt_agl_m` is the remedy the M7 LOS refusal names.
-                # `kw.get(...)` with NO default is deliberate: absent means
+                # Its table default is None on purpose: absent means
                 # "planner default" (the detect altitude), and a value the
                 # caller did send is never quietly replaced. A non-numeric one
                 # raises here and comes back as `invalid_mission_params`.
-                id_ceiling = kw.get("max_id_alt_agl_m")
+                d = dflt("identify_target")
+                id_ceiling = kw.get("max_id_alt_agl_m", d["max_id_alt_agl_m"])
                 return await self._mission_identify_target(
                     vehicle, track_id=kw.get("track_id"), track=kw.get("track"),
-                    alt_agl_m=(120.0 if alt is None else float(alt)),
-                    orbit_first=bool(kw.get("orbit_first", True)),
-                    speed_mps=(10.0 if speed is None else float(speed)),
+                    alt_agl_m=(d["alt_agl_m"] if alt is None else float(alt)),
+                    orbit_first=bool(kw.get("orbit_first", d["orbit_first"])),
+                    speed_mps=(d["speed_mps"] if speed is None else float(speed)),
                     max_id_alt_agl_m=(None if id_ceiling is None
                                       else float(id_ceiling)),
-                    allow_unverified=bool(kw.get("allow_unverified", False)),
+                    allow_unverified=bool(kw.get("allow_unverified",
+                                                 d["allow_unverified"])),
                     **common)
             if kind == "threat_assessment":
+                d = dflt("threat_assessment")
                 return await self._mission_threat_assessment(
-                    vehicle, area_polygon=kw.get("area_polygon"),
-                    defended=kw.get("defended"),
-                    survey=bool(kw.get("survey", False)),
-                    alt_agl_m=(60.0 if alt is None else float(alt)),
-                    overlap_pct=float(kw.get("overlap_pct", 20.0)),
+                    vehicle, area_polygon=kw.get("area_polygon", d["area_polygon"]),
+                    defended=kw.get("defended", d["defended"]),
+                    survey=bool(kw.get("survey", d["survey"])),
+                    alt_agl_m=(d["alt_agl_m"] if alt is None else float(alt)),
+                    overlap_pct=float(kw.get("overlap_pct", d["overlap_pct"])),
                     camera=camera,
-                    speed_mps=(8.0 if speed is None else float(speed)),
+                    speed_mps=(d["speed_mps"] if speed is None else float(speed)),
                     dry_run=dry_run, idempotency_key=idempotency_key)
             if kind == "orbit_poi":
+                d = dflt("orbit_poi")
                 return await self._mission_orbit_poi(
                     vehicle, lat=float(kw["lat"]), lon=float(kw["lon"]),
-                    radius_m=float(kw.get("radius_m", 80.0)),
-                    alt_agl_m=(60.0 if alt is None else float(alt)),
-                    direction=kw.get("direction", "cw"),
-                    laps=int(kw.get("laps", 1)), points=int(kw.get("points", 12)),
-                    camera_track=bool(kw.get("camera_track", True)),
-                    sun_side=bool(kw.get("sun_side", True)),
-                    speed_mps=(10.0 if speed is None else float(speed)),
+                    radius_m=float(kw.get("radius_m", d["radius_m"])),
+                    alt_agl_m=(d["alt_agl_m"] if alt is None else float(alt)),
+                    direction=kw.get("direction", d["direction"]),
+                    laps=int(kw.get("laps", d["laps"])),
+                    points=int(kw.get("points", d["points"])),
+                    camera_track=bool(kw.get("camera_track", d["camera_track"])),
+                    sun_side=bool(kw.get("sun_side", d["sun_side"])),
+                    speed_mps=(d["speed_mps"] if speed is None else float(speed)),
                     **common)
             if kind == "assess":
                 # Legacy point-assess kept for the GEV panel; the doctrine path
                 # for a known contact is mission_identify_target (M7).
                 from .missions import plan_mission
+                d = dflt("assess")
                 plan = plan_mission("assess", vehicle, lat=kw["lat"], lon=kw["lon"],
-                                    radius_m=kw.get("radius_m", 50.0),
-                                    alt_agl_m=(45.0 if alt is None else float(alt)),
+                                    radius_m=kw.get("radius_m", d["radius_m"]),
+                                    alt_agl_m=(d["alt_agl_m"] if alt is None else float(alt)),
                                     camera=camera,
-                                    speed_mps=(8.0 if speed is None else float(speed)))
+                                    speed_mps=(d["speed_mps"] if speed is None
+                                               else float(speed)))
                 return await self._launch_mission(
                     vehicle, plan, idempotency_key=idempotency_key,
                     dry_run=dry_run, lost_link_plan=link_plan)
@@ -4425,7 +4676,10 @@ class GodseyeUavServer:
         track_history, key_images."""
         from .targets import assess_confidence
         ob = track.ob
-        images = [meta["resource"] for (veh, _cam, _typ), meta
+        # `self.frames` values are {"png", "meta"} (see _capture); the URI is
+        # in the frame's meta. Reading it off the entry itself raised
+        # KeyError('resource') once any frame had been captured on `vehicle`.
+        images = [entry["meta"]["resource"] for (veh, _cam, _typ), entry
                   in self.frames.items() if veh == vehicle]
         return {
             "classification": {
@@ -4840,8 +5094,20 @@ class GodseyeUavServer:
         mission = self.missions.get(mission_id) if mission_id else None
         if mission is None and self.missions and mission_id is None:
             mission = max(self.missions.values(), key=lambda m: m["started"])
-        veh = vehicle or (mission or {}).get("vehicle") or "UAV"
-        sensors = await self._sensor_conditions(veh)
+        veh = vehicle or (mission or {}).get("vehicle") or None
+        if not veh:
+            # No vehicle named and no mission to name one. The observer is the
+            # first aircraft in the sim roster; it is never invented (this
+            # used to default to "UAV", and the camera read below then made
+            # FakeAirSim mint a vehicle of that name -- a phantom aircraft in
+            # the roster, the fleet and the intel graph, from a READ).
+            try:
+                roster = list(await self.backend.list_vehicles())
+            except Exception:  # noqa: BLE001 - reported as unknown, never guessed
+                roster = []
+            veh = roster[0] if roster else None
+        # Only scene-level conditions go into the INTREP; no per-vehicle read.
+        sensors = await self._sensor_conditions(veh or "", with_camera=False)
         summary, coverage = self._mission_sections(mission)
         loal = [e for e in self.loal_events
                 if vehicle is None or e.get("vehicle") == veh]
@@ -4854,7 +5120,7 @@ class GodseyeUavServer:
                                "wind_mps": sensors.get("wind_mps"),
                                "gps_quality": sensors.get("gps_quality"),
                                "sensors_used": []},
-            loal_events=loal, observer=veh,
+            loal_events=loal, observer=veh or "unknown: no vehicle named",
             pattern_of_life=self.pol, detail=detail, top_n=top_n)
         report_id = (mission or {}).get("mission_id") or "latest"
         rep["report_id"] = report_id
@@ -6208,6 +6474,26 @@ class GodseyeUavServer:
                                  sim_epoch=record["sim_epoch"])
             return self._idem_record("sim_reset", idempotency_key, record)
 
+        @mcp.tool(name="sim_set_fuel", description=(
+            "SAFETY OVERRIDE (operator only). Set a vehicle's fuel to fuel_pct "
+            "(0-100, default 100) and CLEAR its BINGO latch with an operator "
+            "override, so a vehicle grounded by BINGO can be tasked again. "
+            "sim_reset does not touch fuel, and the fuel clock and latch "
+            "survive restarts, so this is the only refuel. Returns the new "
+            "fuel_pct, the CURRENT BINGO line (bingo_fuel_pct, priced from "
+            "the vehicle's position like uav_get_telemetry) and whether the "
+            "latch is still tripped. A forced RTB already in flight is NOT "
+            "cancelled; a fuel_pct at or below the BINGO line re-latches "
+            "BINGO on the next safety tick. Every call is audited."))
+        async def sim_set_fuel(vehicle: str, fuel_pct: float = 100.0,
+                               idempotency_key: str | None = None) -> dict:
+            replay = self._idem_replay("sim_set_fuel", idempotency_key)
+            if replay is not None:
+                return replay
+            return self._idem_record(
+                "sim_set_fuel", idempotency_key,
+                await self._set_fuel(vehicle, fuel_pct))
+
         @mcp.tool(name="uav_list_ob_classes", description=(
             "The order-of-battle library keys sim_spawn_target and the threat "
             "model use (PLAN §4.6a): key, name, category, role, engagement "
@@ -6745,12 +7031,25 @@ class GodseyeUavServer:
         return out
 
     async def serve(self, host: str = "127.0.0.1", port: int = 8791) -> None:
+        if not self._public_url_pinned:
+            self.advertise_at(_http_base(host, port))
         self.start_monitor()
         try:
             await self.mcp.run_streamable_http_async(
                 host=host, port=port, streamable_http_path="/mcp", stateless_http=True)
         finally:
             self.stop_monitor()
+
+
+def _http_base(host: str, port: int) -> str:
+    """``http://host:port`` a client can dial: a wildcard bind is reached on
+    loopback, and an IPv6 literal is bracketed."""
+    h = (host or "").strip()
+    if h in ("", "0.0.0.0", "::", "[::]"):
+        h = "127.0.0.1"
+    if ":" in h and not h.startswith("["):
+        h = f"[{h}]"
+    return f"http://{h}:{int(port)}"
 
 
 def _dominant_weather(weather: dict) -> str | None:

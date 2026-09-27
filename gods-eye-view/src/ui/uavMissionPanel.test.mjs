@@ -5,7 +5,9 @@ import {
   THEATERS,
   SEED_POIS,
   MISSIONS,
+  commandOutcome,
   createUavMissionPanel,
+  errorText,
   trackRowAsContact,
   unwrapMcp,
 } from './uavMissionPanel.js';
@@ -1212,5 +1214,277 @@ test('the cockpit chase gives up loudly instead of retrying forever', () => {
   }
   assert.equal(panel.isCockpitFollowArmed(), false, 'bounded, not infinite');
   assert.ok(calls <= 40, `gave up after ${calls} attempts`);
+  panel.destroy();
+});
+
+// ---- command outcomes, Refuel, Live view and the Track kind -----------------
+
+test('a tool error is read in both shapes it arrives in', () => {
+  assert.equal(
+    errorText({
+      code: 'unknown_mission_kind',
+      message: "unknown mission kind 'track'",
+    }),
+    "unknown_mission_kind: unknown mission kind 'track'",
+  );
+  assert.equal(
+    errorText('Error executing tool sim_set_fuel'),
+    'Error executing tool sim_set_fuel',
+  );
+  assert.equal(errorText(null), '');
+});
+
+test('only an ok answer counts as done: rejected, error, busy and ok:false do not', () => {
+  assert.equal(commandOutcome({ task_id: 'abc' }).state, 'ok');
+  assert.equal(commandOutcome({ ok: true, fuel_pct: 100 }).state, 'ok');
+  assert.deepEqual(commandOutcome({ rejected: true, error: 'bingo' }), {
+    state: 'rejected',
+    message: 'bingo',
+  });
+  assert.deepEqual(
+    commandOutcome({ error: { code: 'missing_parameter', message: 'no lat' } }),
+    { state: 'error', message: 'missing_parameter: no lat' },
+  );
+  assert.deepEqual(
+    commandOutcome({ error: 'Error executing tool', isError: true }),
+    { state: 'error', message: 'Error executing tool' },
+  );
+  assert.deepEqual(
+    commandOutcome({ status: 'busy', current: { tool: 'uav_fly_route' } }),
+    { state: 'busy', message: 'vehicle busy with uav_fly_route' },
+  );
+  assert.equal(
+    commandOutcome({ ok: false, reason: 'refused' }).state,
+    'not_run',
+  );
+  assert.equal(commandOutcome(null).state, 'error');
+});
+
+const buttonLabelled = (panel, text) =>
+  find(
+    panel._panel,
+    (el) => el.tag === 'button' && (el.children || []).includes(text),
+  );
+const statusOf = (panel) =>
+  find(panel._panel, (el) => /^status( |$)/.test(el.className || ''));
+const settle = async () => {
+  for (let i = 0; i < 6; i += 1) await new Promise((r) => setImmediate(r));
+};
+
+/** Swap fetch for a recorder that answers from `reply(url, body)`. */
+function recordFetch(reply) {
+  const original = globalThis.fetch;
+  const posts = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : null;
+    if (init.method === 'POST') posts.push({ url: String(url), body });
+    return { ok: true, json: async () => reply(String(url), body) };
+  };
+  return { posts, restore: () => (globalThis.fetch = original) };
+}
+
+// ObraMaestra registered these two listeners INSIDE the Cockpit button's click
+// handler: neither button did anything until Cockpit had been pressed, and
+// every Cockpit press stacked another pair.
+test('Live view and Refuel work without Cockpit, and Cockpit never stacks them', async () => {
+  const doc = stubDoc();
+  const net = recordFetch(() => ({
+    ok: true,
+    vehicle: 'Drone1',
+    fuel_pct: 100,
+  }));
+  try {
+    const panel = mountPanel(doc).mount(doc.body);
+    buttonLabelled(panel, 'Live view').fire('click');
+    assert.equal(
+      panel.isCockpitFollowArmed(),
+      true,
+      'Live view arms the follow',
+    );
+    assert.match(statusOf(panel).textContent, /live view: waiting for Drone1/);
+
+    const cockpit = buttonLabelled(panel, 'Cockpit');
+    cockpit.fire('click');
+    cockpit.fire('click');
+    const refuel = buttonLabelled(panel, 'Refuel 100%');
+    assert.equal((refuel.listeners.click || []).length, 1, 'one listener');
+    refuel.fire('click');
+    refuel.fire('click');
+    await settle();
+    assert.equal(net.posts.length, 1, 'one confirmed press, one request');
+    panel.destroy();
+  } finally {
+    net.restore();
+  }
+});
+
+test('Refuel asks for a second press, then sends sim_set_fuel in arguments', async () => {
+  const doc = stubDoc();
+  const net = recordFetch(() => ({
+    ok: true,
+    status: 'accepted',
+    vehicle: 'Drone1',
+    fuel_pct: 100,
+    bingo_was_latched: true,
+    relatch_expected: false,
+  }));
+  try {
+    const panel = mountPanel(doc).mount(doc.body);
+    const refuel = buttonLabelled(panel, 'Refuel 100%');
+    refuel.fire('click');
+    await settle();
+    assert.equal(net.posts.length, 0, 'the first press only arms');
+    assert.equal(refuel.textContent, 'Confirm refuel');
+    assert.match(statusOf(panel).textContent, /clears the BINGO safety latch/);
+
+    refuel.fire('click');
+    await settle();
+    assert.equal(net.posts.length, 1);
+    assert.match(net.posts[0].url, /\/control\/command$/);
+    // The bridge forwards only `arguments` to the tool; a top-level fuel_pct
+    // was silently dropped.
+    assert.deepEqual(net.posts[0].body, {
+      tool: 'sim_set_fuel',
+      vehicle: 'Drone1',
+      arguments: { vehicle: 'Drone1', fuel_pct: 100 },
+    });
+    const status = statusOf(panel);
+    assert.equal(status.className, 'status');
+    assert.match(
+      status.textContent,
+      /refuel: Drone1 at 100% · BINGO latch cleared/,
+    );
+    assert.equal(refuel.textContent, 'Refuel 100%');
+    panel.destroy();
+  } finally {
+    net.restore();
+  }
+});
+
+for (const [name, answer, pattern] of [
+  [
+    'a structured tool error',
+    { error: { code: 'unknown_vehicle', message: 'not in the sim roster' } },
+    /refuel failed: unknown_vehicle: not in the sim roster/,
+  ],
+  [
+    "the bridge's isError string",
+    { error: 'Error executing tool sim_set_fuel', isError: true },
+    /refuel failed: Error executing tool sim_set_fuel/,
+  ],
+  ['ok:false', { ok: false, reason: 'refused' }, /refuel failed: refused/],
+]) {
+  test(`Refuel reports ${name} as a failure`, async () => {
+    const doc = stubDoc();
+    const net = recordFetch(() => answer);
+    try {
+      const panel = mountPanel(doc).mount(doc.body);
+      const refuel = buttonLabelled(panel, 'Refuel 100%');
+      refuel.fire('click');
+      refuel.fire('click');
+      await settle();
+      const status = statusOf(panel);
+      assert.equal(status.className, 'status err');
+      assert.match(status.textContent, pattern);
+      panel.destroy();
+    } finally {
+      net.restore();
+    }
+  });
+}
+
+test('a launch answered with {error} or busy is not "queued" and arms nothing', async () => {
+  for (const [answer, pattern] of [
+    [
+      { error: { code: 'invalid_mission_params', message: 'bad polygon' } },
+      /^error: invalid_mission_params: bad polygon/,
+    ],
+    [
+      { status: 'busy', current: { tool: 'uav_orbit_poi' } },
+      /^busy: vehicle busy with uav_orbit_poi/,
+    ],
+  ]) {
+    const doc = stubDoc();
+    const net = recordFetch(() => answer);
+    try {
+      const panel = mountPanel(doc).mount(doc.body);
+      byId(panel._panel, 'uav-mission').value = 'orbit_poi';
+      launchButton(panel).fire('click');
+      await settle();
+      assert.equal(net.posts.length, 1);
+      const status = statusOf(panel);
+      assert.equal(status.className, 'status err');
+      assert.match(status.textContent, pattern);
+      assert.doesNotMatch(status.textContent, /queued/);
+      assert.equal(panel.isCockpitFollowArmed(), false);
+      panel.destroy();
+    } finally {
+      net.restore();
+    }
+  }
+});
+
+// The Track kind went out as "track" with a POI and no track id: the server
+// has no such kind, and the panel said "Track queued" anyway.
+test('Track needs a roster contact and launches track_target with its id', async () => {
+  const doc = stubDoc();
+  const net = recordFetch(() => ({
+    task_id: 'track-task-1',
+    mission_id: 'MSN-1',
+  }));
+  try {
+    const panel = mountPanel(doc).mount(doc.body);
+    const missionSel = byId(panel._panel, 'uav-mission');
+    const trackOption = missionSel.children.find(
+      (o) => o.attrs.value === 'track',
+    );
+    assert.equal(trackOption.attrs.disabled, '', 'unavailable with no contact');
+    assert.match(
+      trackOption.children[0],
+      /select a contact in the roster first/,
+    );
+
+    missionSel.value = 'track';
+    launchButton(panel).fire('click');
+    await settle();
+    assert.equal(net.posts.length, 0, 'nothing is sent without a track id');
+    assert.equal(statusOf(panel).className, 'status err');
+    assert.match(statusOf(panel).textContent, /Track needs a contact/);
+
+    await panel.tick(); // the roster now carries TRK-0003
+    assert.equal(panel._roster.select('TRK-0003'), true);
+    assert.equal(
+      trackOption.attrs.disabled,
+      undefined,
+      'available once selected',
+    );
+    missionSel.value = 'track';
+    launchButton(panel).fire('click');
+    await settle();
+    assert.equal(net.posts.length, 1);
+    assert.equal(net.posts[0].body.kind, 'track_target');
+    assert.deepEqual(net.posts[0].body.params, { track_id: 'TRK-0003' });
+    assert.match(statusOf(panel).textContent, /Track queued · task track-ta/);
+    assert.equal(panel.isCockpitFollowArmed(), true);
+    panel.destroy();
+  } finally {
+    net.restore();
+  }
+});
+
+test('the tracking port drives the cockpit through the panel callback', () => {
+  const doc = stubDoc();
+  let answer = false;
+  const panel = mountPanel(doc, {
+    onEnterCockpit: () => answer,
+  }).mount(doc.body);
+  assert.equal(panel.enterCockpit('Drone1'), false);
+  answer = 'yes';
+  assert.equal(panel.enterCockpit('Drone1'), false, 'only a literal true');
+  answer = true;
+  assert.equal(panel.enterCockpit('Drone1'), true);
+  panel.armCockpitFollow('Drone1');
+  panel.disarmCockpitFollow();
+  assert.equal(panel.isCockpitFollowArmed(), false);
   panel.destroy();
 });
