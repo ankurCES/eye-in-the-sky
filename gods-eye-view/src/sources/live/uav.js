@@ -400,9 +400,26 @@ export function createUavSource({
         complete: admitted.complete,
         rejectedCount:
           admitted.rejectedCount + missions.rejected + contacts.rejected,
+        // The RUNNING theater (`/snapshot.theater`, WG §3.4): the UAV layer's
+        // epoch reset and the mission panel's re-adopt read it (§4.2.8).
+        theater: snapshotTheater(body?.theater),
       };
     },
   };
+}
+
+/**
+ * `/snapshot.theater` as `{id, epoch}`, or null when it names neither. The
+ * epoch counts only as a plain integer (the bridge sends null for one poll
+ * after a switch, and an older server never sends one).
+ * @param {unknown} raw Snapshot `theater` value.
+ * @returns {{id: string|null, epoch: number|null}|null} Reference.
+ */
+export function snapshotTheater(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : null;
+  const epoch = Number.isInteger(raw.epoch) ? raw.epoch : null;
+  return id === null && epoch === null ? null : { id, epoch };
 }
 
 /* ------------------------------------------------------------------ *

@@ -1,0 +1,34 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {"type": "Point", "coordinates": [32.6169, 46.6354]},
+      "properties": {
+        "osm_type": "R", "osm_id": 1573441, "osm_key": "place", "osm_value": "city",
+        "type": "city", "name": "Kherson", "state": "Kherson Oblast",
+        "country": "Ukraine", "countrycode": "UA",
+        "extent": [32.4829, 46.7254, 32.7412, 46.5835]
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {"type": "Point", "coordinates": [32.5911, 46.6412]},
+      "properties": {
+        "osm_type": "N", "osm_id": 337010207, "osm_key": "railway", "osm_value": "station",
+        "type": "house", "name": "Kherson \u202eevil\u202c <img src=x onerror=alert(1)>",
+        "city": "Kherson", "country": "Ukraine"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {"type": "LineString", "coordinates": [[32.5, 46.6], [32.6, 46.7]]},
+      "properties": {"osm_type": "W", "osm_id": 1, "name": "Not a point"}
+    },
+    {
+      "type": "Feature",
+      "geometry": {"type": "Point", "coordinates": [32.6169, 146.6354]},
+      "properties": {"osm_type": "N", "osm_id": 2, "name": "Latitude out of range"}
+    }
+  ]
+}

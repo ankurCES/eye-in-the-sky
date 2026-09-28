@@ -9,6 +9,7 @@ import {
   alarmFromPayload,
   createIntelStore,
   diffNodes,
+  theaterChangeBetween,
 } from './intelStore.js';
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -539,4 +540,120 @@ test('diffNodes is a pure id diff', () => {
   const first = diffNodes(null, new Map(), [node('a:1', 'track')]);
   assert.deepEqual(first.added, ['a:1']);
   assert.deepEqual(first.removed, []);
+});
+
+// WG §4.2.4: the store names a theater change so the orb runs its transition.
+function withTheater(theater, nodes = [node('veh:Drone1', 'vehicle')]) {
+  return graph(nodes, [], { theater });
+}
+
+test('theaterChanged is null on the first graph and when nothing moved', async () => {
+  const t = { id: 'default', label: 'Redmond', epoch: 0 };
+  const { store, changes, clock } = setup({
+    replies: [
+      withTheater(t),
+      withTheater(t, [node('veh:Drone1', 'vehicle'), node('trk:T-1', 'track')]),
+    ],
+  });
+  store.start();
+  await flush();
+  assert.equal(changes.at(-1).first, true);
+  assert.equal(changes.at(-1).theaterChanged, null);
+  await clock.advance(POLL_MS);
+  assert.deepEqual(changes.at(-1).added, ['trk:T-1']);
+  assert.equal(changes.at(-1).theaterChanged, null);
+  store.stop();
+});
+
+test('theaterChanged names from and to when the theater id changes', async () => {
+  const a = { id: 'default', label: 'Redmond', place: 'Redmond, WA', epoch: 0 };
+  const b = {
+    id: 'dyn-kherson-1',
+    label: 'Kherson',
+    place: 'Kherson, Ukraine',
+    epoch: 1,
+  };
+  const { store, changes, clock } = setup({
+    replies: [withTheater(a), withTheater(b)],
+  });
+  store.start();
+  await flush();
+  await clock.advance(POLL_MS);
+  const d = changes.at(-1);
+  assert.equal(d.graph, true);
+  assert.deepEqual(d.theaterChanged, {
+    from: { id: 'default', epoch: 0, label: 'Redmond', place: 'Redmond, WA' },
+    to: {
+      id: 'dyn-kherson-1',
+      epoch: 1,
+      label: 'Kherson',
+      place: 'Kherson, Ukraine',
+    },
+  });
+  store.stop();
+});
+
+test('theaterChanged fires on an epoch change with the same id', async () => {
+  const a = { id: 'dyn-x', label: 'X', epoch: 2 };
+  const b = { id: 'dyn-x', label: 'X', epoch: 3 };
+  const { store, changes, clock } = setup({
+    replies: [withTheater(a), withTheater(b), withTheater(b)],
+  });
+  store.start();
+  await flush();
+  await clock.advance(POLL_MS);
+  assert.equal(changes.at(-1).theaterChanged.from.epoch, 2);
+  assert.equal(changes.at(-1).theaterChanged.to.epoch, 3);
+  const count = changes.length;
+  await clock.advance(POLL_MS);
+  assert.equal(changes.length, count, 'identical graph: no change event');
+  store.stop();
+});
+
+test('non-graph diffs carry theaterChanged: null so the orb trusts the store', async () => {
+  const { store, changes, api } = setup({
+    replies: [withTheater({ id: 'default', label: 'Redmond', epoch: 0 })],
+  });
+  store.start();
+  await flush();
+  api.streams[0].handlers.onEvent('alarm', {
+    kind: 'bingo',
+    vehicle: 'Drone1',
+    message: 'BINGO',
+    atMs: 5,
+  });
+  const d = changes.at(-1);
+  assert.equal(d.alarms, true);
+  assert.ok('theaterChanged' in d);
+  assert.equal(d.theaterChanged, null);
+  store.stop();
+});
+
+test('theaterChangeBetween: id or both epochs; a missing epoch is not a change', () => {
+  assert.equal(theaterChangeBetween(null, { id: 'a' }), null);
+  assert.equal(theaterChangeBetween({ id: 'a' }, null), null);
+  assert.equal(theaterChangeBetween({ id: 'a' }, { id: 'a' }), null);
+  assert.equal(
+    theaterChangeBetween({ id: 'a' }, { id: 'a', epoch: 4 }),
+    null,
+    'an older server starting to report epochs is not a switch',
+  );
+  assert.equal(
+    theaterChangeBetween({ id: 'a', epoch: 4 }, { id: 'a', epoch: null }),
+    null,
+  );
+  assert.equal(
+    theaterChangeBetween({ id: 'a', epoch: '4' }, { id: 'a', epoch: 5 }),
+    null,
+    'a non-integer epoch is ignored',
+  );
+  assert.deepEqual(theaterChangeBetween({ id: 'a' }, { id: 'b' }), {
+    from: { id: 'a', epoch: null, label: null, place: null },
+    to: { id: 'b', epoch: null, label: null, place: null },
+  });
+  assert.equal(
+    theaterChangeBetween({ id: 'a', epoch: 1 }, { id: 'a', epoch: 2 }).to.epoch,
+    2,
+  );
+  assert.equal(theaterChangeBetween({ id: '' }, { id: 'b' }), null);
 });

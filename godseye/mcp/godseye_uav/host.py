@@ -28,6 +28,12 @@ imported lazily. If one fails to load or to start, the host still boots: it
 answers that module's routes with an honest 503, so the operator keeps the
 rest of the app (without the settings, the analyst runs on the Claude login).
 
+Runtime theaters (WG §4.1.4, §4.1.10): the boot theater is ``--theater``,
+else the one persisted in ``<store>/theater.json`` (a chat-defined theater
+survives a restart with its epoch and airframe), else the default. The bridge
+adapter is a switch's third origin copy, and a theater listener drops the
+bridge's geofence and flown tracks and the intel cache after a switch.
+
 The analyst's model-provider settings (BYOK spec §7): ``LlmSettings`` is built
 before ``ChatService`` (which resolves every turn through it), its
 ``/settings/llm*`` routes sit before the ``/api/*`` catch-all and the static
@@ -49,6 +55,7 @@ import secrets
 import socket
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,9 +73,9 @@ from starlette.routing import Route
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import launch
+from . import launch, theater_switch
 
-log = logging.getLogger("godseye_uav.host")
+log =logging.getLogger("godseye_uav.host")
 
 APP_NAME = "eye-in-the-sky"
 APP_TITLE = "Eye in the Sky"
@@ -113,9 +120,136 @@ class HostConfig:
     cli_path: str | None = None            # None = frozen helper if bundled, else SDK discovery
     effort: str | None = None
     start_loops: bool = True               # bridge telemetry/camera/mission loops
+    # --- runtime theaters and map data (WG §4.1.10) ---
+    #: On-demand map data: geocoding, mapped sites and proposal ground samples.
+    #: Off here so in-process hosts stay offline; ``app.py --geodata`` is on.
+    geodata: bool = False
+    #: Safety-loop hydration, as ``server.resolve_real_data`` takes it: None
+    #: (``$GODSEYE_REAL_DATA``, unset = off), False, "direct" or True (GEV).
+    real_data: Any = None
+    #: Airframe id. None keeps a restored theater's airframe (else the default).
+    airframe: str | None = None
     #: Provider/credential variables ``app.capture_llm_env`` took out of the
     #: launch environment (BYOK spec §3.3). Holds secrets: never log or print it.
     llm_env: dict[str, str] | None = field(default=None, repr=False)
+
+
+# ---------------------------------------------------------------------------
+# the boot theater (WG §4.1.4: a runtime theater survives a restart)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BootTheater:
+    """What ``build_host`` boots on (WG §4.1.4 steps 2-5, 7 and 9)."""
+
+    theater: Any                  # theaters.Theater
+    airframe: str | None          # None = the server's default profile
+    epoch: int                    # kept only when the persisted theater is booted
+    source: str                   # "flag" | "store" | "default"
+    error: str | None = None      # why the persisted file was not used (audited)
+
+
+def boot_theater(cfg: HostConfig, persisted: dict | None) -> BootTheater:
+    """Pick the boot theater from ``cfg`` and ``theater_switch.load_persisted``.
+
+    An explicit ``cfg.theater`` wins (an unknown one still raises KeyError,
+    refused loudly); else the store's persisted theater; else the table
+    default. A corrupt or unresolvable file never blocks boot: the default is
+    booted and ``error`` says why. The epoch and airframe are kept only when
+    the persisted theater is the one booted, and an explicit ``cfg.airframe``
+    always wins (ValueError names the known ids).
+
+    A real AirSim's origin is fixed by its settings.json, so there only an
+    explicit ``cfg.theater`` or the default is booted: a theater the fake sim
+    was switched to is never restored onto it (audited, like a bad file).
+    """
+    from . import safety, theaters
+
+    doc = persisted if isinstance(persisted, dict) else None
+    error = str(doc["error"]) if doc is not None and doc.get("error") else None
+    saved = doc if doc is not None and error is None else None
+    airframe = safety.get_airframe(cfg.airframe).id if cfg.airframe else None
+    if cfg.theater:
+        t, source = launch.resolve_theater(cfg.theater), "flag"
+    elif (saved is not None and cfg.sim_backend == "real"
+          and saved.get("theater_id") != theaters.DEFAULT_THEATER_ID):
+        error = (f"real AirSim: the origin is fixed by settings.json, so the persisted "
+                 f"theater {str(saved.get('theater_id'))[:60]!r} was not restored; "
+                 "pass --theater to choose one")
+        saved = None
+        t, source = launch.resolve_theater(None), "default"
+    elif saved is not None:
+        try:
+            t, source = launch.resolve_theater(saved.get("theater_id")), "store"
+        except (KeyError, ValueError, TypeError) as exc:
+            error = (f"persisted theater {str(saved.get('theater_id'))[:60]!r} "
+                     f"did not resolve ({type(exc).__name__})")
+            saved = None
+            t, source = launch.resolve_theater(None), "default"
+    else:
+        t, source = launch.resolve_theater(None), "default"
+    same = saved is not None and saved.get("theater_id") == t.id
+    if same and airframe is None:
+        airframe = saved.get("airframe")
+    epoch = saved.get("epoch") if same else 0
+    epoch = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 else 0
+    return BootTheater(t, airframe, epoch, source, error)
+
+
+def restore_theater_state(server: Any, boot: BootTheater, store_dir: Path) -> None:
+    """§4.1.4 steps 7-9, before the monitor starts (restart recovery stamps
+    the restored epoch on the rows it resumes). Re-persists at once, so an
+    explicit ``--theater`` or a corrupt file is replaced by what now runs.
+    """
+    server.theater_epoch = boot.epoch
+    server.theater_set_via = "boot"
+    server.theater_set_at_ms = int(time.time() * 1000)
+    theater_switch.persist(store_dir, theater_switch.state_of(server, via="boot"))
+    if boot.error:
+        server.store.log_audit("theater_restore_failed", boot.error,
+                               fallback=server.theater.id, source=boot.source)
+        log.warning("persisted theater not restored (%s); booted %s", boot.error,
+                    server.theater.id)
+    elif boot.source == "store":
+        log.info("theater %s restored from the store (epoch %d)", server.theater.id,
+                 boot.epoch)
+
+
+def theater_config(server: Any) -> dict:
+    """``/app/config.theater``: the RUNNING theater, read from the server
+    (a switch changes it). Id, label and epoch only; no secret goes here."""
+    t = server.theater
+    epoch = getattr(server, "theater_epoch", 0)
+    return {"id": t.id, "label": t.label,
+            "epoch": epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else 0}
+
+
+def theater_listener(host: Any) -> Callable[[dict], None]:
+    """The host's theater listener (§4.1.10), run on the tasking loop after a
+    switch: the bridge's geofence and flown tracks and the intel graph cache
+    all describe the old area. The feed and intel are read at call time (the
+    feed can be swapped; intel may have failed to load). Every step runs; a
+    failure is raised afterwards so the switch audits it.
+    """
+    def on_theater_changed(state: dict) -> None:
+        host.theater = host.server.theater
+        bridge = getattr(host.bridge_app.state, "bridge", None)
+        feed = getattr(bridge, "feed", None)
+        steps = (("feed.invalidate_geofence", getattr(feed, "invalidate_geofence", None)),
+                 ("bridge.reset_flown", getattr(bridge, "reset_flown", None)),
+                 ("intel.invalidate", getattr(host.intel, "invalidate", None)))
+        failed = []
+        for name, step in steps:
+            if not callable(step):
+                continue
+            try:
+                step()
+            except Exception as exc:  # noqa: BLE001 - the others still run
+                failed.append(f"{name}: {type(exc).__name__}: {exc}")
+        if failed:
+            raise RuntimeError("; ".join(failed))
+
+    return on_theater_changed
 
 
 def default_store_dir(*, platform: str | None = None, env: Any = None,
@@ -604,6 +738,8 @@ class Host:
     chat: Any                   # chat.ChatService | None
     config: HostConfig
     token: str
+    theater: Any                # the running theater (a switch's listener updates it)
+    boot: BootTheater           # what the host booted on, and from where
 
     def __init__(self, **kw: Any) -> None:
         self.intel = None
@@ -802,10 +938,14 @@ def build_host(cfg: HostConfig) -> Host:
         raise ValueError("a real AirSim needs an explicit sim_port")
     url_host = "[::1]" if bind_addr == "::1" else "127.0.0.1"
 
-    t = launch.resolve_theater(cfg.theater)         # KeyError names the known ids
+    # WG §4.1.4 boot order: the store, then its persisted theater (a dynamic
+    # row is registered before any id is resolved), then T1. Reading the file
+    # creates nothing, so a busy port still fails before the store is touched.
+    store_dir = Path(cfg.store_dir or default_store_dir()).expanduser().resolve()
+    boot = boot_theater(cfg, theater_switch.load_persisted(store_dir))
+    t = boot.theater                                # KeyError names the known ids
     home = launch.home_geopoint(t)                  # MSL -> HAE, once (T1)
     token = cfg.token or secrets.token_urlsafe(24)
-    store_dir = Path(cfg.store_dir or default_store_dir()).expanduser().resolve()
     ui_dir = Path(cfg.ui_dir).expanduser().resolve() if cfg.ui_dir else default_ui_dir()
 
     acquired: list[Callable[[], Any]] = []
@@ -852,12 +992,15 @@ def build_host(cfg: HostConfig) -> Host:
         # The MCP auth metadata (401 WWW-Authenticate resource_metadata) names
         # THIS host's port, not the legacy stack's 8791.
         server = launch.build_server(t, backend, store, token=token,
-                                     public_url=f"http://{url_host}:{port}")
+                                     public_url=f"http://{url_host}:{port}",
+                                     airframe=boot.airframe, real_data=cfg.real_data,
+                                     geodata=cfg.geodata)
         acquired.append(server.tasking.shutdown)
         if server.theater_mismatch is not None:
             raise RuntimeError(
                 f"server resolved theater {server.theater.id!r} for a {t.id!r} "
                 f"envelope: {server.theater_mismatch}")
+        restore_theater_state(server, boot, store_dir)
 
         mcp_asgi = server.mcp.streamable_http_app(
             streamable_http_path=MCP_PATH, stateless_http=True, host="127.0.0.1")
@@ -872,7 +1015,7 @@ def build_host(cfg: HostConfig) -> Host:
 
     host = Host(
         app=app, bridge_app=app, server=server, config=cfg, token=token,
-        theater=t, home=home, sim=sim, sim_port=sim_port, store=store,
+        theater=t, boot=boot, home=home, sim=sim, sim_port=sim_port, store=store,
         store_dir=store_dir, backend=backend, adapter=adapter, sockets=sockets,
         port=port, mcp_port=mcp_port, url=f"http://{url_host}:{port}/",
         mcp_url=mcp_url, ui_dir=ui_dir, ui_built=(ui_dir / "index.html").is_file(),
@@ -946,6 +1089,22 @@ def _settings_guard(llm_mod: Any, host: Host) -> tuple[type, dict] | None:
     return guard, kw
 
 
+def _wire_theater(host: Host, adapter: Any) -> None:
+    """WG §4.1.10: the bridge adapter's origin copy moves with a switch, and
+    the host's listener drops the caches of the old area. A switch refuses
+    without a listener ("needs the app host"), so if the adapter cannot be
+    held the listener is not added: a refused switch, never a bridge left
+    projecting against the old origin.
+    """
+    try:
+        host.server.attach_origin_holder(adapter)
+    except Exception as exc:  # noqa: BLE001 - the app boots; switching is off
+        log.warning("runtime theater change disabled: the bridge origin cannot "
+                    "move with it (%s: %s)", type(exc).__name__, exc)
+        return
+    host.server.theater_listeners.append(theater_listener(host))
+
+
 def _wire(host: Host, mcp_asgi: ASGIApp, adapter: Any) -> None:
     app, cfg, token = host.app, host.config, host.token
     auth, auth_sse = bearer_auth(token), sse_auth(token)
@@ -962,10 +1121,12 @@ def _wire(host: Host, mcp_asgi: ASGIApp, adapter: Any) -> None:
         app.add_middleware(guard[0], **guard[1])
     app.add_middleware(LoopbackHostMiddleware)            # outermost
 
+    _wire_theater(host, adapter)
+
     @app.get("/app/config", include_in_schema=False)
     def app_config() -> dict:
         return {"app": APP_NAME, "version": app_version(),
-                "theater": {"id": host.theater.id, "label": host.theater.label},
+                "theater": theater_config(host.server),
                 "chat": host.chat_summary(), "mcp_path": MCP_PATH,
                 "ui": "built" if host.ui_built else "missing"}
 

@@ -2799,3 +2799,356 @@ def test_a_clean_preflight_spawns_once_and_is_not_rerun_on_a_live_cli(tmp_path):
         await svc.shutdown()
     asyncio.run(main())
     assert len(sdk.clients) == 1 and llm.preflights == 1
+
+
+# ======================================================================
+# WG v2 Phase A (unit A9): the theater directive, approval previews, the
+# acknowledgement flag, the ui allowlist and the dry-run theater epoch
+# ======================================================================
+
+XSS = "<img src=x onerror=alert(1)>"
+BIDI = chr(0x202E) + "evil" + chr(0x202C)  # RLO ... PDF
+THEATER_ID = "dyn-bengaluru-centre-1a2b3c"
+SET_ARGS = {"proposal_id": "prop-1", "theater_id": THEATER_ID, "label": "Bengaluru centre",
+            "ao": [[12.95, 77.57], [12.95, 77.62], [12.99, 77.62], [12.99, 77.57]],
+            "home_lat": 12.97, "home_lon": 77.59, "ground_msl_m": 920.0,
+            "airframe": "quad_suas_electric"}
+PREVIEW_REQUIRED = {"checks", "center", "bbox", "home", "airframe", "ground_msl_m"}
+
+
+def accepted_switch(label="Bengaluru centre", tid=THEATER_ID, **extra):
+    """`sim_set_theater`'s accepted result (WG v2 §4.1.3), trimmed."""
+    return {"ok": True, "status": "accepted",
+            "theater": {"id": tid, "label": label, "epoch": 1, "dynamic": True},
+            "previous": {"id": "default", "label": "Redmond (AirSim default)"},
+            "airframe": {"id": "quad_suas_electric", "changed": False},
+            "fuel": "kept", "sites_loaded": 0, "real_data": "off", **extra}
+
+
+def test_ui_theater_follows_only_an_approved_accepted_switch(tmp_path, monkeypatch):
+    monkeypatch.setattr(chat_mod.theater_tools, "approval_preview",
+                        lambda srv, tool, args: {"checks": [], "tool": tool})
+    cases = [
+        ("toolu_1", "approve", accepted_switch()),
+        ("toolu_2", "approve", accepted_switch(status="unchanged")),
+        ("toolu_3", "approve", accepted_switch(status="duplicate", idempotent_replay=True)),
+        ("toolu_4", "approve", {"rejected": True, "error": "switch_refused",
+                                "message": "Drone1: airborne (landed_state=1)"}),
+        ("toolu_5", "deny", None),
+        ("toolu_6", "approve", accepted_switch(label=BIDI + XSS, tid="dyn-x-2")),
+        ("toolu_7", "approve", {"ok": True, "status": "accepted",
+                                "theater": {"id": "bad|id", "label": "x"}}),
+        ("toolu_8", "approve", {"ok": True, "status": "accepted", "theater": "dyn-x-3"}),
+        ("toolu_9", "approve", accepted_switch(tid="dyn-no-label", label=None)),
+    ]
+
+    async def turn(client, prompt):
+        yield init()
+        for cid, _, payload in cases:
+            yield tool_use(cid, "sim_set_theater", SET_ARGS)
+            perm = await client.ask(f"{TOOL_PREFIX}sim_set_theater", SET_ARGS, cid)
+            if isinstance(perm, PermissionResultAllow):
+                yield tool_result(cid, payload)
+            else:
+                yield deny_result(cid, perm)
+        # an accepted result for a call that never went through the approval broker
+        yield tool_use("toolu_x", "sim_set_theater", SET_ARGS)
+        yield tool_result("toolu_x", accepted_switch(tid="dyn-never-asked"))
+        yield ResultMessage()
+
+    svc = make_service(tmp_path, FakeSdk(turn), server=_StubServer())
+
+    async def main():
+        sid, rec, _ = await start_turn(svc, "Fly a recce over Bengaluru")
+        for cid, verdict, _ in cases:
+            req = (await rec.wait(lambda e, cid=cid: e[1] == "approval_request"
+                                  and e[2]["call_id"] == cid))[2]
+            assert req["tool"] == "sim_set_theater"
+            assert req["theater_preview"] == {"checks": [], "tool": "sim_set_theater"}
+            assert "time_scale_preview" not in req
+            assert req["acknowledge_required"] is False
+            assert req["allow_session"] is False
+            await svc.resolve_approval(sid, req["approval_id"], verdict)
+        await rec.wait_name("turn_end")
+        assert rec.of("ui") == [
+            {"action": "theater", "id": f"thr:{THEATER_ID}", "label": "Bengaluru centre"},
+            {"action": "theater", "id": "thr:dyn-x-2", "label": "evil" + XSS},
+            {"action": "theater", "id": "thr:dyn-no-label"},
+        ]
+        names = rec.names()
+        first_ui = names.index("ui")
+        assert names.index("approval_resolved") < first_ui < names.index("turn_end")
+        outcomes = {d["call_id"]: d["outcome"] for d in rec.of("tool_result")}
+        assert outcomes["toolu_4"] == "rejected" and outcomes["toolu_5"] == "not_run"
+        assert outcomes["toolu_2"] == outcomes["toolu_3"] == "ok"  # ok, just no directive
+        await svc.shutdown()
+    asyncio.run(main())
+
+
+def test_approval_requests_carry_previews_and_the_acknowledgement_flag(tmp_path, monkeypatch):
+    seen: list = []
+
+    def fake_preview(srv, tool, args):
+        seen.append((srv, tool, dict(args)))
+        if tool == "sim_set_theater":
+            raise RuntimeError("cache gone")
+        return {"from": 1.0, "to": float(args["scale"]), "t": (1, 2),
+                "checks": [{"text": "Fake simulator", "ok": True}], "caveats": ["x"]}
+
+    monkeypatch.setattr(chat_mod.theater_tools, "approval_preview", fake_preview)
+    calls = [("toolu_s", "sim_set_time_scale", {"scale": 10}),
+             ("toolu_t", "sim_set_theater", SET_ARGS),
+             ("toolu_f", "sim_set_fuel", {"vehicle": "Drone1", "pct": 50}),
+             ("toolu_k", "uav_takeoff", {"vehicle": "Drone1"})]
+
+    async def turn(client, prompt):
+        yield init()
+        for cid, tool, args in calls:
+            yield tool_use(cid, tool, args)
+            perm = await client.ask(f"{TOOL_PREFIX}{tool}", args, cid)
+            yield deny_result(cid, perm)
+        yield ResultMessage()
+
+    server = _StubServer()
+    svc = make_service(tmp_path, FakeSdk(turn), server=server)
+
+    async def main():
+        sid, rec, _ = await start_turn(svc)
+        reqs = {}
+        for cid, _, _ in calls:
+            req = (await rec.wait(lambda e, cid=cid: e[1] == "approval_request"
+                                  and e[2]["call_id"] == cid))[2]
+            reqs[cid] = req
+            await svc.resolve_approval(sid, req["approval_id"], "deny")
+        await rec.wait_name("turn_end")
+        await svc.shutdown()
+        return reqs
+
+    reqs = asyncio.run(main())
+    speed = reqs["toolu_s"]
+    assert speed["time_scale_preview"] == {
+        "from": 1.0, "to": 10.0, "t": [1, 2],  # plain JSON
+        "checks": [{"text": "Fake simulator", "ok": True}], "caveats": ["x"]}
+    assert "theater_preview" not in speed and speed["acknowledge_required"] is False
+    assert reqs["toolu_t"]["theater_preview"] == {}  # a failing preview: Deny-only slip
+    assert reqs["toolu_f"]["acknowledge_required"] is True  # safety_override
+    assert reqs["toolu_k"]["acknowledge_required"] is False
+    for cid in ("toolu_f", "toolu_k"):
+        assert "theater_preview" not in reqs[cid] and "time_scale_preview" not in reqs[cid]
+    assert [(s is server, tool) for s, tool, _ in seen] == [
+        (True, "sim_set_time_scale"), (True, "sim_set_theater")]
+    assert seen[1][2] == SET_ARGS
+
+
+def test_previews_are_empty_without_a_server_or_a_stored_proposal(tmp_path, monkeypatch):
+    stub = make_service(tmp_path, FakeSdk(), server=_StubServer())
+    # the real theater_tools: no proposal book on this server -> {}
+    assert stub._approval_preview("sim_set_theater", SET_ARGS) == {}
+    assert stub._approval_preview("uav_takeoff", {"vehicle": "Drone1"}) == {}
+    called = []
+    monkeypatch.setattr(chat_mod.theater_tools, "approval_preview",
+                        lambda *a: called.append(a) or {"x": 1})
+    none = make_service(tmp_path, FakeSdk(), server=None)
+    assert none._approval_preview("sim_set_time_scale", {"scale": 2}) == {}
+    assert called == []  # never asked without a server
+    monkeypatch.setattr(chat_mod.theater_tools, "approval_preview", lambda *a: ["not", "a dict"])
+    assert stub._approval_preview("sim_set_time_scale", {"scale": 2}) == {}
+
+
+def test_emit_ui_allowlist_is_the_six_actions_and_checks_theater_and_map(tmp_path):
+    svc = make_service(tmp_path, FakeSdk())
+    s = chat_mod._Session("s-ui")
+    good = [{"action": "focus", "ids": ["veh:Drone1"]},
+            {"action": "track", "vehicle": "Drone1", "reason": "x"},
+            {"action": "orb"},
+            {"action": "inspect", "id": "sit:dyn-x:way/1"},
+            {"action": "theater", "id": "thr:dyn-x"},
+            {"action": "map", "ids": ["thr:dyn-x", "sit:dyn-x:way/1"], "reason": "r"}]
+    for directive in good:
+        svc._emit_ui(s, directive)
+    assert [(name, data) for _, name, data in s.log] == [("ui", d) for d in good]
+    bad = [{"action": "theater"}, {"action": "theater", "id": "veh:Drone1"},
+           {"action": "theater", "id": 3}, {"action": "map"}, {"action": "map", "ids": []},
+           {"action": "map", "ids": ["veh:D"] * 51}, {"action": "map", "ids": [""]},
+           {"action": "map", "ids": "thr:x"}, {"action": "zoom"}, {"action": "mode_changed"},
+           {"action": "ui_show_theater"}, "map", None]
+    for directive in bad:
+        with pytest.raises(ValueError):
+            svc._emit_ui(s, directive)
+    assert len(s.log) == len(good)
+    assert chat_mod.UI_ACTIONS == ("focus", "track", "orb", "inspect", "theater", "map")
+
+
+def test_ui_show_map_reaches_the_stream_and_bad_ids_do_not(tmp_path):
+    ok = {"ids": ["thr:default", "sit:default:way/1"], "reason": "Watch the recce"}
+    bad = {"ids": ["Bengaluru"], "reason": "x"}
+
+    async def turn(client, prompt):
+        yield init()
+        for cid, args in (("toolu_m", ok), ("toolu_b", bad)):
+            yield tool_use(cid, "ui_show_map", args)
+            out = await client.run_tool(f"{TOOL_PREFIX}ui_show_map", args)
+            yield UserMessage([ToolResultBlock(cid, out["content"], out.get("is_error"))])
+        yield ResultMessage()
+
+    svc = make_service(tmp_path, FakeSdk(turn))
+
+    async def main():
+        _sid, rec, _ = await start_turn(svc, "Show me")
+        await rec.wait_name("turn_end")
+        assert rec.of("ui") == [{"action": "map", **ok}]
+        results = {d["call_id"]: d for d in rec.of("tool_result")}
+        assert results["toolu_m"]["ok"] is True
+        assert results["toolu_m"]["entities"] == []  # {"ok": true} names nothing
+        assert results["toolu_b"]["ok"] is False and results["toolu_b"]["outcome"] == "error"
+        await svc.shutdown()
+    asyncio.run(main())
+
+
+def test_focused_site_ids_reach_the_prompt(tmp_path):
+    text = ChatService._compose_prompt("What is this?", {"focused_ids": [
+        "sit:dyn-x:way/1", "site:dyn-x:way/1", "thr:dyn-x"]})
+    assert text.startswith("[Console context: the operator has these entities focused: "
+                           "[[sit:dyn-x:way/1]], [[thr:dyn-x]]]")
+
+
+class _EpochServer(_StubServer):
+    """The stub server with a running theater epoch (A6a's `theater_epoch`)."""
+
+    def __init__(self):
+        super().__init__()
+        self.theater_epoch = 0
+
+
+def _dry_payload(epoch=None):
+    gate = dict(DRY_RUN_PAYLOAD["gate"])
+    if epoch is not None:
+        gate["theater_epoch"] = epoch
+    return {**DRY_RUN_PAYLOAD, "gate": gate}
+
+
+def test_a_dry_run_from_another_theater_epoch_never_vouches_for_a_slip(tmp_path):
+    """WG v2 §4.1.9 #10: a dry run recorded at epoch N does not match a slip at
+    epoch N+1; the lookup at the new epoch drops the stale entries."""
+    server = _EpochServer()
+    plan = {"vehicle": "Drone1", "kind": "grid_search", "polygon": AO, "alt_agl_m": 60}
+    live = {"vehicle": "Drone1", "polygon": AO, "alt_agl_m": 60}
+    marks: dict = {}
+
+    async def turn(client, prompt):
+        yield init()
+        steps = [("toolu_1", _dry_payload(0)), ("toolu_2", None), ("switch", 1),
+                 ("toolu_3", None), ("toolu_4", _dry_payload(0)), ("toolu_5", None),
+                 ("toolu_6", _dry_payload()), ("toolu_7", None)]
+        for cid, payload in steps:
+            if cid == "switch":
+                server.theater_epoch = payload  # the switch completed meanwhile
+                continue
+            if payload is not None:
+                yield tool_use(cid, "mission_dry_run", plan)
+                perm = await client.ask(f"{TOOL_PREFIX}mission_dry_run", plan, cid)
+                assert isinstance(perm, PermissionResultAllow)
+                yield tool_result(cid, payload)
+                marks[cid] = dict(next(iter(svc._sessions.values())).dry_runs)
+            else:
+                yield tool_use(cid, "mission_grid_search", live)
+                perm = await client.ask(f"{TOOL_PREFIX}mission_grid_search", live, cid)
+                yield deny_result(cid, perm)
+        yield ResultMessage()
+
+    svc = make_service(tmp_path, FakeSdk(turn), server=server)
+
+    async def main():
+        sid, rec, _ = await start_turn(svc)
+        seen = {}
+        for cid in ("toolu_2", "toolu_3", "toolu_5", "toolu_7"):
+            req = (await rec.wait(lambda e, cid=cid: e[1] == "approval_request"
+                                  and e[2]["call_id"] == cid))[2]
+            seen[cid] = (req, dict(svc._sessions[sid].dry_runs))
+            await svc.resolve_approval(sid, req["approval_id"], "deny")
+        await rec.wait_name("turn_end")
+        await svc.shutdown()
+        return seen
+
+    seen = asyncio.run(main())
+    key = ("grid_search", "Drone1")
+    assert marks["toolu_1"][key][2] == 0  # the epoch the gate read
+    req, _ = seen["toolu_2"]
+    assert req["dry_run"]["ok"] is True and req["dry_run"]["matches_args"] is True
+    req, runs = seen["toolu_3"]
+    assert "dry_run" not in req and runs == {}  # epoch 1: the epoch-0 plan was dropped
+    assert marks["toolu_4"][key][2] == 0  # gate ran before the switch, result after
+    req, runs = seen["toolu_5"]
+    assert "dry_run" not in req and runs == {}
+    assert marks["toolu_6"][key][2] == 1  # no epoch on the gate: the running one
+    req, runs = seen["toolu_7"]
+    assert req["dry_run"]["matches_args"] is True and key in runs
+    assert "theater_epoch" not in req["dry_run"]["gate"]  # the slip's gate keys are fixed
+
+
+def test_dry_runs_without_a_theater_epoch_still_match(tmp_path):
+    """A server with no `theater_epoch` (legacy hosts, stubs): None == None."""
+    svc = make_service(tmp_path, FakeSdk(), server=_StubServer())
+    s = chat_mod._Session("s-dry")
+    args = {"vehicle": "Drone1", "kind": "grid_search", "polygon": AO, "alt_agl_m": 60}
+    svc._record_dry_run(s, "mission_dry_run", args, _dry_payload())
+    assert s.dry_runs[("grid_search", "Drone1")][2] is None
+    found = svc._dry_run_for(s, "mcp__godseye__mission_grid_search",
+                             {"vehicle": "Drone1", "polygon": AO, "alt_agl_m": 60})
+    assert found is not None and found["matches_args"] is True
+    svc._record_dry_run(s, "mission_dry_run", args, _dry_payload(True))  # a bool is no epoch
+    assert s.dry_runs[("grid_search", "Drone1")][2] is None
+
+
+def test_a_console_theater_switch_end_to_end_on_the_real_server(tmp_path):
+    """Real server, real toolbelt, real theater tools (map data off, no
+    network): the slip carries the real previews, the approved switch runs
+    with `set_via: "console"`, and the service emits `ui theater`."""
+    with real_server(tmp_path) as srv:
+        srv.theater_listeners.append(lambda state: None)  # the app host's listener
+        srv.boot_recovery_done.set()                      # restart recovery finished
+        prop = asyncio.run(srv.mcp._tool_manager._tools["theater_propose"].fn(
+            lat=12.9716, lon=77.5946, label="Bengaluru centre", ground_msl_m=920.0,
+            airframe="quad_suas_electric"))
+        assert not prop.get("rejected") and "error" not in prop, prop
+        set_args = prop["set_args"]
+        speed = {"scale": 10}
+
+        async def turn(client, prompt):
+            yield init()
+            yield tool_use("toolu_t", "sim_set_theater", set_args)
+            perm = await client.ask(f"{TOOL_PREFIX}sim_set_theater", set_args, "toolu_t")
+            assert isinstance(perm, PermissionResultAllow)
+            out = await client.run_tool(f"{TOOL_PREFIX}sim_set_theater", perm.updated_input)
+            yield UserMessage([ToolResultBlock("toolu_t", out["content"], out.get("is_error"))])
+            yield tool_use("toolu_s", "sim_set_time_scale", speed)
+            perm = await client.ask(f"{TOOL_PREFIX}sim_set_time_scale", speed, "toolu_s")
+            yield deny_result("toolu_s", perm)
+            yield ResultMessage()
+
+        svc = ChatService(server=srv, intel=None, store_dir=tmp_path / "store",
+                          sdk=FakeSdk(turn))
+
+        async def main():
+            sid, rec, _ = await start_turn(svc, "Fly a recce over 12.97160, 77.59460")
+            req = await rec.wait_name("approval_request")
+            assert req["tool"] == "sim_set_theater" and req["acknowledge_required"] is False
+            preview = req["theater_preview"]
+            assert PREVIEW_REQUIRED <= set(preview), sorted(preview)
+            assert {"text": "Proposal still valid", "ok": True} in preview["checks"]
+            await svc.resolve_approval(sid, req["approval_id"], "approve")
+            req = (await rec.wait(lambda e: e[1] == "approval_request"
+                                  and e[2]["tool"] == "sim_set_time_scale"))[2]
+            scale = req["time_scale_preview"]
+            assert {"checks", "from", "to"} <= set(scale) and scale["to"] == 10
+            await svc.resolve_approval(sid, req["approval_id"], "deny")
+            await rec.wait_name("turn_end")
+            results = {d["call_id"]: d for d in rec.of("tool_result")}
+            assert results["toolu_t"]["ok"] is True, results["toolu_t"]
+            assert rec.of("ui") == [{"action": "theater", "id": f"thr:{set_args['theater_id']}",
+                                     "label": "Bengaluru centre"}]
+            await svc.shutdown()
+        asyncio.run(main())
+        assert srv.theater.id == set_args["theater_id"] and srv.theater_epoch == 1
+        assert srv.theater_set_via == "console"
+        assert srv.time_scale == 1.0  # the denied speed change never ran

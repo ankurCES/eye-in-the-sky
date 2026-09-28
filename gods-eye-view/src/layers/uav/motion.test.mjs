@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as Cesium from 'cesium';
 
-import { createUavLayer, MAX_POSITION_SAMPLES } from './index.js';
+import { createUavLayer, JUMP_GUARD_M, MAX_POSITION_SAMPLES } from './index.js';
 import {
   longitudeOf,
   mutableSource,
@@ -175,4 +175,33 @@ test('motion state is released with the layer', async () => {
   fixture.layer.destroy();
   assert.equal(fixture.layer.testing.motion.sampleCount('Drone1'), 0);
   assert.equal(fixture.layer.testing.motion.sampledProperty('Drone1'), null);
+});
+
+test('a fix beyond the jump guard restarts the samples; nothing sweeps across', async () => {
+  const h = harness();
+  await h.layer.update(h.viewer);
+  await poll(h, T0 + 200, LON_B);
+  const { motion } = h.layer.testing;
+  assert.equal(motion.sampleCount('Drone1'), 2);
+  assert.equal(JUMP_GUARD_M, 2000);
+
+  // 13,000 km in one poll: a jump, not motion.
+  await poll(h, T0 + 400, 32.6, {
+    position: { latitude: 46.64, longitude: 32.6 },
+  });
+  assert.equal(motion.sampleCount('Drone1'), 1);
+  // Mid-interval, the drone is at the new fix, not somewhere over the globe.
+  h.clock.nowMs = T0 + 500;
+  const lon = longitudeOf(motion.positionAt('Drone1'));
+  assert.ok(Math.abs(lon - 32.6) < 1e-6, `rendered at ${lon}`);
+
+  // Directly, too: the motion owner guards itself.
+  const cart = (lonDeg, latDeg) =>
+    Cesium.Cartesian3.fromDegrees(lonDeg, latDeg, 100);
+  motion.addSample('Probe', cart(0, 0), T0);
+  motion.addSample('Probe', cart(0.01, 0), T0 + 200); // ~1.1 km
+  assert.equal(motion.sampleCount('Probe'), 2);
+  motion.addSample('Probe', cart(0.05, 0), T0 + 400); // ~4.5 km
+  assert.equal(motion.sampleCount('Probe'), 1);
+  h.layer.destroy();
 });

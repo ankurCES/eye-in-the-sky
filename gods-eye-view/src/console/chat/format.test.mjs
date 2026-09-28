@@ -5,11 +5,13 @@ import {
   CLASS_META,
   ICON,
   SENSOR_TOOLS,
+  STALING_TOOLS,
   ago,
   approvalVehicle,
   approveVerb,
   bidiSafe,
   bytes,
+  classApprovable,
   classKey,
   coord,
   countdown,
@@ -96,13 +98,69 @@ test('server strings split on " · " and the console never adds one', () => {
   );
 });
 
-test('class metadata fails closed to command', () => {
+test('unknown classes fail safe to a non-approvable "unknown" (WG D7 #8)', () => {
   assert.equal(classKey('sensor'), 'sensor');
-  assert.equal(classKey('mystery'), 'command');
-  assert.equal(classKey('toString'), 'command');
+  // Replaces the old fail-closed-to-command pin: a new server class (e.g.
+  // `engagement`) must never become an approvable command slip.
+  for (const klass of [
+    'mystery',
+    'engagement',
+    'toString',
+    '__proto__',
+    'hasOwnProperty',
+    '',
+    null,
+    undefined,
+    42,
+    { toString: () => 'command' },
+  ]) {
+    assert.equal(classKey(klass), 'unknown', String(klass));
+    assert.equal(classApprovable(klass), false, String(klass));
+  }
+  assert.deepEqual(
+    { ...CLASS_META.unknown },
+    {
+      phrase: 'Unrecognised action',
+      icon: ICON.warning,
+      slip: true,
+      approvable: false,
+    },
+  );
+  for (const k of [
+    'read',
+    'plan',
+    'sensor',
+    'command',
+    'sim',
+    'safety_override',
+  ])
+    assert.equal(classApprovable(k), true, k);
   assert.equal(CLASS_META.command.phrase, 'Commands an aircraft');
   assert.equal(CLASS_META.safety_override.icon, ICON.override);
   assert.equal(CLASS_META.read.slip, false);
+  assert.equal(approveVerb('x', 'unknown'), '');
+  assert.equal(policyLine('unknown'), '');
+});
+
+test('Phase A tools: titles, verbs, policy line, staling and the sit prefix', () => {
+  assert.equal(toolTitle('geo_lookup'), 'Look up a place');
+  assert.equal(toolTitle('geo_sites'), 'List mapped sites');
+  assert.equal(toolTitle('theater_propose'), 'Propose a theater');
+  assert.equal(toolTitle('sim_set_theater'), 'Set the theater');
+  assert.equal(toolTitle('sim_set_time_scale'), 'Set sim speed');
+  assert.equal(toolTitle('ui_show_map'), 'Show on the map');
+  assert.equal(approveVerb('sim_set_theater', 'sim'), 'Approve theater change');
+  assert.equal(approveVerb('sim_set_time_scale', 'sim'), 'Approve change');
+  assert.equal(
+    policyLine('sim', 'sim_set_theater'),
+    'Theater changes are approved one at a time.',
+  );
+  assert.equal(
+    policyLine('sim', 'sim_set_time_scale'),
+    'Simulation changes are approved one at a time in this version.',
+  );
+  assert.ok(STALING_TOOLS.includes('sim_set_theater'));
+  assert.equal(nodeTypeOf('sit:dyn-x:way/1'), 'site');
 });
 
 test('approve verbs per tool and class', () => {

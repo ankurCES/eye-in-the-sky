@@ -13,7 +13,19 @@
  *
  * Coordinates: y is the polar axis (north = +y); longitude 0 faces +z, which
  * is the camera at rest, and +90° is +x.
+ *
+ * WG spec §4.2.4 and §4.2.6: the active theater always takes the pole, even
+ * when another theater held it in the previous layout (either scope); mapped
+ * sites sit in their own sector-anchored row at +42°, with the contact belt
+ * topped at +35°. A type the contract lacks goes to `other`.
  */
+
+import {
+  SITE_BAND,
+  placeSectorRow,
+  sectorRowLon,
+  siteSectorKey,
+} from './contextBands.js';
 
 const DEG = Math.PI / 180;
 const GOLDEN = 0.6180339887498949;
@@ -60,9 +72,10 @@ export const BANDS = Object.freeze({
     min: 72,
     anchored: true,
   }),
+  site: SITE_BAND,
   track: Object.freeze({
     caption: 'Contacts',
-    latTop: 38,
+    latTop: 35,
     latBottom: -26,
     lat: 6,
     min: 30,
@@ -104,6 +117,7 @@ export const BAND_ORDER = Object.freeze([
   'poi',
   'vehicle',
   'mission',
+  'site',
   'track',
   'other',
   'unit',
@@ -114,7 +128,9 @@ export const BAND_ORDER = Object.freeze([
 
 /** Parallels the graticule draws: band-group boundaries only (spec §4.1). */
 export const GRATICULE_PARALLELS = Object.freeze({
-  beltTop: 44,
+  beltTop: 38.5,
+  /** Sector names sit between the belt line and the top row of contacts. */
+  sectorNames: 36.75,
   beltBottom: -28.5,
   alarmCap: -63,
   emptyRow: 6,
@@ -312,7 +328,10 @@ function alarmSeq(node) {
  *
  * Deterministic: the same graph (in any node order) gives the same layout.
  * Stable: with `previous` (the last result) every surviving node keeps its
- * slot unless its pool had to grow past two-thirds occupancy.
+ * slot unless its pool had to grow past two-thirds occupancy, a newly active
+ * theater claimed the pole, or a more salient site pushed it into its
+ * sector's overflow. `hidden[i]` marks placed nodes the orb does not draw
+ * (site overflow); `overflow.site` counts them.
  *
  * @param {{nodes?: object[], edges?: object[]}|null} graph
  * @param {object|null} [previous] the previous computeLayout() result
@@ -334,6 +353,8 @@ export function computeLayout(graph, previous = null) {
   const band = new Array(n);
   const sector = new Int8Array(n).fill(-1);
   const placed = new Uint8Array(n);
+  // Placed but not drawn: site-band overflow (counted, sent to the map).
+  const hidden = new Uint8Array(n);
   const assignments = new Map();
   const pools = {};
   const prevAssign =
@@ -384,8 +405,10 @@ export function computeLayout(graph, previous = null) {
    * @param {number} min minimum capacity
    * @param {(slot:number, capacity:number, id:string)=>[number,number]} where slot → [lat, lon]
    * @param {(id:string, capacity:number)=>({slot:number, anchored:boolean}|null)} [prefer]
+   * @param {Map<string, number>|null} [claims] ids that take this slot whoever
+   *   held it before (the displaced holder probes like a newcomer)
    */
-  const fillPool = (key, list, min, where, prefer) => {
+  const fillPool = (key, list, min, where, prefer, claims = null) => {
     if (!list.length) {
       if (prevPools[key]) pools[key] = { capacity: prevPools[key].capacity };
       return;
@@ -400,7 +423,14 @@ export function computeLayout(graph, previous = null) {
     pools[key] = { capacity };
     const taken = new Map();
     const pending = [];
+    const inList = new Set(list);
+    for (const [id, slot] of claims || []) {
+      if (!inList.has(id) || taken.has(slot)) continue;
+      taken.set(slot, id);
+      assignments.set(id, { pool: key, slot, capacity, provisional: false });
+    }
     for (const id of list) {
+      if (claims?.has(id) && taken.get(claims.get(id)) === id) continue;
       const was = keepPrevious ? prevAssign?.get(id) : null;
       const choice = prefer?.(id, capacity) ?? null;
       const reanchor = was?.provisional && choice?.anchored;
@@ -467,12 +497,17 @@ export function computeLayout(graph, previous = null) {
   const placedLons = (indices) =>
     indices.filter((i) => placed[i]).map((i) => lon[i]);
 
-  // Theater: the first (active first) sits on the pole, the rest ring it.
+  // Theater: the active one takes the pole in either scope, even when another
+  // theater held it last time (WG §4.2.4 pole fix); the rest ring it at +85°.
+  // With none active, the pole holder keeps it (or the first by id takes it).
   const theaters = [...members.theater].sort((a, b) => {
     const aa = byId.get(a)?.attrs?.active === true ? 0 : 1;
     const bb = byId.get(b)?.attrs?.active === true ? 0 : 1;
     return aa - bb || compareIds(a, b);
   });
+  const activeTheater = theaters.find(
+    (id) => byId.get(id)?.attrs?.active === true,
+  );
   fillPool(
     'theater',
     theaters,
@@ -485,6 +520,7 @@ export function computeLayout(graph, previous = null) {
             wrapLon(-180 + ((slot - 0.5) * 360) / (capacity - 1)),
           ],
     () => ({ slot: 0, anchored: false }),
+    activeTheater ? new Map([[activeTheater, 0]]) : null,
   );
   fillPool(
     'vehicle',
@@ -542,6 +578,45 @@ export function computeLayout(graph, previous = null) {
       return anchorAt(placedLons(flying))(id, capacity);
     },
   );
+
+  // Sites: one row at +42°, anchored to their sector, 12 slots of 3° each;
+  // a sector's overflow sits at its centre, hidden and counted (§4.2.6).
+  const sectorKeys = new Set(SECTORS.map((sec) => sec.key));
+  const siteItems = members.site.map((id) => {
+    const s = sectorOf(siteSectorKey(byId.get(id), sectorKeys));
+    sector[index.get(id)] = s;
+    return { id, sector: s, salience: Number(byId.get(id)?.salience) || 0 };
+  });
+  const siteRow = placeSectorRow(siteItems, {
+    slots: BANDS.site.slotsPerSector,
+    previous: (id) => {
+      const was = prevAssign?.get(id);
+      return was?.pool === 'site' ? was : null;
+    },
+  });
+  for (const item of siteItems) {
+    const i = index.get(item.id);
+    const at = siteRow.slots.get(item.id);
+    if (at) {
+      set(i, BANDS.site.lat, sectorRowLon(item.sector, at.slot));
+      assignments.set(item.id, {
+        pool: 'site',
+        sector: item.sector,
+        slot: at.slot,
+        capacity: BANDS.site.slotsPerSector,
+      });
+    } else {
+      set(i, BANDS.site.lat, SECTORS[item.sector].lonCenter);
+      hidden[i] = 1;
+      assignments.set(item.id, {
+        pool: 'site',
+        sector: item.sector,
+        slot: -1,
+        capacity: BANDS.site.slotsPerSector,
+        overflow: true,
+      });
+    }
+  }
 
   fillPool('other', members.other, BANDS.other.min, ring(BANDS.other.lat));
   fillPool(
@@ -621,6 +696,7 @@ export function computeLayout(graph, previous = null) {
   const counts = {};
   for (const key of BAND_ORDER) counts[key] = members[key].length;
   const sectorCounts = bySector.map((list) => list.length);
+  const overflow = { site: siteRow.overflow.length };
 
   return {
     n,
@@ -638,5 +714,7 @@ export function computeLayout(graph, previous = null) {
     pools,
     counts,
     sectorCounts,
+    hidden,
+    overflow,
   };
 }

@@ -1488,3 +1488,77 @@ test('the tracking port drives the cockpit through the panel callback', () => {
   assert.equal(panel.isCockpitFollowArmed(), false);
   panel.destroy();
 });
+
+// ---- runtime theaters (WG v2 §4.2.8): a switch re-adopts ---------------------
+
+test('a runtime theater switch re-adopts, even over a hand-picked selector', async () => {
+  const doc = stubDoc();
+  let running = 'default';
+  let loads = 0;
+  const snap = { ...SNAPSHOT, theater: { id: 'default', epoch: 0 } };
+  const panel = mountPanel(doc, {
+    theaterLoader: async () => {
+      loads += 1;
+      return normalizeTheaterTable({
+        ...OFFLINE_THEATER_PAYLOAD,
+        active: runningBlock(running),
+      });
+    },
+    source: { label: 'stub', getSnapshot: async () => snap },
+  });
+  await panel.adoptRunningTheater();
+  const selector = byId(panel._panel, 'uav-theater');
+  assert.equal(selector.value, 'default');
+  await panel.tick(); // the baseline theater is not a change
+  const settled = loads;
+  assert.equal(await panel.noteTheater({ id: 'default', epoch: 0 }), null);
+
+  // The operator looks at another theater by hand; the bridge still flies
+  // Redmond, so the panel leaves their choice alone.
+  selector.value = 'iran-isfahan';
+  selector.fire('change');
+  await panel.tick();
+  assert.equal(selector.value, 'iran-isfahan');
+  assert.equal(loads, settled);
+
+  // An approved switch moves the bridge: /snapshot says so, the table is
+  // re-read and the selection follows the aircraft.
+  running = 'iran-natanz';
+  snap.theater = { id: 'iran-natanz', epoch: 1 };
+  await panel.tick();
+  assert.equal(loads, settled + 1);
+  assert.equal(selector.value, 'iran-natanz');
+  assert.match(panel._running.textContent, /running: Iran — Natanz/);
+  const seeds = optionText(byId(panel._panel, 'uav-poi-seed'));
+  assert.ok(!seeds.some((text) => /Isfahan North/.test(text)));
+
+  // A null epoch for one poll, then the same epoch: no second adoption.
+  snap.theater = { id: 'iran-natanz', epoch: null };
+  await panel.tick();
+  snap.theater = { id: 'iran-natanz', epoch: 1 };
+  await panel.tick();
+  assert.equal(loads, settled + 1);
+
+  // An airframe-only switch (same id, new epoch) is a switch too.
+  snap.theater = { id: 'iran-natanz', epoch: 2 };
+  await panel.tick();
+  assert.equal(loads, settled + 2);
+  panel.destroy();
+});
+
+test('a bridge whose snapshot carries no theater never triggers re-adoption', async () => {
+  const doc = stubDoc();
+  let loads = 0;
+  const panel = mountPanel(doc, {
+    theaterLoader: async () => {
+      loads += 1;
+      return runningTable(runningBlock('iran-isfahan'))();
+    },
+  });
+  await panel.adoptRunningTheater();
+  const before = loads;
+  for (let i = 0; i < 3; i += 1) await panel.tick();
+  assert.equal(loads, before);
+  assert.equal(byId(panel._panel, 'uav-theater').value, 'iran-isfahan');
+  panel.destroy();
+});

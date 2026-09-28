@@ -15,8 +15,11 @@ import {
   statusWord,
   threatWord,
   typeWord,
+  typeLabel,
   marginSubtitle,
   marginTitle,
+  unrecognisedItemTitle,
+  UNRECOGNISED_ITEM_LINE,
 } from './text.js';
 
 test('server strings split on " · " and the console never writes one', () => {
@@ -115,7 +118,11 @@ test('status words: not assessed is never "none", contacts are never "ok"', () =
   );
   assert.equal(statusWord({ type: 'alarm', status: 'ok' }), 'Info');
   assert.equal(typeWord('track'), 'Contact');
-  assert.equal(typeWord('mystery'), 'Entity');
+  assert.equal(
+    typeWord('mystery'),
+    'Unrecognised',
+    'an unknown type is unrecognised, not a generic entity (WG §4.2.1)',
+  );
 });
 
 test('registers are fixed per meaning and "Assumed" only when the server says so', () => {
@@ -325,4 +332,91 @@ test('a place reads its type word once, never "place, place"', () => {
     label: 'main battle tank',
   });
   assert.doesNotMatch(ob, /equipment, equipment/);
+});
+
+const XSS = '<img src=x onerror=alert(1)>';
+const BIDI = '\u202Eevil\u202C';
+const BIDI_CHARS = /[\u202A-\u202E\u2066-\u2069]/;
+
+test('fail-safe words: an unknown type reads "Unrecognised", its status is never read (WG §4.2.1)', () => {
+  const node = {
+    id: 'frc:red-sam-1',
+    type: 'force',
+    label: 'Red SAM 1',
+    subtitle: 'Red · SAM · Active',
+    status: 'ok',
+  };
+  assert.equal(typeWord('force'), 'Unrecognised');
+  assert.equal(typeLabel('force'), 'Unrecognised (force)');
+  assert.equal(typeLabel('track'), 'Contact');
+  assert.equal(unrecognisedItemTitle('force'), 'Unrecognised item (force)');
+  assert.match(UNRECOGNISED_ITEM_LINE, /isn't a statement that it's safe\.$/);
+  assert.equal(
+    statusWord(node),
+    'Not assessed',
+    'status ignored: never "Normal"',
+  );
+  assert.equal(statusWord({ ...node, status: 'critical' }), 'Not assessed');
+  assert.equal(registerOf(node), 'Not assessed');
+  assert.equal(nodeLabel(node), 'Red SAM 1', 'label verbatim');
+  assert.deepEqual(splitSegments(nodeSubtitle(node)), [
+    'Unrecognised (force)',
+    'Red',
+    'SAM',
+    'Active',
+  ]);
+  assert.equal(
+    optionText(node),
+    'Red SAM 1, unrecognised (force), not assessed, Red, SAM, Active',
+  );
+  // A hostile type string stays text and is cut short.
+  const odd = typeLabel(`${XSS}${BIDI}${'x'.repeat(80)}`);
+  assert.ok(odd.startsWith('Unrecognised (<img src=x onerror=alert(1)>evil'));
+  assert.ok(!BIDI_CHARS.test(odd) && odd.length <= 60);
+  assert.equal(typeLabel(undefined), 'Unrecognised (no type)');
+});
+
+test('site words: category word, "Mapped, not verified", register Mapped', () => {
+  const site = {
+    id: 'sit:dyn-x:way/1',
+    type: 'site',
+    label: 'Kherson International',
+    status: 'critical',
+    attrs: { category: 'airfield' },
+  };
+  assert.equal(typeWord('site'), 'Site');
+  assert.equal(statusWord(site), 'Mapped, not verified');
+  assert.equal(registerOf(site), 'Mapped');
+  assert.deepEqual(splitSegments(nodeSubtitle(site)), [
+    'Airfield',
+    'Mapped, not verified',
+  ]);
+  assert.equal(
+    optionText(site),
+    'Kherson International, site, airfield, mapped, not verified',
+  );
+  const medical = { ...site, attrs: { category: 'medical', protected: true } };
+  assert.equal(splitSegments(nodeSubtitle(medical))[0], 'Medical, protected');
+  const odd = { ...site, attrs: { category: 'volcano' } };
+  assert.equal(splitSegments(nodeSubtitle(odd))[0], 'Mapped site');
+  const unnamed = { ...site, label: '', attrs: { category: 'power' } };
+  assert.equal(nodeLabel(unnamed), 'Unnamed power site');
+});
+
+test('untrusted labels render as text: markup stays literal, bidi controls go (§3.11)', () => {
+  for (const type of ['track', 'site', 'theater', 'force']) {
+    const node = {
+      id: `x:${type}`,
+      type,
+      label: `${XSS} ${BIDI}`,
+      subtitle: `${BIDI} · ${XSS}`,
+      attrs: { category: 'port' },
+    };
+    const label = nodeLabel(node);
+    assert.ok(label.includes(XSS), `${type}: the angle brackets stay literal`);
+    assert.ok(label.includes('evil'));
+    assert.ok(!BIDI_CHARS.test(label), `${type}: no bidi control in the label`);
+    assert.ok(!BIDI_CHARS.test(nodeSubtitle(node)));
+    assert.ok(!BIDI_CHARS.test(optionText(node)));
+  }
 });

@@ -646,6 +646,11 @@ class Store:
         Pure by default: pass `record=True` to also write the recovery decision
         into the audit trail. Tracks and pattern-of-life are reloaded too, so
         track ids stay unique across restarts (M11).
+
+        Every recovered item's `fields["theater"]` is the theater id its rows
+        were journaled in, or None for a legacy row that predates the field
+        (WG §4.1.4): the boot re-gate aborts work planned in another theater,
+        and never aborts a legacy row on that ground.
         """
         now = time.time() if now is None else now
         fuel = self.fuel_state()
@@ -674,7 +679,8 @@ class Store:
                 kind="task", id=tid, vehicle=vehicle, decision=decision, reason=reason,
                 last_event=rec.get("_last_event"), last_ts=rec["_last_ts"],
                 tool=rec.get("tool"), params=params,
-                fields={"state": rec.get("state"), "mission_id": rec.get("mission_id")}))
+                fields={"state": rec.get("state"), "mission_id": rec.get("mission_id"),
+                        "theater": rec.get("theater")}))
 
         for mid, rec in self._fold(self.missions, "mission_id", TERMINAL_MISSION_EVENTS).items():
             if rec.get("_terminal"):
@@ -688,7 +694,8 @@ class Store:
                 kind="mission", id=mid, vehicle=vehicle, decision=decision, reason=reason,
                 last_event=rec.get("_last_event"), last_ts=rec["_last_ts"],
                 tool=rec.get("kind"), params=rec.get("params"),
-                fields={k: v for k, v in rec.items() if not k.startswith("_")}))
+                fields={"theater": None,
+                        **{k: v for k, v in rec.items() if not k.startswith("_")}}))
 
         report.tracks = len(self.tracks.reload())
         report.pattern_of_life = len(self.pattern_of_life.reload())

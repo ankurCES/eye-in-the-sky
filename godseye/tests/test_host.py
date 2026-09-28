@@ -2,8 +2,8 @@
 
 The live tests boot a real host (FakeAirSim + MCP + bridge on ONE app) with
 ``serve()`` on a worker thread, the way ``app.py --window`` runs it, and talk
-to it over real sockets. Ports come from 52300-52599 and are bound for real,
-with a retry on a clash. The wiring tests swap in fake ``intel_graph`` and
+to it over real sockets. Ports come from 53700-53749 (A12's range, WG §4.3)
+and are bound for real, with a retry on a clash. The wiring tests swap in fake ``intel_graph`` and
 ``chat`` modules, so they check the host's side of those interfaces without
 depending on the modules built in parallel.
 """
@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import types
+from collections import deque
 from pathlib import Path
 
 import godseye_uav
@@ -28,6 +29,7 @@ import pytest
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
 from godseye_uav import host as hostmod
+from godseye_uav import theater_switch, theaters
 from godseye_uav.host import (
     HostConfig,
     bearer_auth,
@@ -43,7 +45,7 @@ from godseye_uav.host import (
 )
 
 TOKEN = f"test-token-host-{os.getpid()}"
-_PORTS = list(range(52300, 52600))
+_PORTS = list(range(53700, 53750))            # A12: 53700-53749 here, 53750-53799 in test_app
 _rng = random.Random(os.getpid() ^ time.time_ns())
 
 INDEX_HTML = (
@@ -158,12 +160,14 @@ def test_app_config_is_open_and_never_carries_the_token(live):
     body = r.json()
     assert body["app"] == "eye-in-the-sky"
     assert body["version"]
-    assert body["theater"] == {"id": "default", "label": live.host.theater.label}
+    # WG §4.1.10: the running theater with its epoch; no secret rides along.
+    assert body["theater"] == {"id": "default", "label": live.host.theater.label, "epoch": 0}
     assert body["mcp_path"] == "/mcp"
     assert body["ui"] == "built"
     assert body["chat"]["available"] is False           # chat=False in this host
     assert "model" in body["chat"]
     assert TOKEN not in r.text
+    assert "console_key" not in r.text and "consoleKey" not in r.text
 
 
 def test_index_gets_the_runtime_config_before_the_first_module_script(live):
@@ -1135,5 +1139,349 @@ def test_the_real_settings_default_to_the_claude_login(tmp_path):
         # (spec §6.2), and a temp store never defaults to the login keychain.
         assert host.llm._options_builder == host.chat.check_options
         assert host.llm.key_store["kind"] in ("file", "memory")
+    finally:
+        host.close()
+
+
+# ---------------------------------------------------------------------------
+# runtime theaters (WG §4.1.4 boot order, §4.1.10 host wiring; unit A12)
+# ---------------------------------------------------------------------------
+
+#: Bengaluru centre (E2E A1): a chat theater far from the Redmond default.
+BLR = (12.9716, 77.5946)
+QUAD, GROUP3 = "quad_suas_electric", "group3_fixed_wing"
+
+
+def _call(srv, name: str, **args) -> dict:
+    """A registered MCP tool's function, in-process (no transport)."""
+    return asyncio.run(srv.mcp._tool_manager._tools[name].fn(**args))
+
+
+def _audits(host, kind: str) -> list[dict]:
+    return [r for r in host.store.audit.read_all() if r.get("kind") == kind]
+
+
+def _state_file(store: Path) -> dict:
+    return json.loads((store / "theater.json").read_text(encoding="utf-8"))
+
+
+def _blr_theater(label: str = "Bengaluru centre") -> theaters.Theater:
+    return theaters.make_dynamic(label=label, place="Bengaluru", center=BLR,
+                                 half_extent_m=2940.0, home=BLR, home_alt_msl_m=920.0,
+                                 provenance=None)
+
+
+def _persist_dynamic(store: Path, *, epoch: int, airframe: str = GROUP3,
+                     label: str = "Bengaluru centre") -> theaters.Theater:
+    """Write `<store>/theater.json` as a switch would, WITHOUT registering the
+    theater: only the host's boot (load_persisted) may register it."""
+    t = _blr_theater(label)
+    srv = types.SimpleNamespace(theater=t, airframe_id=airframe, theater_epoch=epoch,
+                                theater_set_at_ms=1_700_000_000_000,
+                                theater_set_via="console",
+                                theater_previous={"id": "default", "label": "Redmond"})
+    store.mkdir(parents=True, exist_ok=True)
+    assert theater_switch.persist(store, theater_switch.state_of(srv)) is not None
+    assert t.id not in {d.id for d in theaters.dynamic_theaters()}
+    return t
+
+
+class _Spy:
+    """Wraps a bound method: counts calls, then calls through."""
+
+    def __init__(self, fn) -> None:
+        self.fn, self.calls = fn, 0
+
+    def __call__(self, *a, **kw):
+        self.calls += 1
+        return self.fn(*a, **kw)
+
+
+def test_a_theater_set_from_chat_survives_a_restart_with_its_epoch_and_airframe(
+        tmp_path, monkeypatch):
+    """The whole path on real hosts: switch through the real tools on host A
+    (the listener drops the bridge geofence, flown tracks and intel cache;
+    the adapter origin moves; /app/config follows), then host B on the same
+    store boots that theater, its epoch and its airframe (§4.1.4)."""
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, start_loops=False)
+    try:
+        srv, bridge = host.server, host.app.state.bridge
+        assert len(srv.theater_listeners) == 1 and host.adapter in srv.origin_holders
+        spies = {"feed": _Spy(bridge.feed.invalidate_geofence),
+                 "flown": _Spy(bridge.reset_flown), "intel": _Spy(host.intel.invalidate)}
+        monkeypatch.setattr(bridge.feed, "invalidate_geofence", spies["feed"])
+        monkeypatch.setattr(bridge, "reset_flown", spies["flown"])
+        monkeypatch.setattr(host.intel, "invalidate", spies["intel"])
+        with TestClient(host.app, base_url="http://127.0.0.1") as c:
+            assert srv.boot_recovery_done.wait(20), "restart recovery never finished"
+            with bridge._lock:
+                bridge._flown["Drone1"] = deque([(47.6, -122.1), (47.61, -122.1)])
+            before = c.get("/app/config").json()["theater"]
+            assert before == {"id": "default", "label": srv.theater.label, "epoch": 0}
+            p = _call(srv, "theater_propose", lat=BLR[0], lon=BLR[1],
+                      label="Bengaluru centre", ground_msl_m=920.0, airframe=GROUP3)
+            assert not p.get("rejected") and "error" not in p, p
+            out = _call(srv, "sim_set_theater", **p["set_args"])
+            assert out["ok"] is True and out["status"] == "accepted", out
+            tid = out["theater"]["id"]
+            assert tid.startswith("dyn-") and out["theater"]["epoch"] == 1
+            assert {k: s.calls for k, s in spies.items()} == {"feed": 1, "flown": 1, "intel": 1}
+            assert bridge.flown("Drone1") == []
+            assert not _audits(host, "theater_listener_failed")
+            geo = host.adapter.home_geo                     # the third origin copy moved
+            assert (round(geo.latitude, 6), round(geo.longitude, 6)) == (
+                round(srv.theater.home_lat, 6), round(srv.theater.home_lon, 6))
+            assert host.theater.id == tid                   # the listener keeps it current
+            r = c.get("/app/config")
+            assert r.json()["theater"] == {"id": tid, "label": "Bengaluru centre", "epoch": 1}
+            assert TOKEN not in r.text and "console_key" not in r.text
+        doc = _state_file(host.store_dir)
+        assert (doc["theater_id"], doc["epoch"], doc["airframe"], doc["set_via"]) == (
+            tid, 1, GROUP3, "mcp")
+    finally:
+        host.close()
+
+    theaters.clear_dynamic()                # a new process knows only the store's file
+    again = _boot(tmp_path, ui_dir=None, mcp_port=False, start_loops=False)
+    try:
+        srv = again.server
+        assert again.boot.source == "store" and again.boot.error is None
+        assert srv.theater.id == tid and srv.theater.dynamic
+        assert srv.theater_epoch == 1 and srv.airframe_id == GROUP3
+        assert srv.theater_set_via == "boot"
+        with TestClient(again.app, base_url="http://127.0.0.1") as c:
+            assert c.get("/app/config").json()["theater"] == {
+                "id": tid, "label": "Bengaluru centre", "epoch": 1}
+        doc = _state_file(again.store_dir)
+        assert (doc["theater_id"], doc["epoch"], doc["set_via"]) == (tid, 1, "boot")
+        assert not _audits(again, "theater_restore_failed")
+    finally:
+        again.close()
+
+
+def test_an_explicit_theater_wins_over_the_store_and_is_persisted(tmp_path):
+    store = tmp_path / "store"
+    blr = _persist_dynamic(store, epoch=3, airframe=GROUP3)
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, start_loops=False,
+                 theater="iran-isfahan")
+    try:
+        srv = host.server
+        assert host.boot.source == "flag" and host.boot.error is None
+        assert srv.theater.id == "iran-isfahan"
+        assert srv.theater_epoch == 0                    # another theater: no epoch carried
+        assert srv.airframe_id == QUAD                   # ... and not its airframe either
+        doc = _state_file(store)
+        assert (doc["theater_id"], doc["epoch"], doc["airframe"], doc["set_via"]) == (
+            "iran-isfahan", 0, QUAD, "boot")
+        assert doc["theater"] is None                    # a preset is stored by id only
+        assert blr.id in {t.id for t in theaters.dynamic_theaters()}   # read, not booted
+    finally:
+        host.close()
+
+
+def test_the_persisted_theater_keeps_its_epoch_but_an_explicit_airframe_wins(tmp_path):
+    store = tmp_path / "store"
+    blr = _persist_dynamic(store, epoch=4, airframe=GROUP3)
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, start_loops=False,
+                 theater=blr.id, airframe=QUAD)
+    try:
+        srv = host.server
+        assert (srv.theater.id, srv.theater_epoch, srv.airframe_id) == (blr.id, 4, QUAD)
+        assert _state_file(store)["airframe"] == QUAD
+    finally:
+        host.close()
+
+
+@pytest.mark.parametrize("content", [
+    "{not json",
+    json.dumps({"schema": "something/else", "theater_id": "default"}),
+    json.dumps({"schema": theater_switch.SCHEMA, "theater_id": "atlantis", "epoch": 2}),
+    json.dumps({"schema": theater_switch.SCHEMA, "theater_id": "dyn-gone-1234abcd",
+                "theater": None, "epoch": 2}),
+    json.dumps({"schema": theater_switch.SCHEMA, "theater_id": "default", "epoch": -1}),
+], ids=["corrupt", "wrong-schema", "unknown-id", "dynamic-without-row", "bad-epoch"])
+def test_an_unusable_theater_file_boots_the_default_audited_and_replaced(tmp_path, content):
+    store = tmp_path / "store"
+    store.mkdir()
+    (store / "theater.json").write_text(content, encoding="utf-8")
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, start_loops=False)
+    try:
+        srv = host.server
+        assert host.boot.source == "default" and host.boot.error
+        assert srv.theater.id == theaters.DEFAULT_THEATER_ID and srv.theater_epoch == 0
+        rows = _audits(host, "theater_restore_failed")
+        assert len(rows) == 1 and rows[0]["fallback"] == theaters.DEFAULT_THEATER_ID
+        doc = _state_file(store)                         # re-persisted: now valid
+        assert doc["schema"] == theater_switch.SCHEMA and doc["theater_id"] == "default"
+        assert theater_switch.load_persisted(store)["theater_id"] == "default"
+    finally:
+        host.close()
+
+
+def test_a_first_boot_persists_the_default_with_no_audit(tmp_path):
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, start_loops=False)
+    try:
+        assert host.boot == hostmod.BootTheater(host.server.theater, None, 0, "default")
+        assert not _audits(host, "theater_restore_failed")
+        doc = _state_file(host.store_dir)
+        assert (doc["theater_id"], doc["epoch"], doc["set_via"]) == ("default", 0, "boot")
+        assert host.server.theater_set_at_ms is not None
+    finally:
+        host.close()
+
+
+def test_boot_theater_rules_without_a_host():
+    cfg = HostConfig(theater=None)
+    saved = {"theater_id": "iran-isfahan", "airframe": GROUP3, "epoch": 7}
+    b = hostmod.boot_theater(cfg, saved)
+    assert (b.theater.id, b.airframe, b.epoch, b.source, b.error) == (
+        "iran-isfahan", GROUP3, 7, "store", None)
+    b = hostmod.boot_theater(HostConfig(theater="iran-isfahan"), saved)
+    assert (b.source, b.epoch, b.airframe) == ("flag", 7, GROUP3)   # same theater
+    b = hostmod.boot_theater(HostConfig(theater="default"), saved)
+    assert (b.theater.id, b.epoch, b.airframe) == ("default", 0, None)
+    b = hostmod.boot_theater(HostConfig(theater=None, airframe=QUAD), saved)
+    assert (b.epoch, b.airframe) == (7, QUAD)
+    b = hostmod.boot_theater(cfg, {"error": "theater.json is unreadable"})
+    assert (b.theater.id, b.source, b.error) == ("default", "default",
+                                                 "theater.json is unreadable")
+    b = hostmod.boot_theater(cfg, {"theater_id": "dyn-not-registered-1", "epoch": 2})
+    assert b.theater.id == "default" and "did not resolve" in b.error and b.epoch == 0
+    assert hostmod.boot_theater(cfg, None).source == "default"
+    with pytest.raises(KeyError):
+        hostmod.boot_theater(HostConfig(theater="atlantis"), saved)
+    with pytest.raises(ValueError, match="unknown airframe"):
+        hostmod.boot_theater(HostConfig(theater=None, airframe="zeppelin"), None)
+
+
+def test_a_real_airsim_never_gets_a_restored_theater_it_was_not_given():
+    """settings.json fixes a real AirSim's origin: a theater the fake sim was
+    switched to must not be restored onto it (only --theater or the default)."""
+    real = HostConfig(theater=None, sim_backend="real", sim_port=1)
+    b = hostmod.boot_theater(real, {"theater_id": "iran-isfahan", "airframe": GROUP3,
+                                    "epoch": 4})
+    assert (b.theater.id, b.source, b.epoch, b.airframe) == ("default", "default", 0, None)
+    assert b.error.startswith("real AirSim: the origin is fixed by settings.json")
+    b = hostmod.boot_theater(real, {"theater_id": "default", "airframe": None, "epoch": 2})
+    assert (b.theater.id, b.source, b.epoch, b.error) == ("default", "store", 2, None)
+    flagged = HostConfig(theater="iran-isfahan", sim_backend="real", sim_port=1)
+    b = hostmod.boot_theater(flagged, {"theater_id": "iran-isfahan", "epoch": 4})
+    assert (b.theater.id, b.source, b.epoch, b.error) == ("iran-isfahan", "flag", 4, None)
+
+
+def test_build_server_gets_the_geodata_real_data_and_airframe_switches(tmp_path, monkeypatch):
+    from godseye_uav import launch
+
+    seen: list[dict] = []
+    real_build = launch.build_server
+
+    def spy(t, backend, store, **kw):
+        seen.append(kw)
+        return real_build(t, backend, store, **kw)
+
+    monkeypatch.setattr(launch, "build_server", spy)
+    monkeypatch.delenv("GODSEYE_REAL_DATA", raising=False)
+    monkeypatch.delenv("GODSEYE_GEODATA", raising=False)
+    host = _boot(tmp_path / "a", ui_dir=None, mcp_port=False, start_loops=False,
+                 geodata=True, real_data="direct", airframe=GROUP3)
+    try:
+        kw = seen[-1]
+        assert (kw["geodata"], kw["real_data"], kw["airframe"]) == (True, "direct", GROUP3)
+        srv = host.server
+        assert srv.geodata_enabled is True and srv.real is not None
+        assert srv.airframe_id == GROUP3
+    finally:
+        host.close()
+    host = _boot(tmp_path / "b", ui_dir=None, mcp_port=False, start_loops=False)
+    try:
+        kw = seen[-1]
+        assert (kw["geodata"], kw["real_data"], kw["airframe"]) == (False, None, None)
+        assert host.server.geodata_enabled is False and host.server.real is None
+        assert host.server.sites.as_dict()["reason"] == "map data is off"
+    finally:
+        host.close()
+
+
+def _listener_host(**over):
+    """A host-shaped namespace for the listener: every step records its name."""
+    order: list[str] = []
+    feed = types.SimpleNamespace(invalidate_geofence=lambda: order.append("feed"))
+    bridge = types.SimpleNamespace(feed=feed, reset_flown=lambda: order.append("flown"))
+    intel = types.SimpleNamespace(invalidate=lambda: order.append("intel"))
+    ns = types.SimpleNamespace(
+        server=types.SimpleNamespace(theater="new"), theater="old",
+        bridge_app=types.SimpleNamespace(state=types.SimpleNamespace(bridge=bridge)),
+        intel=intel)
+    for k, v in over.items():
+        setattr(ns, k, v)
+    return ns, order
+
+
+def test_the_theater_listener_drops_the_feed_geofence_flown_tracks_and_intel_cache():
+    ns, order = _listener_host()
+    listen = hostmod.theater_listener(ns)
+    listen({"theater_id": "dyn-x"})
+    assert order == ["feed", "flown", "intel"] and ns.theater == "new"
+    # The feed is read at call time: a swapped feed is the one invalidated.
+    swapped: list[str] = []
+    ns.bridge_app.state.bridge.feed = types.SimpleNamespace(
+        invalidate_geofence=lambda: swapped.append("new feed"))
+    listen({})
+    assert swapped == ["new feed"]
+    # No intel (it failed to load) and a feed without the hook: the rest runs.
+    ns, order = _listener_host(intel=None)
+    ns.bridge_app.state.bridge.feed = object()
+    hostmod.theater_listener(ns)({})
+    assert order == ["flown"]
+
+
+def test_a_failing_listener_step_never_skips_the_others_and_is_raised():
+    def boom():
+        raise OSError("feed gone")
+
+    ns, order = _listener_host()
+    ns.bridge_app.state.bridge.feed = types.SimpleNamespace(invalidate_geofence=boom)
+    with pytest.raises(RuntimeError, match="feed.invalidate_geofence: OSError: feed gone"):
+        hostmod.theater_listener(ns)({})
+    assert order == ["flown", "intel"]
+
+
+def test_a_listener_failure_is_audited_and_the_switch_still_lands(tmp_path, monkeypatch):
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, start_loops=False)
+    try:
+        srv = host.server
+
+        def broken():
+            raise RuntimeError("intel cache wedged")
+
+        monkeypatch.setattr(host.intel, "invalidate", broken)
+        srv.boot_recovery_done.set()             # no lifespan here: nothing to recover
+        p = _call(srv, "theater_propose", lat=BLR[0], lon=BLR[1], label="Bengaluru centre",
+                  ground_msl_m=920.0, airframe=QUAD)
+        out = _call(srv, "sim_set_theater", **p["set_args"])
+        assert out["status"] == "accepted" and srv.theater_epoch == 1
+        rows = _audits(host, "theater_listener_failed")
+        assert len(rows) == 1 and "intel cache wedged" in rows[0]["message"]
+        assert host.app.state.bridge.flown("Drone1") == []
+    finally:
+        host.close()
+
+
+def test_without_an_origin_holder_no_listener_is_added_so_a_switch_is_refused(tmp_path):
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, start_loops=False)
+    try:
+        srv = host.server
+        srv.theater_listeners.clear()
+        srv.origin_holders.clear()
+        hostmod._wire_theater(host, object())    # no .relocate / .home_geo
+        assert srv.theater_listeners == [] and srv.origin_holders == []
+        srv.boot_recovery_done.set()
+        p = _call(srv, "theater_propose", lat=BLR[0], lon=BLR[1], label="Bengaluru centre",
+                  ground_msl_m=920.0, airframe=QUAD)
+        out = _call(srv, "sim_set_theater", **p["set_args"])
+        assert out.get("rejected") is True and srv.theater.id == "default"
+        assert theater_switch.MSG_NO_HOST in json.dumps(out)
+        hostmod._wire_theater(host, host.adapter)
+        assert len(srv.theater_listeners) == 1 and srv.origin_holders == [host.adapter]
     finally:
         host.close()

@@ -16,7 +16,6 @@ Wave-3 MCP server is in while it is being written.
 """
 import asyncio
 import json
-import sys
 import threading
 import time
 
@@ -29,7 +28,6 @@ from fastapi.testclient import TestClient
 # searched when it cannot find one. This module used to carry an absolute
 # path into one developer's home directory, which no clone or CI runner
 # could satisfy.
-
 from godseye_uav import bridge as bridge_mod
 from godseye_uav.bridge import (
     AGL_FEED_SKEW_FLOOR_MS,
@@ -40,6 +38,7 @@ from godseye_uav.bridge import (
     DEFAULT_CORS_ORIGINS,
     AirSimAdapter,
     Alarm,
+    BridgeState,
     EventHub,
     McpClient,
     MissionFeed,
@@ -52,12 +51,12 @@ from godseye_uav.bridge import (
 )
 from godseye_uav.fake_airsim import FakeAirSim
 
-# Ports in this module's assigned range (48000-48099) so a concurrent run of
+# Ports in this module's assigned range (53800-53899, WG §4.3) so a concurrent run of
 # another test module cannot collide with the FakeAirSim this file boots.
 # `PORT` is claimed at fixture time: a socket left in TIME_WAIT by a previous
 # run must not error the whole module, so a few ports are tried in turn.
-SIM_PORTS = range(48001, 48012)
-LIVE_PORTS = range(48021, 48030)
+SIM_PORTS = range(53801, 53812)
+LIVE_PORTS = range(53821, 53830)
 PORT = SIM_PORTS.start
 TOKEN = "test-token"
 
@@ -2119,7 +2118,7 @@ class TestFailVisibly:
             assert "Drone1" not in adapter.vehicle_errors and adapter.last_error is None
 
     def test_an_unreachable_sim_host_still_reads_down(self):
-        adapter = AirSimAdapter(ip="127.0.0.1", port=_free_port(range(48031, 48040)))
+        adapter = AirSimAdapter(ip="127.0.0.1", port=_free_port(range(53831, 53840)))
         assert adapter.snapshot("Drone1") is None      # nothing listens there
         assert adapter.sim_state.startswith("down: TransportError"), adapter.sim_state
         assert adapter.vehicle_errors == {}
@@ -2859,7 +2858,7 @@ _DEM_REACH_M = 1500.0
 FORDOW_HOME_LAT, FORDOW_HOME_LON, FORDOW_HOME_HAE = 34.8853, 50.9958, 903.01
 FORDOW_RIDGE = (34.8765, 50.9958)
 #: This module's second port range, for the real-terrain stack.
-REAL_PORTS = range(51100, 51120)
+REAL_PORTS = range(53850, 53870)
 
 
 def _dem_height(dem, lat, lon):
@@ -3087,3 +3086,482 @@ class TestRealTerrainEndToEnd:
         assert veh["agl"] == pytest.approx(veh["alt_agl_launch_datum_m"], abs=1.0)
         assert veh["alt_agl_reason"], "a synthetic AGL with no reason"
         assert veh["alt_agl_launch_datum_mismatch_m"] is None
+
+
+# ===========================================================================
+# WG §4.1.7 (A10): runtime theaters. The geofence/theater is re-read on an
+# epoch change, `/snapshot.theater = {id, epoch}`, the flown track resets on
+# an origin jump and on `reset_flown()`, and the adapter's origin relocates.
+# ===========================================================================
+
+DYN_ID = "dyn-bengaluru-centre-1a2b3c"
+DYN_AO = [[12.9491, 77.5715], [12.9491, 77.6177],
+          [12.9941, 77.6177], [12.9941, 77.5715]]
+
+
+def _theater_doc(tid, label, ao, *, epoch, ground=920.0):
+    """A `uav://safety/geofence` document as A6a serves it (epoch, dynamic)."""
+    block = {"id": tid, "label": label, "ao": ao,
+             "ground_elevation_msl_m": ground,
+             "dynamic": tid.startswith("dyn-")}
+    if epoch is not None:
+        block["epoch"] = epoch
+    return {"geofence": ao, "theater": block, "theater_mismatch": None}
+
+
+ISFAHAN_EPOCH_0 = _theater_doc("iran-isfahan", "Iran — Isfahan",
+                               ISFAHAN_GEOFENCE["geofence"], epoch=0,
+                               ground=1570.0)
+DYN_EPOCH_1 = _theater_doc(DYN_ID, "Bengaluru centre", DYN_AO, epoch=1)
+
+
+def _geofence_reads(mcp):
+    return [c for c in mcp.calls
+            if c[0] == "resource" and c[1]["uri"] == "uav://safety/geofence"]
+
+
+def _fed_app(mcp, *, adapter=None):
+    """create_app with a MissionFeed on `mcp`, not yet polled."""
+    adapter = adapter or AirSimAdapter(ip="127.0.0.1", port=PORT)
+    app = create_app(adapter=adapter, token=TOKEN, start_loops=False)
+    feed = MissionFeed(mcp, app.state.hub, vehicles=list,
+                       flown=app.state.bridge.flown)
+    app.state.bridge.feed = feed
+    app.state.feed = feed
+    return app, feed
+
+
+def _geofence_feature(overlay):
+    return next(f for f in overlay["features"] if f["id"] == "geofence")
+
+
+class TestSnapshotTheater:
+    def test_snapshot_carries_the_theater_id_and_epoch(self, sim):
+        """§3.4: `/snapshot.theater = {id, epoch}`. The id is the active
+        block's; the epoch is the geofence document's `theater.epoch`. Before
+        loop C has read anything both are None, never a guessed theater."""
+        from godseye_uav import theaters
+
+        app, feed = _fed_app(full_mcp(geofence=ISFAHAN_EPOCH_0))
+        with TestClient(app) as tc:
+            before = tc.get("/snapshot", headers=H).json()["theater"]
+            feed.poll_once()
+            body = tc.get("/snapshot", headers=H).json()
+            health = tc.get("/health").json()
+        assert before == {"id": None, "epoch": None}
+        assert body["theater"] == {"id": "iran-isfahan", "epoch": 0}
+        assert set(body["theater"]) == {"id", "epoch"}
+        # The active block itself is unchanged: no epoch leaks into it.
+        assert set(health["theater"]) == set(theaters.ACTIVE_KEYS)
+        assert body["theater"]["id"] == health["theater"]["id"]
+
+    def test_a_server_without_an_epoch_gives_none_not_zero(self, sim):
+        """A server that predates the epoch (or sends a bool) must not read
+        as epoch 0: the console would treat a later real 0 as no change."""
+        for doc in (ISFAHAN_GEOFENCE,
+                    _theater_doc("iran-isfahan", "Iran — Isfahan",
+                                 ISFAHAN_GEOFENCE["geofence"], epoch=True),
+                    _theater_doc("iran-isfahan", "Iran — Isfahan",
+                                 ISFAHAN_GEOFENCE["geofence"], epoch="3")):
+            app, feed = _fed_app(full_mcp(geofence=doc))
+            feed.poll_once()
+            with TestClient(app) as tc:
+                ref = tc.get("/snapshot", headers=H).json()["theater"]
+            assert ref == {"id": "iran-isfahan", "epoch": None}, doc
+
+    def test_an_unknown_theater_has_no_epoch(self, sim):
+        """A document with no theater id is UNKNOWN; its epoch is not
+        published on its own, since an epoch of nothing adopts nothing."""
+        doc = {"geofence": ISFAHAN_GEOFENCE["geofence"],
+               "theater": {"epoch": 5}}
+        app, feed = _fed_app(full_mcp(geofence=doc))
+        feed.poll_once()
+        assert feed.theater_ref() == {"id": None, "epoch": None}
+        with TestClient(app) as tc:
+            assert tc.get("/snapshot", headers=H).json()["theater"] == {
+                "id": None, "epoch": None}
+
+    def test_a_state_source_without_theater_ref_degrades_to_the_active_id(
+            self, sim):
+        """`state_source` may be any MissionFeed-shaped object. One without
+        `theater_ref()` still yields the active id, with an unknown epoch;
+        one without `active_theater()` yields nothing - and neither 500s."""
+        from godseye_uav import theaters
+
+        class ActiveOnly:
+            polls = 0
+
+            def active_theater(self):
+                return theaters.active_from_server(
+                    {"id": "iran-isfahan", "label": "Iran — Isfahan",
+                     "ao": ISFAHAN_GEOFENCE["geofence"],
+                     "ground_elevation_msl_m": 1570.0},
+                    source="test", at_ms=1)
+
+            def intel(self):
+                return MissionIntel()
+
+            def overlay(self):
+                return {"type": "FeatureCollection", "features": []}
+
+            def note_datum(self, *_a):
+                pass
+
+            def loop(self, **_kw):
+                pass
+
+            def stop(self):
+                pass
+
+        class Bare(ActiveOnly):
+            active_theater = None
+
+        for source, want in ((ActiveOnly(), {"id": "iran-isfahan", "epoch": None}),
+                             (Bare(), {"id": None, "epoch": None})):
+            app = create_app(adapter=AirSimAdapter(ip="127.0.0.1", port=PORT),
+                             token=TOKEN, start_loops=False, state_source=source)
+            with TestClient(app) as tc:
+                r = tc.get("/snapshot", headers=H)
+            assert r.status_code == 200
+            assert r.json()["theater"] == want
+
+
+class TestGeofenceEpoch:
+    def test_invalidate_then_one_poll_reads_the_new_theater(self):
+        """D7 #4 (WG §4.1.9): after `invalidate_geofence()` and ONE
+        `poll_once`, `active_theater()["id"]` is the new theater. Without the
+        invalidation the cached document keeps answering the old one."""
+        mcp = full_mcp(geofence=ISFAHAN_EPOCH_0)
+        feed, _hub = wired(mcp)
+        feed.poll_once()
+        assert feed.active_theater()["id"] == "iran-isfahan"
+
+        mcp.geofence = DYN_EPOCH_1                 # the server switched
+        feed.poll_once()
+        assert feed.active_theater()["id"] == "iran-isfahan", (
+            "the cached document is re-read on a 30 s clock, not per poll")
+        assert len(_geofence_reads(mcp)) == 1
+
+        feed.invalidate_geofence()
+        between = feed.active_theater()
+        assert between["known"] is False and between["id"] is None
+        assert "re-read" in between["reason"], (
+            "unknown-while-re-reading must not read as a dead server")
+        assert feed.theater_ref() == {"id": None, "epoch": None}
+
+        feed.poll_once()
+        active = feed.active_theater()
+        assert active["known"] is True and active["id"] == DYN_ID
+        assert feed.theater_ref() == {"id": DYN_ID, "epoch": 1}
+        assert len(_geofence_reads(mcp)) == 2
+
+    def test_the_overlay_draws_the_new_geofence_on_that_poll(self):
+        """`_overlay_key` is reset with the document, so the geofence layer is
+        rebuilt even though no mission state moved."""
+        mcp = full_mcp(geofence=ISFAHAN_EPOCH_0)
+        feed, _hub = wired(mcp)
+        feed.poll_once()
+        old = _geofence_feature(feed.overlay())
+        assert old["properties"]["theater"] == "iran-isfahan"
+
+        mcp.geofence = DYN_EPOCH_1
+        feed.invalidate_geofence()
+        feed.poll_once()
+        fence = _geofence_feature(feed.overlay())
+        assert fence["properties"]["theater"] == DYN_ID
+        assert fence["properties"]["enforced"] is True
+        ring = fence["geometry"]["coordinates"][0]
+        assert ring[:-1] == [[lon, lat] for lat, lon in DYN_AO]
+
+    def test_the_periodic_reread_catches_an_epoch_change(self):
+        """D7 #4, second half: with no listener (a separately restarted MCP
+        server), the GEOFENCE_REREAD_S re-read finds the new epoch."""
+        mcp = full_mcp(geofence=ISFAHAN_EPOCH_0)
+        feed, _hub = wired(mcp)
+        feed.poll_once()
+        mcp.geofence = DYN_EPOCH_1
+        for _ in range(3):
+            feed.poll_once()
+        assert feed.active_theater()["id"] == "iran-isfahan"
+        assert len(_geofence_reads(mcp)) == 1
+
+        feed._geofence_at -= bridge_mod.GEOFENCE_REREAD_S + 1.0   # 30 s pass
+        feed.poll_once()
+        assert feed.active_theater()["id"] == DYN_ID
+        assert feed.theater_ref()["epoch"] == 1
+        assert len(_geofence_reads(mcp)) == 2
+
+    def test_the_same_id_with_a_new_epoch_is_a_change(self):
+        """An airframe-only switch keeps the id and bumps the epoch; that is
+        a new theater activation and must rebuild like one."""
+        mcp = full_mcp(geofence=DYN_EPOCH_1)
+        feed, _hub = wired(mcp)
+        assert feed._refresh_geofence() is True     # first document
+        feed._geofence_at -= bridge_mod.GEOFENCE_REREAD_S + 1.0
+        assert feed._refresh_geofence() is False, "a re-read is not a change"
+        mcp.geofence = _theater_doc(DYN_ID, "Bengaluru centre", DYN_AO, epoch=2)
+        feed._geofence_at -= bridge_mod.GEOFENCE_REREAD_S + 1.0
+        assert feed._refresh_geofence() is True
+        assert feed.theater_ref() == {"id": DYN_ID, "epoch": 2}
+
+    def test_an_unchanged_reread_does_not_rebuild_the_overlay(self):
+        mcp = full_mcp(geofence=ISFAHAN_EPOCH_0)
+        feed, _hub = wired(mcp)
+        feed.poll_once()
+        built = feed.overlay()
+        feed._geofence_at -= bridge_mod.GEOFENCE_REREAD_S + 1.0
+        feed.poll_once()
+        assert len(_geofence_reads(mcp)) == 2
+        assert feed.overlay() is built
+
+    def test_a_failed_reread_keeps_the_last_known_theater(self):
+        """A server that stops answering has not changed theater: the last
+        answer stands (its `at_ms` says how old it is), and the error is not
+        allowed to blank the operator's theater."""
+        mcp = full_mcp(geofence=ISFAHAN_EPOCH_0)
+        feed, _hub = wired(mcp)
+        feed.poll_once()
+        at_ms = feed.active_theater()["at_ms"]
+        mcp.absent.add("uav://safety/geofence")
+        feed._geofence_at -= bridge_mod.GEOFENCE_REREAD_S + 1.0
+        feed.poll_once()
+        assert len(_geofence_reads(mcp)) == 2
+        active = feed.active_theater()
+        assert active["known"] is True and active["id"] == "iran-isfahan"
+        assert active["at_ms"] == at_ms
+        assert feed.theater_ref() == {"id": "iran-isfahan", "epoch": 0}
+
+    def test_a_failed_read_after_an_invalidation_names_the_error(self):
+        """"Being re-read" is only true until a read fails; then the operator
+        is owed the upstream error, as for any unread resource."""
+        mcp = full_mcp(geofence=ISFAHAN_EPOCH_0)
+        feed, _hub = wired(mcp)
+        feed.poll_once()
+        mcp.absent.add("uav://safety/geofence")
+        feed.invalidate_geofence()
+        feed.poll_once()
+        active = feed.active_theater()
+        assert active["known"] is False and active["id"] is None
+        assert "Unknown resource" in active["reason"]
+
+    def test_a_read_in_flight_across_an_invalidation_is_dropped(self):
+        """The switch can land while loop C's read is on the wire: that
+        answer may describe the OLD theater, and storing it would pin the old
+        id for a whole re-read period. It is dropped; the next poll reads."""
+        holder = {}
+
+        class RacingMcp(FakeMcp):
+            race = True
+
+            def read_resource(self, uri):
+                out = super().read_resource(uri)
+                if uri == "uav://safety/geofence" and self.race:
+                    self.race = False
+                    self.geofence = DYN_EPOCH_1          # switch completes...
+                    holder["feed"].invalidate_geofence()  # ...listener fires
+                return out                              # the OLD document
+
+        mcp = RacingMcp(geofence=ISFAHAN_EPOCH_0)
+        feed, _hub = wired(mcp)
+        holder["feed"] = feed
+        feed.poll_once()
+        assert feed.active_theater()["known"] is False
+        assert feed.theater_ref()["id"] is None
+        feed.poll_once()
+        assert feed.active_theater()["id"] == DYN_ID
+        assert feed.theater_ref() == {"id": DYN_ID, "epoch": 1}
+        assert len(_geofence_reads(mcp)) == 2
+
+    def test_invalidate_is_safe_from_another_thread_while_loop_c_polls(self):
+        """The listener runs on the tasking loop, loop C on its own thread.
+        Hammer both; the feed must end on the new theater with no exception."""
+        mcp = full_mcp(geofence=ISFAHAN_EPOCH_0)
+        feed, _hub = wired(mcp)
+        feed.poll_once()
+        mcp.geofence = DYN_EPOCH_1
+        errors = []
+
+        def listener():
+            try:
+                for _ in range(200):
+                    feed.invalidate_geofence()
+            except Exception as exc:  # noqa: BLE001 - the assertion below
+                errors.append(exc)
+
+        t = threading.Thread(target=listener)
+        t.start()
+        for _ in range(50):
+            feed.poll_once()
+        t.join()
+        feed.poll_once()
+        assert not errors
+        assert feed.theater_ref() == {"id": DYN_ID, "epoch": 1}
+
+
+class _ScriptedAdapter(AirSimAdapter):
+    """Loop A's adapter, answering from a list of (lat, lon) fixes. Never
+    connects (the port is this module's own, unused)."""
+
+    def __init__(self, fixes):
+        super().__init__(ip="127.0.0.1", port=53899)
+        self.fixes = list(fixes)
+
+    def snapshot(self, name):
+        lat, lon = self.fixes.pop(0)
+        return _bare_snapshot(name=name, latitude=lat, longitude=lon)
+
+
+REDMOND = (47.641468, -122.140165)
+BENGALURU = (12.9716, 77.5946)
+
+
+def _north_of(origin, metres):
+    return origin[0] + metres / bridge_mod._M_PER_DEG_LAT, origin[1]
+
+
+class TestFlownJumpGuard:
+    def test_a_13000_km_jump_gives_a_one_point_track(self):
+        """D7 #7 (WG §4.1.9): the relocation jump Redmond -> Bengaluru is not
+        a flown leg. On the old code the track kept the Redmond vertices and
+        drew one line across the globe, which coverage then scored."""
+        fixes = [_north_of(REDMOND, 10.0 * i) for i in range(5)] + [BENGALURU]
+        state = BridgeState(_ScriptedAdapter(fixes), TOKEN)
+        for _ in fixes:
+            assert state.tick_vehicle("Drone1") is not None
+        assert state.flown("Drone1") == [BENGALURU]
+
+    def test_moves_under_the_guard_extend_the_track(self):
+        start = BENGALURU
+        near = _north_of(start, bridge_mod.FLOWN_JUMP_M - 10.0)
+        far = _north_of(near, bridge_mod.FLOWN_JUMP_M + 10.0)
+        state = BridgeState(_ScriptedAdapter([start, near, far]), TOKEN)
+        state.tick_vehicle("Drone1")
+        state.tick_vehicle("Drone1")
+        assert state.flown("Drone1") == [start, near]
+        state.tick_vehicle("Drone1")
+        assert state.flown("Drone1") == [far]
+        assert bridge_mod.FLOWN_JUMP_M == 2000.0     # R23: same as the console
+
+    def test_crossing_the_antimeridian_is_not_a_jump(self):
+        """A theater anywhere includes Fiji: ~22 m across 180° is a step."""
+        east, west = (-17.0, 179.9999), (-17.0, -179.9999)
+        state = BridgeState(_ScriptedAdapter([east, west]), TOKEN)
+        state.tick_vehicle("Drone1")
+        state.tick_vehicle("Drone1")
+        assert state.flown("Drone1") == [east, west]
+
+    def test_the_guard_is_per_vehicle(self):
+        state = BridgeState(_ScriptedAdapter([REDMOND, BENGALURU, REDMOND]),
+                            TOKEN)
+        state.tick_vehicle("Drone1")
+        state.tick_vehicle("Drone2")
+        state.tick_vehicle("Drone1")
+        assert state.flown("Drone1") == [REDMOND]
+        assert state.flown("Drone2") == [BENGALURU]
+
+    def test_reset_flown_drops_every_track(self):
+        fixes = [REDMOND, _north_of(REDMOND, 50.0), BENGALURU]
+        state = BridgeState(_ScriptedAdapter(fixes), TOKEN)
+        state.tick_vehicle("Drone1")
+        state.tick_vehicle("Drone1")
+        state.tick_vehicle("Drone2")
+        state.reset_flown()
+        assert state.flown("Drone1") == [] and state.flown("Drone2") == []
+
+
+class TestAdapterRelocate:
+    def test_relocate_moves_the_projection(self, sim):
+        """WG §4.1.3 step 2d: the adapter's origin copy moves, and the NEXT
+        sample projects the same NED offset from the new origin. On the old
+        code a relocated sim drew the drone at Redmond (relocate_proto E1)."""
+        from godseye_uav.geo import GeoPoint
+
+        adapter = AirSimAdapter(ip="127.0.0.1", port=PORT)
+        old = adapter.home_geo
+        before = adapter.snapshot("Drone1")
+        assert before is not None, adapter.last_error
+        new = GeoPoint(BENGALURU[0], BENGALURU[1], 838.6)
+        adapter.relocate(new)
+        after = adapter.snapshot("Drone1")
+        assert after is not None, adapter.last_error
+
+        off_before = bridge_mod._ground_m(old.latitude, old.longitude,
+                                          before.latitude, before.longitude)
+        off_after = bridge_mod._ground_m(new.latitude, new.longitude,
+                                         after.latitude, after.longitude)
+        assert off_after == pytest.approx(off_before, abs=2.0)
+        assert off_after < 50_000.0, "the sample was not projected from the new home"
+        # HAE in, HAE out (T1): height above the origin is unchanged.
+        assert after.alt_hae - new.altitude == pytest.approx(
+            before.alt_hae - old.altitude, abs=2.0)
+
+    def test_home_geo_is_the_holder_protocols_geopoint(self, sim):
+        """§3.10: an origin holder exposes `.relocate(GeoPoint)` and
+        `.home_geo -> GeoPoint`; the switch cross-checks this copy against the
+        sim's and the backend's to 1e-9° and 1e-3 m, so it is the exact point."""
+        from godseye_uav.geo import GeoPoint
+
+        adapter = AirSimAdapter(ip="127.0.0.1", port=PORT)
+        assert isinstance(adapter.home_geo, GeoPoint)
+        assert adapter.home_geo == bridge_mod.DEFAULT_HOME
+        new = GeoPoint(-17.7134, 178.065, 12.25)
+        adapter.relocate(new)
+        assert isinstance(adapter.home_geo, GeoPoint)
+        assert adapter.home_geo == new
+        assert adapter.home_declared == new and adapter.home_datum == "hae"
+
+    def test_an_msl_home_is_held_as_hae(self, sim):
+        from godseye_uav.geo import GeoPoint, canonical_altitude
+
+        home_msl = GeoPoint(47.641468, -122.140165, 122.0)
+        adapter = AirSimAdapter(ip="127.0.0.1", port=PORT, home=home_msl,
+                                home_datum="msl")
+        fix = canonical_altitude(122.0, home_msl.latitude, home_msl.longitude,
+                                 datum="msl")
+        assert adapter.home_geo.altitude == pytest.approx(fix.alt_hae, abs=1e-6)
+
+    def test_a_bad_point_is_refused_and_the_origin_kept(self):
+        from godseye_uav.geo import GeoPoint
+
+        adapter = AirSimAdapter(ip="127.0.0.1", port=53899)
+        home = adapter.home_geo
+        for bad in (GeoPoint(float("nan"), 77.5, 900.0),
+                    GeoPoint(91.0, 77.5, 900.0),
+                    GeoPoint(12.9, 181.0, 900.0),
+                    GeoPoint(12.9, 77.5, float("inf"))):
+            with pytest.raises(ValueError):
+                adapter.relocate(bad)
+            assert adapter.home_geo == home
+
+
+class TestTheaterListenerSequence:
+    def test_the_host_listener_resets_what_the_console_reads(self, sim):
+        """WG §4.1.10: the host's theater listener runs
+        `feed.invalidate_geofence(); state.reset_flown()`. After it and one
+        loop-C poll, every bridge surface names the new theater: /snapshot
+        (id and epoch), /health, /theaters and the /mission-overlay geofence,
+        and the flown track is gone."""
+        mcp = full_mcp(geofence=ISFAHAN_EPOCH_0)
+        app, feed = _fed_app(mcp)
+        state = app.state.bridge
+        feed.poll_once()
+        with state._lock:
+            state._record_flown(_bare_snapshot(latitude=32.65, longitude=51.66))
+        with TestClient(app) as tc:
+            assert tc.get("/snapshot", headers=H).json()["theater"] == {
+                "id": "iran-isfahan", "epoch": 0}
+
+            mcp.geofence = DYN_EPOCH_1          # the switch, server side
+            feed.invalidate_geofence()           # the listener, bridge side
+            state.reset_flown()
+            assert state.flown("Drone1") == []
+            feed.poll_once()                     # loop C's next pass
+
+            snap = tc.get("/snapshot", headers=H).json()
+            health = tc.get("/health").json()
+            active = tc.get("/theaters", headers=H).json()["active"]
+            overlay = tc.get("/mission-overlay", headers=H).json()
+
+        assert snap["theater"] == {"id": DYN_ID, "epoch": 1}
+        assert health["theater"]["id"] == active["id"] == DYN_ID
+        assert _geofence_feature(overlay)["properties"]["theater"] == DYN_ID

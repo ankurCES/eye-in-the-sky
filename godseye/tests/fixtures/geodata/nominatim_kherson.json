@@ -1,0 +1,16 @@
+[
+  {
+    "place_id": 12345678, "licence": "Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright",
+    "osm_type": "relation", "osm_id": 1573441, "lat": "46.6354", "lon": "32.6169",
+    "category": "boundary", "type": "administrative", "place_rank": 16, "importance": 0.61,
+    "addresstype": "city", "name": "Kherson",
+    "display_name": "Kherson, Kherson Urban Hromada, Kherson Raion, Kherson Oblast, Ukraine",
+    "boundingbox": ["46.5835", "46.7254", "32.4829", "32.7412"]
+  },
+  {
+    "place_id": 87654321, "licence": "Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright",
+    "osm_type": "node", "osm_id": 999, "lat": "not-a-number", "lon": "32.6",
+    "category": "place", "type": "village", "addresstype": "village", "name": "Broken row",
+    "display_name": "Broken row", "boundingbox": ["46.1", "46.2", "32.1", "32.2"]
+  }
+]

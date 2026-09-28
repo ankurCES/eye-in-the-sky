@@ -61,7 +61,7 @@ def _nothing_listens(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) != 0
 
 CURATED = ["intel_overview", "intel_search", "intel_entity", "read_intel_resource",
-           "ui_focus", "ui_track", "ui_show_orb", "ui_inspect"]
+           "ui_focus", "ui_track", "ui_show_orb", "ui_inspect", "ui_show_map"]
 
 
 # ------------------------------------------------------------------ fakes --
@@ -640,3 +640,146 @@ def test_real_sdk_serves_the_toolbelt_end_to_end(server):
             await client.call_tool("ui_track", {"vehicle": "Drone1", "reason": "x"})
     asyncio.run(main())
     assert emitted == [{"action": "track", "vehicle": "Drone1", "reason": "x"}]
+
+
+# ------------------------------------------------ WG v2 Phase A (unit A9) --
+
+XSS = "<img src=x onerror=alert(1)>"
+BIDI = chr(0x202E) + "evil" + chr(0x202C)  # RLO ... PDF
+
+
+def test_ui_show_map_emits_a_map_directive_with_deduplicated_ids():
+    emitted = []
+    belt = _tools(build(None, None, emitted))
+    ids = ["thr:dyn-bengaluru-centre-1a2b3c", "sit:dyn-x:way/1", "veh:Drone1",
+           "sit:dyn-x:way/1", "poi:default:North Field"]
+    res = asyncio.run(belt["ui_show_map"].handler({"ids": ids, "reason": "Watch the recce"}))
+    assert _payload(res) == {"ok": True}
+    assert emitted == [{"action": "map",
+                        "ids": ["thr:dyn-bengaluru-centre-1a2b3c", "sit:dyn-x:way/1",
+                                "veh:Drone1", "poi:default:North Field"],
+                        "reason": "Watch the recce"}]
+    schema = belt["ui_show_map"].input_schema
+    assert schema["required"] == ["ids", "reason"]
+    assert schema["properties"]["ids"]["minItems"] == 1
+    assert schema["properties"]["ids"]["maxItems"] == tb.MAP_IDS_MAX == 50
+    assert schema["properties"]["reason"]["maxLength"] == 200
+    assert "thr:" in belt["ui_show_map"].description
+
+
+@pytest.mark.parametrize("ids", [
+    [], None, "thr:default", [f"veh:D{i}" for i in range(51)],
+    ["thr:default", "not-an-id"], ["theater:default"], ["sit:"], [XSS], ["veh:a|b"],
+    ["trk:[x]"], ["veh:line\nbreak"], [7], ["x" * 10 + ":" + "y"],
+])
+def test_ui_show_map_validates_ids_and_emits_nothing_on_a_bad_list(ids):
+    emitted = []
+    belt = _tools(build(None, None, emitted))
+    res = asyncio.run(belt["ui_show_map"].handler({"ids": ids, "reason": "r"}))
+    assert res["is_error"] is True
+    err = _payload(res)["error"]
+    assert err["code"] == "invalid_ids" and err["message"]
+    assert "<img" not in err["message"]  # model input is never echoed back
+    assert emitted == []
+
+
+def test_map_ids_problem_sentences():
+    assert tb.map_ids(["thr:default"]) == (None, ["thr:default"])
+    problem, ids = tb.map_ids([f"veh:D{i}" for i in range(51)])
+    assert ids == [] and "at most 50" in problem
+    problem, ids = tb.map_ids(["thr:default", "nope", 3])
+    assert ids == [] and problem.startswith("2 of the ids are not graph ids")
+
+
+def test_ui_show_map_reason_is_capped():
+    emitted = []
+    belt = _tools(build(None, None, emitted))
+    asyncio.run(belt["ui_show_map"].handler({"ids": ["thr:default"], "reason": "r" * 900}))
+    assert len(emitted[0]["reason"]) == 200
+
+
+def test_entity_id_accepts_site_ids_and_extract_entities_finds_them():
+    assert tb._ENTITY_ID.match("sit:dyn-x:way/1")
+    assert tb._ENTITY_ID.match("sit:default:node/123456789")
+    assert not tb._ENTITY_ID.match("site:dyn-x:way/1")
+    assert not tb._ENTITY_ID.match("sit:dyn-x:way/1|label")
+    for prefix in ("veh", "msn", "trk", "unit", "ob", "rpt", "thr", "poi", "sit", "alarm",
+                   "feed"):
+        assert tb._ENTITY_ID.match(f"{prefix}:x"), prefix
+    # geo_sites rows carry the graph id (sites.SiteSet.as_dict, A3)
+    payload = {"sites": [{"id": "sit:dyn-x:way/1", "name": XSS},
+                         {"id": "sit:dyn-x:node/2", "name": BIDI}], "total": 2}
+    assert extract_entities(payload) == ["sit:dyn-x:way/1", "sit:dyn-x:node/2"]
+
+
+def test_intel_search_describes_the_site_type():
+    belt = _tools(build(None, StubIntel()))
+    search = belt["intel_search"]
+    assert "mapped sites" in search.description
+    assert "context only" in search.description
+    assert "site (mapped strategic site)" in (
+        search.input_schema["properties"]["types"]["description"])
+    assert search.input_schema["properties"]["types"]["maxItems"] >= 11
+
+
+class _ListedInfo:
+    def __init__(self, name):
+        self.name = name
+        self.description = f"{name} (test double)"
+        self.input_schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+
+
+class _ViaMcp:
+    """Records the call source (`theater_tools.CALL_VIA`) each call sees."""
+
+    def __init__(self, fail=False):
+        self.seen: list[tuple[str, str]] = []
+        self.fail = fail
+
+    async def list_tools(self):
+        return [_ListedInfo("sim_set_theater"), _ListedInfo("uav_get_telemetry")]
+
+    async def call_tool(self, name, args):
+        from godseye_uav import theater_tools
+
+        self.seen.append((name, theater_tools.CALL_VIA.get()))
+        await asyncio.sleep(0)
+        if self.fail:
+            raise RuntimeError("boom")
+        return type("R", (), {"content": [type("B", (), {"text": '{"ok": true}'})()],
+                              "is_error": False})()
+
+
+class _ViaServer:
+    def __init__(self, fail=False):
+        self.mcp = _ViaMcp(fail)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_the_proxy_marks_its_calls_as_console_and_resets_the_source(fail):
+    from godseye_uav import theater_tools
+
+    server = _ViaServer(fail)
+
+    async def main():
+        belt = _tools(await build_toolbelt(server, None, lambda d: None, FakeSdk))
+        for name in ("sim_set_theater", "uav_get_telemetry"):
+            res = await belt[name].handler({"x": 1})
+            assert bool(res.get("is_error")) is fail
+            assert theater_tools.CALL_VIA.get() == "mcp"  # reset after each call
+        return theater_tools.CALL_VIA.get()
+
+    assert asyncio.run(main()) == "mcp"
+    assert server.mcp.seen == [("sim_set_theater", "console"), ("uav_get_telemetry", "console")]
+    assert theater_tools.CALL_VIA.get() == "mcp"
+
+
+def test_a_direct_mcp_call_keeps_the_default_source(listing_server):
+    """Only the toolbelt proxy says "console"; /mcp callers stay "mcp"."""
+    from godseye_uav import theater_tools
+
+    async def main():
+        await listing_server.mcp.call_tool("uav_list_ob_classes", {})
+        return theater_tools.CALL_VIA.get()
+
+    assert asyncio.run(main()) == "mcp"

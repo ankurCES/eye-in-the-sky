@@ -157,14 +157,19 @@ def assess_capability(track: Track, observer: dict | None = None) -> dict:
     observer_range_m = None
     above_ceiling = False
     if observer and observer.get("lat") is not None:
+        # Both altitudes are HAE: the observer's `alt_m` is telemetry
+        # alt_hae_m and the track's is its detection geo_point altitude.
         obs_alt = float(observer.get("alt_m") or 0.0)
         ground = _dist_m(track.lat, track.lon, float(observer["lat"]),
                          float(observer["lon"]))
         dz = obs_alt - float(track.alt_m or 0.0)
         observer_range_m = math.hypot(ground, dz)
         if ob.weapon_range_m > 0.0:
+            # A weapon ceiling is height above the SHOOTER, not above the
+            # ellipsoid: comparing absolute HAE put every observer in a
+            # high-elevation theater above every ceiling (D7 #5).
             above_ceiling = (ob.weapon_ceiling_m > 0.0
-                             and obs_alt > ob.weapon_ceiling_m)
+                             and dz > ob.weapon_ceiling_m)
             if observer_range_m <= ob.weapon_range_m and not above_ceiling:
                 geometry, in_envelope = 1.0, True
             else:
@@ -186,7 +191,7 @@ def assess_capability(track: Track, observer: dict | None = None) -> dict:
                 score=geometry, unit="m"))
             if above_ceiling:
                 ev.append(_cite("above_weapon_ceiling", True,
-                                f"observer at {obs_alt:.0f} m is above the "
+                                f"observer {dz:.0f} m above the site, over the "
                                 f"{ob.weapon_ceiling_m:.0f} m engagement ceiling of {ob.name}",
                                 score=0.25))
         else:

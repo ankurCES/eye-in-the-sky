@@ -41,14 +41,26 @@ because the hook only fires on an actual ``import airsim``.
 Every branch here is exercised by ``scripts/ci.sh``'s "seam gate", which runs
 conftest against a throwaway repo skeleton so the developer's own sibling
 checkout cannot answer for it.
+
+It also holds two session-wide guarantees (WG spec §4.1.10, §4.1.1), below
+``_bootstrap()``: the EGRESS GUARD (no test reaches a non-local address;
+``live_net`` tests run only under ``GODSEYE_LIVE_NET=1``) and per-test
+isolation of the runtime (``dyn-``) theater registry. Both touch
+``godseye_uav`` only inside fixtures, so the seam gate's bare skeleton still
+imports this file.
 """
 from __future__ import annotations
 
+import functools
 import importlib.machinery
 import importlib.util
+import ipaddress
 import os
 import pathlib
+import socket
 import sys
+
+import pytest
 
 #: Repo root -- this file is <repo>/tests/conftest.py.
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -264,3 +276,187 @@ def _bootstrap() -> None:
 
 
 _bootstrap()
+
+
+# ---------------------------------------------------------------------------
+# EGRESS GUARD (WG spec §4.1.10)
+#
+# No test touches the network: every HTTP client is injected. This makes that
+# hold instead of hoping it does. For the whole session:
+#   * GODSEYE_NO_EGRESS=1 is set, so subprocess hosts inherit it and
+#     geo_http / realdata's direct fetches refuse to reach an upstream;
+#   * socket.socket.connect / connect_ex and socket.create_connection raise
+#     OSError("egress blocked in tests: ...") for any non-local address.
+# "Local" is loopback (127.0.0.0/8, ::1), "localhost", the unspecified address
+# and this machine's own interface address (a connect there never leaves the
+# host; test_host.py black-box-probes the sim on it). Hostnames other than
+# "localhost" are refused WITHOUT resolving them, because resolving is itself
+# a network call. A UDP connect() sends nothing (it only picks a route), so it
+# is not refused.
+#
+# `@pytest.mark.live_net` tests are skipped unless GODSEYE_LIVE_NET=1; then,
+# for those tests only, both measures are lifted. A live_net test that needs
+# a network-enabled subprocess host must start it inside the test or a
+# function-scoped fixture (a module-scoped one starts before the lift).
+# ---------------------------------------------------------------------------
+
+NO_EGRESS_ENV = "GODSEYE_NO_EGRESS"
+LIVE_NET_ENV = "GODSEYE_LIVE_NET"
+EGRESS_BLOCKED = "egress blocked in tests"
+
+
+def live_net_enabled() -> bool:
+    return os.environ.get(LIVE_NET_ENV) == "1"
+
+
+@functools.lru_cache(maxsize=1)
+def _own_addresses() -> frozenset[str]:
+    """This machine's primary interface addresses (UDP route pick: no packet)."""
+    found: set[str] = set()
+    for family, probe in ((socket.AF_INET, ("192.0.2.1", 9)),         # TEST-NET-1
+                          (socket.AF_INET6, ("2001:db8::1", 9))):     # documentation
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as s:
+                s.connect(probe)
+                found.add(str(ipaddress.ip_address(s.getsockname()[0].split("%", 1)[0])))
+        except (OSError, ValueError):
+            continue
+    return frozenset(found)
+
+
+def is_local_host(host: object) -> bool:
+    """True when a connect to `host` cannot leave this machine."""
+    if isinstance(host, bytes):
+        host = host.decode("ascii", "replace")
+    if not isinstance(host, str):
+        return False
+    name = host.strip().strip("[]").split("%", 1)[0].lower()
+    if name in ("", "localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(name)
+    except ValueError:
+        return False                      # a hostname: never resolved here
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback or ip.is_unspecified or str(ip) in _own_addresses()
+
+
+class EgressGuard:
+    """The installed socket patches; `lifted` is True only inside a live_net test."""
+
+    def __init__(self) -> None:
+        self.installed = False
+        self.lifted = False
+        self.blocked: list[str] = []      # "host:port" of every refused connect
+        self._connect = self._connect_ex = self._create_connection = None
+
+    def check(self, address: object, *, family: int | None = None,
+              kind: int | None = None) -> None:
+        if not self.installed or self.lifted:
+            return
+        if family is not None and family not in (socket.AF_INET, socket.AF_INET6):
+            return                        # AF_UNIX and friends: not the network
+        if kind == socket.SOCK_DGRAM:
+            return
+        if isinstance(address, (tuple, list)) and address:
+            host, port = address[0], (address[1] if len(address) > 1 else "?")
+        else:
+            host, port = address, "?"
+        if is_local_host(host):
+            return
+        where = f"{host}:{port}"
+        self.blocked.append(where)
+        raise OSError(f"{EGRESS_BLOCKED}: {where}")
+
+    def install(self, mp: pytest.MonkeyPatch) -> None:
+        guard = self
+        self._connect = socket.socket.connect
+        self._connect_ex = socket.socket.connect_ex
+        self._create_connection = socket.create_connection
+
+        def connect(sock, address):
+            guard.check(address, family=sock.family, kind=sock.type)
+            return guard._connect(sock, address)
+
+        def connect_ex(sock, address):
+            guard.check(address, family=sock.family, kind=sock.type)
+            return guard._connect_ex(sock, address)
+
+        def create_connection(address, *args, **kwargs):
+            guard.check(address)
+            return guard._create_connection(address, *args, **kwargs)
+
+        mp.setattr(socket.socket, "connect", connect)
+        mp.setattr(socket.socket, "connect_ex", connect_ex)
+        mp.setattr(socket, "create_connection", create_connection)
+        self.installed = True
+
+
+EGRESS_GUARD = EgressGuard()
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if live_net_enabled():
+        return
+    skip = pytest.mark.skip(
+        reason=f"live network test: set {LIVE_NET_ENV}=1 to run it (egress guard)")
+    for item in items:
+        if item.get_closest_marker("live_net") is not None:
+            item.add_marker(skip)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def egress_guard():
+    """Session-wide: GODSEYE_NO_EGRESS=1 and the socket patches (§4.1.10)."""
+    mp = pytest.MonkeyPatch()
+    mp.setenv(NO_EGRESS_ENV, "1")
+    EGRESS_GUARD.install(mp)
+    try:
+        yield EGRESS_GUARD
+    finally:
+        mp.undo()
+        EGRESS_GUARD.installed = False
+
+
+@pytest.fixture(autouse=True)
+def _live_net_lift(request, monkeypatch):
+    """Under GODSEYE_LIVE_NET=1, a live_net test runs with both measures off."""
+    if request.node.get_closest_marker("live_net") is None or not live_net_enabled():
+        yield
+        return
+    monkeypatch.delenv(NO_EGRESS_ENV, raising=False)
+    EGRESS_GUARD.lifted = True
+    try:
+        yield
+    finally:
+        EGRESS_GUARD.lifted = False
+
+
+# ---------------------------------------------------------------------------
+# RUNTIME THEATER REGISTRY (WG spec §4.1.1): `theaters._DYNAMIC` is process
+# state. Each module starts and ends with it empty (`clear_dynamic()`), and
+# each test gets back, at its end, exactly the registry it started with — so
+# a module-scoped fixture's registration (a host booted on a `dyn-` theater)
+# survives from test to test, while anything a test registers is dropped.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module", autouse=True)
+def _dynamic_theaters_per_module():
+    from godseye_uav import theaters
+
+    theaters.clear_dynamic()
+    yield
+    theaters.clear_dynamic()
+
+
+@pytest.fixture(autouse=True)
+def _dynamic_theaters_per_test():
+    from godseye_uav import theaters
+
+    before = theaters.dynamic_theaters()
+    yield
+    if [id(t) for t in theaters.dynamic_theaters()] != [id(t) for t in before]:
+        theaters.clear_dynamic()
+        for t in before:
+            theaters.register_dynamic(t)

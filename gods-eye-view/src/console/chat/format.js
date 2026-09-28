@@ -33,43 +33,75 @@ export const ICON = Object.freeze({
   offline: 'cloud_off',
 });
 
-/** Approval classes (contract §5.2) with their phrase and glyph (spec §2.3). */
+/**
+ * Approval classes (contract §5.2) with their phrase and glyph (spec §2.3).
+ * `approvable:false` means the console never renders an Approve element for
+ * the class: its slip is Deny-only (WG spec §4.2.1).
+ */
 export const CLASS_META = Object.freeze({
-  read: Object.freeze({ phrase: 'Reads data', icon: ICON.read, slip: false }),
+  read: Object.freeze({
+    phrase: 'Reads data',
+    icon: ICON.read,
+    slip: false,
+    approvable: true,
+  }),
   plan: Object.freeze({
     phrase: 'Plans only, nothing flies',
     icon: ICON.plan,
     slip: false,
+    approvable: true,
   }),
   sensor: Object.freeze({
     phrase: 'Tasks a sensor',
     icon: ICON.sensor,
     slip: true,
+    approvable: true,
   }),
   command: Object.freeze({
     phrase: 'Commands an aircraft',
     icon: ICON.command,
     slip: true,
+    approvable: true,
   }),
   sim: Object.freeze({
     phrase: 'Changes the simulation',
     icon: ICON.sim,
     slip: true,
+    approvable: true,
   }),
   safety_override: Object.freeze({
     phrase: 'Safety override',
     icon: ICON.override,
     slip: true,
+    approvable: true,
+  }),
+  unknown: Object.freeze({
+    phrase: 'Unrecognised action',
+    icon: ICON.warning,
+    slip: true,
+    approvable: false,
   }),
 });
 
-/** Unknown classes fail closed to `command`, like the server policy. */
+/**
+ * Unknown (or missing) classes fail SAFE to `'unknown'`: a Deny-only slip
+ * that can never be approved (WG spec §4.2.1, D7 #8). Before M14a they failed
+ * closed to `command`, which a new server class (`engagement`) would have
+ * turned into an approvable command slip.
+ */
 export function classKey(klass) {
-  return Object.hasOwn(CLASS_META, klass) ? klass : 'command';
+  return typeof klass === 'string' && Object.hasOwn(CLASS_META, klass)
+    ? klass
+    : 'unknown';
 }
 
 export function classMeta(klass) {
   return CLASS_META[classKey(klass)];
+}
+
+/** Whether the console may ever offer Approve for this class. */
+export function classApprovable(klass) {
+  return CLASS_META[classKey(klass)].approvable === true;
 }
 
 /** Human titles per bare tool name (mirrors analyst_policy._TITLES). */
@@ -126,6 +158,12 @@ export const TOOL_TITLES = Object.freeze({
   sim_set_fuel: 'Refuel',
   sim_set_link_state: 'Set link state',
   sim_reset: 'Reset simulation',
+  geo_lookup: 'Look up a place',
+  geo_sites: 'List mapped sites',
+  theater_propose: 'Propose a theater',
+  sim_set_theater: 'Set the theater',
+  sim_set_time_scale: 'Set sim speed',
+  ui_show_map: 'Show on the map',
 });
 
 export function toolTitle(tool) {
@@ -161,6 +199,7 @@ export const STALING_TOOLS = Object.freeze([
   'sim_set_weather',
   'sim_set_time',
   'sim_set_fuel',
+  'sim_set_theater',
 ]);
 
 const MISSION_KIND = Object.freeze({
@@ -262,7 +301,11 @@ export function approveVerb(tool, klass) {
     return tool === 'uav_scan_targets'
       ? 'Approve scan'
       : 'Approve sensor tasking';
-  if (k === 'sim') return 'Approve change';
+  if (k === 'unknown') return '';
+  if (k === 'sim')
+    return tool === 'sim_set_theater'
+      ? 'Approve theater change'
+      : 'Approve change';
   if (k === 'safety_override') return 'Approve override';
   if (tool === 'uav_takeoff') return 'Approve takeoff';
   if (tool === 'uav_land') return 'Approve landing';
@@ -282,10 +325,12 @@ export function approveVerb(tool, klass) {
   return 'Approve command';
 }
 
-/** Policy line under the buttons (spec §6.5 item 10). */
-export function policyLine(klass) {
+/** Policy line under the buttons (spec §6.5 item 10; WG spec §4.2.2). */
+export function policyLine(klass, tool = null) {
   const k = classKey(klass);
   if (k === 'command') return 'Commands are approved one at a time.';
+  if (k === 'sim' && tool === 'sim_set_theater')
+    return 'Theater changes are approved one at a time.';
   if (k === 'sim')
     return 'Simulation changes are approved one at a time in this version.';
   if (k === 'safety_override') return 'Overrides are approved one at a time.';
@@ -302,6 +347,7 @@ const PREFIX_TYPE = Object.freeze({
   rpt: 'report',
   thr: 'theater',
   poi: 'poi',
+  sit: 'site',
   alarm: 'alarm',
   feed: 'feed',
 });

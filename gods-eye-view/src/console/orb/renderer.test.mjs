@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createCamera, orientationFacing } from './camera.js';
-import { statusColor, statusKey } from './glyphs.js';
+import { COLORS, statusColor, statusKey } from './glyphs.js';
+import { SITE_GLYPHS, UNRECOGNISED_GLYPH } from './glyphPaths.js';
 import { computeLayout, toVector } from './layout.js';
 import { nodeRadius } from './orb.js';
 import {
@@ -949,4 +950,72 @@ test('band captions step off glyphs, or stay out, and never crowd each other', (
     placeCaptions(shown, camera, { ...opts, avoid: walled }).length,
     0,
   );
+});
+
+test('site band caption: "Sites n (m more on the map)", none when empty, a degraded feed says so (WG §4.2.6)', () => {
+  const site = (captions) => captions.find((c) => c.key === 'site');
+  assert.equal(
+    site(bandCaptions({ track: 3 })),
+    undefined,
+    'empty band: no caption',
+  );
+  assert.equal(
+    site(bandCaptions({ site: 0 }, { sites: { count: 0, omitted: 9 } })),
+    undefined,
+  );
+  const row = site(
+    bandCaptions({ site: 41 }, { sites: { count: 38, omitted: 12 } }),
+  );
+  assert.equal(row.text, 'Sites 38 (12 more on the map)');
+  assert.equal(row.lat, 42);
+  assert.equal(row.ink, null);
+  assert.equal(site(bandCaptions({ site: 5 })).text, 'Sites 5');
+  assert.equal(
+    site(bandCaptions({ site: 5 }, { recent: { site: 5 } })).text,
+    'Sites 5',
+    'no "(+n)" suffix on the site band',
+  );
+  const down = site(
+    bandCaptions({ site: 0 }, { sites: { count: 0, degraded: true } }),
+  );
+  assert.equal(
+    down.text,
+    'Map data feed down. Sites may be missing, not absent.',
+  );
+  const order = bandCaptions({ mission: 1, site: 2, track: 3 }).map(
+    (c) => c.key,
+  );
+  assert.ok(order.indexOf('mission') < order.indexOf('site'));
+  assert.ok(order.indexOf('site') < order.indexOf('track'));
+});
+
+test('site glyphs paint their category outline in Pencil; unknown types paint the lilac "?"', () => {
+  const { env, made } = spriteEnv();
+  const renderer = createRenderer(env);
+  const ctx = fakeCtx();
+  renderer.paintNode(
+    ctx,
+    { type: 'site', status: 'ok', category: 'bridge' },
+    20,
+    20,
+    9,
+  );
+  const strokes = ctx.calls
+    .filter((c) => c[0] === 'stroke')
+    .map((c) => c[1]?.d);
+  assert.ok(strokes.includes(SITE_GLYPHS.bridge));
+  assert.ok(
+    ctx.sets.some(([k, v]) => k === 'strokeStyle' && v === COLORS.pencil),
+  );
+  assert.equal(ctx.count('fill'), 0, 'outline only');
+  const odd = fakeCtx();
+  renderer.paintNode(odd, { type: 'force', status: 'ok' }, 20, 20, 9);
+  assert.ok(
+    odd.calls.some((c) => c[0] === 'stroke' && c[1]?.d === UNRECOGNISED_GLYPH),
+  );
+  assert.ok(
+    odd.sets.some(([k, v]) => k === 'strokeStyle' && v === COLORS.unknown),
+  );
+  assert.ok(!odd.sets.some(([, v]) => v === COLORS.ok), 'never green');
+  assert.equal(made.length, 0);
 });

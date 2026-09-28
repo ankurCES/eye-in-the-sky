@@ -1623,3 +1623,144 @@
     border: 2px solid CanvasText;
   }
 }
+
+/* ------------------------------------- places, sites and unknown types */
+/* WG spec §4.2.1, §4.2.5, §4.2.6. Sites are context: Pencil, never a state
+   colour. A type the console doesn't know is lilac, never green. */
+
+:where(.ic-root) .ic-kit-reg[data-register='mapped'] {
+  border-style: dashed;
+}
+
+/* The rail's theater title cross-fades in when the theater changes. */
+:where(.ic-root) .ic-rail__theater.is-changed {
+  animation: ic-rail-theater-in var(--ic-t-travel, 600ms) ease-out;
+}
+
+@keyframes ic-rail-theater-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+:where(.ic-root) .ic-rail__area {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 16px;
+}
+
+:where(.ic-root) .ic-rail__size {
+  color: var(--ic-film, #e6ecef);
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-rail__home,
+:where(.ic-root) .ic-inspector__home-name,
+:where(.ic-root) .ic-inspector__tag-value {
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-rail__switching {
+  color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-rail__elapsed {
+  color: var(--ic-pencil, #a3b0ba);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-rail__previous {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+:where(.ic-root) .ic-rail__previous-word {
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-inspector__category {
+  color: var(--ic-film, #e6ecef);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+}
+
+/* "Protected" (medical) is a word, never a colour alone. */
+:where(.ic-root) .ic-inspector__protected {
+  padding: 0 6px;
+  border: 1px solid var(--ic-film, #e6ecef);
+  border-radius: 4px;
+  color: var(--ic-film, #e6ecef);
+  font: 600 12px/16px var(--ic-font-sans, inherit);
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-inspector__type--unrecognised,
+:where(.ic-root) .ic-search__type--unrecognised,
+:where(.ic-root) .ic-inspector__unrecognised {
+  color: var(--ic-unknown, #bba7e0);
+}
+
+:where(.ic-root) .ic-inspector__alt-name {
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-inspector__tags {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+:where(.ic-root) .ic-inspector__tag-key {
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-search__category,
+:where(.ic-root) .ic-search__tag {
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-search__tag {
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-search__row[data-tone='neutral'] {
+  --ic-row-ink: var(--ic-pencil, #a3b0ba);
+}
+
+:where(.ic-root) .ic-search__chips--sites {
+  padding-top: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :where(.ic-root) .ic-rail__theater.is-changed {
+    animation: none;
+  }
+}
+
+@media (forced-colors: active) {
+  :where(.ic-root) .ic-inspector__protected {
+    border-color: CanvasText;
+  }
+}
+
+:where(.ic-root) .ic-inspector__line[data-status='warn'] {
+  color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-inspector__stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+}

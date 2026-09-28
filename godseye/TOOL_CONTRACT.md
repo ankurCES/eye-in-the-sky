@@ -4,7 +4,7 @@ This is the contract Wave-2 implementers and the `godseye-uav` skill both build 
 It is PLAN.md §4.1–§4.8 made concrete. Where the shipped code deviates, this document wins.
 
 **Baseline measured before the work started:** 19 tools, **0 resources**, 0 prompts.
-**Shipped now:** 46 tools, 8 resources (3 concrete + 5 templates) — verified over the real transport.
+**Shipped now:** 51 tools (46 + the five runtime-theater tools of §4.5), 8 resources (3 concrete + 5 templates) — verified over the real transport.
 
 ## Conventions (apply to every tool)
 
@@ -134,6 +134,49 @@ authoritative.
 The in-app analyst does not see `uav_list_tracks`, `sim_set_environment` or `uav_handoff_target`;
 its approval class for every tool is in `mcp/godseye_uav/analyst_policy.py` (see
 `INTEL_CONSOLE.md`).
+
+## §4.5 Runtime theaters and sim speed (WG v2 Phase A)
+
+SIMULATION administration: put the simulated AO over any real place, and run the fake simulator
+faster. Registered by `mcp/godseye_uav/theater_tools.py`. A real place is **context only (M14)**:
+geocoder answers and mapped sites are never targets, and a missing site is not an absent one.
+
+| Tool | Class | Params | Returns |
+|---|---|---|---|
+| `geo_lookup` | read | query (2–200 characters), limit=5 (1–10) | `{candidates: [{id, name, label, lat, lon, bbox: [s,w,n,e], size_km, source, geocoder, kind, osm, theater_id}], provenance}`. Order: coordinates → theater table → Photon → Nominatim; cached 30 days. No heights. Map data off (`--geodata off`): coordinates only, otherwise `candidates: []` with `provenance.reason` "map data is off; give coordinates". Uncached lookups: 30 per 10 min, else `rate_limited`. |
+| `geo_sites` | read | category? (airfield, military_base, port, power, fuel, comms, bridge, rail_hub, hq_gov, border_crossing, medical, dam, other), limit=40 (1–60), refresh=false, near_lat?, near_lon? | `{sites: [{id: "sit:{theater}:{osm}", name, label, category, subtype, lat, lon, bounds, protected, salience, tags, …, distance_m?}], returned, total, counts, capped, real, degraded, reason, fetched_at_ms, bbox, attribution, caveat, note, theater: {id, epoch}, refresh?, hint?}`. `refresh=true` refetches the running theater's area in a worker thread (6 per 10 min, else `rate_limited`); a degraded or empty answer never replaces a non-degraded set of the same theater epoch. |
+| `theater_propose` | plan | theater_id?, lat?, lon?, place_id?, label? (≤60), place?, bbox? [s,w,n,e], half_extent_m?, airframe?, home_lat?, home_lon?, **ground_msl_m?**, query? (the `geo_lookup` query, shown to the operator) | `{proposal_id, simulated_world: true, theater: {id, label, place, ao, bbox, ao_km, area_km2, home: [lat, lon, msl], pois, dynamic}, airframe: {id, label, summary, reach_m, ao_max_half_m}, ground: {msl_m, provenance}, sites, caveats, set_args}`. Changes nothing. Half-extent `clamp(requested or geocoded or default, 1500, clamp(0.4·reach, 1500, 25000))`. Ground is metres **MSL** (Re:Earth → EGM96, else Open-Meteo, else the operator's `ground_msl_m`). 10 per 10 min with map data on. Refusals: `ground_unknown`, `theater_invalid`, `rate_limited`, `proposal_timeout` (60 s). Proposals live 30 min (16 at most). |
+| `sim_set_theater` | **sim** (operator approval every time; never session-grantable) | proposal_id, theater_id, label, ao [[lat, lon]] (3–12), home_lat, home_lon, **ground_msl_m**, airframe, idempotency_key | `{ok, status: "accepted", theater: {id, label, epoch, dynamic}, previous, home: {lat, lon, alt_msl_m, alt_hae_m, undulation_m, datum_source}, airframe: {id, changed}, fuel, reset, kept, sites_loaded, real_data}`; `{ok, status: "unchanged"}` when the theater and airframe are already running. |
+| `sim_set_time_scale` | **sim** | scale (1–10), idempotency_key | `{ok, status: "accepted", scale, previous, caveats}` |
+
+**Theater change protocol.** `geo_lookup` (or coordinates) → `theater_propose` → `sim_set_theater(**set_args)`
+exactly. The handler checks, in order: idempotency replay; the proposal exists (`proposal_expired`); every
+argument matches it to 1e-7° and 0.01 m, the AO vertex by vertex (`proposal_mismatch` with `fields`); same
+theater row (AO, home, ground, label, POIs) and airframe (`unchanged`; a corrected home or ground under the
+same id is a switch). The switch then runs on the tasking loop: every drone is parked, landed,
+at the new home; the geofence, home and fuel homes move; the theater's MSL ground is converted to HAE once
+(T1); contacts, reports and the audit trail are kept; fuel is kept unless the airframe changes (full tank).
+
+**Refusals.** These five tools refuse with `{"rejected": true, "error": "<code>", "message": "<one
+sentence>"}` (WG v2 §3.1; the console shows `message` verbatim, as text) and change nothing. Every tool:
+`invalid_parameter` for malformed arguments; the three budgeted ones `rate_limited`. `sim_set_theater`
+also: `proposal_expired`, `proposal_mismatch` (with `fields`), `switch_refused` (with `reasons`, one
+sentence each) while any drone is airborne, busy, BINGO-latched or has lost its link, while a forced RTB
+flies, under real AirSim, outside the app host ("runtime theater change needs the app host"), before
+restart recovery finishes, or while another switch runs; `theater_integrity` when the origin copies fail
+their cross-check (every copy is put back at the old origin; after it every command but `uav_land` and
+`uav_hover` is refused and the monitor enforces nothing until a restart); `theater_switch_failed` for an
+unexpected error. `sim_set_time_scale` also: `time_scale_refused` under real AirSim. A refusal is never
+recorded against an `idempotency_key`.
+
+**Who asked.** `set_via` is `console` when the in-app analyst made the call (the operator approved its
+slip), `mcp` for a direct `/mcp` call, `boot` for the restored theater. The chat slip's previews come from
+`theater_tools.approval_preview`; the graph's theater block from `theater_tools.theater_state`.
+
+**Sim speed.** The fake simulator only (physics, fuel and the sun run `scale`× faster). The returned
+caveats say what stays on wall time: link-loss timers, detections and scans, the analyst's clock, the
+safety checks ("Safety checks run every 0.5 sim-seconds.") and, above ×3, camera captures (coverage gaps).
+`time_scale` is not persisted; a restart runs at ×1.
 
 ## Report size — summary by default, full traces on request
 

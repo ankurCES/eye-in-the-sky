@@ -43,11 +43,28 @@ MCP port (8791) as a second listener for the same app, then the God's Eye View v
 
 Environment: `THEATER`, `SIM_BACKEND` (`fake`\|`real`), `AIRSIM_PORT`, `BRIDGE_PORT`, `MCP_PORT`,
 `UI_PORT`, `TOKEN` (default `dev-token`, passed to the app as `GODSEYE_TOKEN`) and `STORE` (default
-`godseye/.godseye/store`).
+`godseye/.godseye/store`). `start.sh` passes `--geodata on`, and passes `--theater` only when
+`THEATER` is set; with it unset the app boots the theater persisted in `$STORE/theater.json`, else
+the table default. An unknown `THEATER` is refused before anything binds a port.
 
-`./scripts/demo_laptop.sh` boots that stack and flies a scripted recon mission over MCP. The browser
-page opens on the console; Track on the rail shows the drone on the map, and `?console=off` gives the
-plain map.
+`./scripts/demo_laptop.sh` boots that stack and flies a scripted recon mission over MCP. It always
+names a table theater (`THEATER`, else the table default), so a theater set from chat is not
+restored under it. The browser page opens on the console; Track on the rail shows the drone on the
+map, and `?console=off` gives the plain map.
+
+The app's theater, map-data and airframe flags (`app.py`, WG v2 Phase A):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--theater <id>` | the theater persisted in `<store>/theater.json`, else `default` | A theater-table id (`choices` are the static table only). An explicit flag wins over the store and is re-persisted. |
+| `--geodata on\|off` | `on` | On-demand map data over the network: place lookup, mapped sites and ground samples for new theaters. `off` keeps the app offline for these: places are given as coordinates, and a new area needs the operator's `ground_msl_m`. |
+| `--real-data off\|direct\|gev` | flag absent: `$GODSEYE_REAL_DATA`, unset = off | Real-world data for the safety loop (terrain AGL and LOS, geofence floor, weather). `direct` fetches Re:Earth and Open-Meteo itself; `gev` uses God's Eye View's proxies at `$GODSEYE_GEV_ORIGIN`. An explicit `off` wins over the environment. |
+| `--airframe quad_suas_electric\|group3_fixed_wing` | the restored theater's airframe, else `$GODSEYE_AIRFRAME`, else `quad_suas_electric` | The fuel-model profile. An explicit flag wins even over a restored theater's airframe. |
+
+The startup banner says whether the theater was restored from the store (with its epoch), prints a
+WARNING line when the persisted theater could not be used (the default is booted instead and the
+store's audit trail records `theater_restore_failed`), and adds a line
+`map data : on|off (geocoding and mapped sites); real-data hydration on|off`.
 
 `godseye_uav.launch` (the older three-listener launcher) is unchanged and still used by tests.
 
@@ -69,6 +86,27 @@ browser) and the CLI's environment; `llm_providers.py` is the catalog. Dev and t
 `GODSEYE_LLM_SECRET_STORE=file`. `INTEL_CONSOLE.md` has the full contract: routes, SSE events,
 approval classes, session grants, sign-in policy, providers and keys, environment variables, where
 transcripts are written, and observed cost; the repository `README.md` lists the providers.
+
+## Theaters anywhere, map data and sim speed
+
+The simulated AO no longer has to be a row of the theater table (WG v2 Phase A). From chat, the
+analyst looks a place up (`geo_lookup`, or takes coordinates), sizes an AO for the airframe
+(`theater_propose`, which changes nothing), and asks to move the simulation there
+(`sim_set_theater`). The operator approves that on a sim slip, every time. The switch parks every
+drone, landed, at the new home, and moves the geofence, home and every fuel model's home. It moves
+the three copies of the simulation origin together and cross-checks them. The new theater is
+persisted in `<store>/theater.json`, so it survives a restart. `sim_set_time_scale` runs the fake
+simulator up to ten times faster. A real place is **context only**: mapped strategic sites
+(`geo_sites`, from OpenStreetMap) appear on the orb and the map, and are never targets.
+
+- Tools: `TOOL_CONTRACT.md` §4.5 (the five new server tools, their refusals and budgets). The
+  default `/mcp` catalog is 51 tools; nothing in Phase A is kinetic.
+- Operator flow, slips, persistence, restart rules and audit rows: `INTEL_CONSOLE.md`, "Runtime
+  theaters and sim speed".
+- Upstreams, caches, the `--geodata` and `--real-data` switches, and attribution:
+  `REAL_DATA_INTEGRATION.md` and `../THIRD_PARTY_NOTICES.md` §4.
+- The bridge's side (`/snapshot.theater`, the geofence re-read, the flown-track reset):
+  `BRIDGE_CONTRACT.md`, "Runtime theaters".
 
 ## Connecting a harness
 
@@ -108,7 +146,8 @@ Note this SDK's `streamable_http_client` takes `http_client=` (not `headers=`) a
 `scripts/demo_mission.py` is a complete worked example that drives the real transport.
 
 Calls over `/mcp` do not pass through the console's order slips (those are for the in-app analyst);
-the server's own safety gates apply to every caller.
+the server's own safety gates apply to every caller. That includes `sim_set_theater`: an `/mcp`
+caller can switch the theater with the same refusals, and the theater records `set_via: "mcp"`.
 
 ## The skill
 
@@ -133,15 +172,28 @@ stricter.
 - **Lost link**: the server runs the mission's lost-link plan on its own (hold-orbit /
   climb-for-LOS / RTB / continue) and logs the LOAL event into the INTREP.
 - **Busy**: one in-flight command per vehicle; a second returns `{"status":"busy", "current": …}`.
+- **Theater switch**: refused unless every drone is proven landed, idle, not BINGO-latched and
+  linked, no forced RTB is flying, the sim is the built-in fake, the host is the app host and
+  restart recovery has finished. While a switch runs, and after a plan whose gate was checked in an
+  earlier theater, a submit is refused with `theater_changed`. If the origin copies fail their
+  cross-check, every copy is put back at the old origin, the safety monitor enforces nothing, and
+  every submit except `uav_land` and `uav_hover` is refused with `theater_integrity` until a
+  restart. Once the origin starts to move, a cancelled caller (Stop, a closed chat) cannot leave the
+  switch half-done: it runs to its end. What the monitor's caches already disprove (a drone
+  airborne or busy, say) is refused before the switch blocks ticks and commands.
+- **Restart**: an interrupted route is re-gated against the booted theater before it resumes; one
+  planned in another theater is aborted with a forced RTB (`restart_resume_regate_failed`).
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `mcp/godseye_uav/app.py`, `host.py` | Entry point (window, browser, headless, self-test) and the single-process host |
-| `mcp/godseye_uav/server.py` | MCP server: 46 tools, 8 resources |
+| `mcp/godseye_uav/server.py` | MCP server: 51 tools, 8 resources |
 | `mcp/godseye_uav/bridge.py` | Telemetry bridge |
-| `mcp/godseye_uav/intel_graph.py` | Intel graph and `/intel/*` routes |
+| `mcp/godseye_uav/intel_graph.py`, `intel_sites.py`, `intel_overlay.py` | Intel graph and `/intel/*` routes; mapped-site nodes; the map's `/intel/overlay` feed |
+| `mcp/godseye_uav/theaters.py`, `theater_plan.py`, `theater_switch.py`, `theater_tools.py` | Theater table and dynamic registry; proposals; the switch and `theater.json`; the five theater and sim-speed tools |
+| `mcp/godseye_uav/geo_http.py`, `geocode.py`, `sites.py` | Direct map-data upstreams (User-Agent, rate gates, cache, egress switch); Photon/Nominatim lookup; OpenStreetMap sites |
 | `mcp/godseye_uav/chat.py`, `analyst_policy.py`, `analyst_toolbelt.py`, `analyst_prompt.md` | The analyst |
 | `mcp/godseye_uav/llm_settings.py`, `llm_providers.py` | The analyst's model providers: `/settings/llm*`, keys, connection checks, the catalog |
 | `mcp/godseye_uav/` (rest) | Safety, tasking, missions, targets, threat, geo, store, theaters, real data, fake sim |
@@ -164,7 +216,8 @@ stricter.
 `tests/conftest.py` puts `mcp/` and the AirSim PythonClient (`$GODSEYE_AIRSIM_PYTHONCLIENT`,
 `../airsim/PythonClient` or `.godseye/vendor/airsim/PythonClient`, which `scripts/setup.sh` fetches)
 on the path. The whole suite runs against the built-in fake AirSim with no Unreal and no GPU:
-1,767 tests, about 40 minutes, most of it `test_server.py`. The analyst and window tests mostly use
+2,488 tests collected when the WG v2 Phase A docs were written. The last timed full run (1,767
+tests) took about 40 minutes, most of it `test_server.py`. The analyst and window tests mostly use
 fakes for `claude_agent_sdk` and `webview`; the few that need the real SDK skip without it, so the
 suite runs without the `app` extra. One test runs the
 built desktop app and is opt-in: `GODSEYE_TEST_DESKTOP_APP=1 .venv/bin/python -m pytest
@@ -173,12 +226,29 @@ tests/test_app.py -k built_app` after `../scripts/build_desktop.sh`. The provide
 proxy, with fake keys (`GODSEYE_LIVE_CLI=0` skips them); `GODSEYE_TEST_KEYCHAIN=1` adds a round trip
 through a throwaway Keychain.
 
+**No test reaches the internet.** `tests/conftest.py` installs an egress guard for the whole
+session: it sets `GODSEYE_NO_EGRESS=1` (subprocess hosts inherit it, and the direct map-data
+client refuses before opening a socket), and it makes `socket.socket.connect`, `connect_ex` and
+`socket.create_connection` raise `OSError("egress blocked in tests: …")` for any address that is
+not local. Local means loopback, `localhost`, the unspecified address and this machine's own
+interface address; other host names are refused without a DNS lookup, and a UDP `connect()`
+(which sends nothing) is allowed. Every HTTP client in the geodata code is injectable, and the
+tests use hand-written fixtures in `tests/fixtures/geodata/`.
+
+A test that really needs the network is marked `@pytest.mark.live_net` (registered in
+`pyproject.toml`). It is skipped unless `GODSEYE_LIVE_NET=1`, which lifts both measures for that
+test only. A `live_net` test that needs a networked subprocess host must start it inside the test
+or a function-scoped fixture: a module-scoped fixture starts before the guard is lifted.
+
 ## Datum: read this before touching altitudes
 
 Altitude is the highest-risk area in the system. There is exactly one conversion point,
 `geo.canonical_altitude()`, and no module may do its own geoid math.
 
-- Origin altitudes are entered as MSL and converted once at ingest.
+- Origin altitudes are entered as MSL and converted once at ingest. A runtime theater stores its
+  ground as MSL, and each activation (a switch, or the boot) converts it to HAE exactly once; the
+  switch then moves the fake sim's, the MCP backend's and the bridge's origin copies to that one
+  point and cross-checks them.
 - `altHae = altMSL + N(φ, λ)`, where `N` is the EGM96 geoid undulation: negative where the geoid is
   below the ellipsoid (−22.21 m at the Redmond origin, +1.58 m near Isfahan).
 - Every altitude field names its datum: `alt_hae_m`, `alt_msl_m`, `alt_agl_m`. Never a bare `alt_m`.
@@ -188,13 +258,25 @@ Altitude is the highest-risk area in the system. There is exactly one conversion
 ## Known limits
 
 - The UAV is simulated; only the environment data can be real. See `REAL_DATA_INTEGRATION.md`.
-- The real-data layer is off by default (`GODSEYE_REAL_DATA`). With it off, `alt_agl_m` is height
-  above the launch datum, LOS is geometric and there is no live air traffic; every such value says
-  so (`alt_agl_is_real`, `los_is_measured`, `traffic_is_real`). Turning it on needs God's Eye View's
-  `/api` providers, which only its vite dev server hosts.
+- The real-data layer (hydration of the safety loop) is off by default (`--real-data`,
+  `GODSEYE_REAL_DATA`). With it off, `alt_agl_m` is height above the launch datum, LOS is geometric
+  and there is no live air traffic; every such value says so (`alt_agl_is_real`, `los_is_measured`,
+  `traffic_is_real`). `--real-data direct` gives terrain and weather without God's Eye View, but no
+  mapped installations or live traffic; `--real-data gev` needs God's Eye View's `/api` providers,
+  which only its vite dev server hosts. Map data for new theaters (`--geodata`) is a separate
+  switch and is on in the app.
 - Geo-registration is certified to a measured ~900 m radius from the origin: the ported AirSim math
   mixes a spherical NED→geodetic with an ellipsoidal geodetic→NED, so horizontal error grows with
-  range (worst ≈5 m/km near the equator). Beyond that radius, re-anchor the origin.
+  range (worst ≈5 m/km near the equator). Beyond that radius, re-anchor the origin. A chat theater
+  is much larger than that: its AO half-extent is 1.5–2.94 km for the quad and up to 25 km for the
+  group-3 profile, so positions near the edge of a large AO carry that error.
+- The group-3 fixed-wing profile changes the fuel model only; the fake simulator still flies
+  multirotor kinematics (hover, 20 m/s cap), and a proposal says so.
+- A runtime theater switch needs the built-in fake simulator and the app host. Under a real AirSim
+  the origin is fixed by its `settings.json`: switches are refused, and a persisted chat theater is
+  not restored at boot.
+- Sim speed is not persisted: a restart runs at ×1. Link-loss timers, detections and scans, and the
+  analyst's clock stay on wall time at any speed.
 - OpenSky is licensed for non-commercial research/education use; several other feeds carry
   attribution requirements. See `../gods-eye-view/DATA_SOURCES.md`.
 - The analyst and host have their own list in `INTEL_CONSOLE.md`, "Known limits".

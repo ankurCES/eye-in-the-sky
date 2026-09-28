@@ -10,6 +10,7 @@ import {
   grantScopeOf,
   initialState,
   latestCommandRow,
+  MAP_IDS_MAX,
   pendingApprovals,
   rateLimit,
   reduce,
@@ -1322,4 +1323,85 @@ test('review: a switch mid-turn leaves the running turn on its own provider', as
     ev('usage', { turn_id: 't3', provider: custom, input_tokens: 1 }, 9),
   );
   assert.equal(s.usage.turns.t3.provider.id, 'custom');
+});
+
+// ---- WG Phase A: previews, the raw class, theater and map directives -------------------
+
+test('approval_request keeps the theater and speed previews and acknowledge_required', () => {
+  const preview = { checks: [], center: [1, 2], bbox: [0, 1, 2, 3] };
+  let s = reduce(
+    initialState(),
+    ev(
+      'approval_request',
+      {
+        approval_id: 'a1',
+        call_id: 'c1',
+        tool: 'sim_set_theater',
+        class: 'sim',
+        title: 'Set the theater',
+        args: { label: 'Kherson' },
+        theater_preview: preview,
+        acknowledge_required: false,
+      },
+      1,
+    ),
+  );
+  assert.equal(s.approvals.a1.klass, 'sim');
+  assert.equal(s.approvals.a1.rawClass, 'sim');
+  assert.equal(s.approvals.a1.theaterPreview, preview);
+  assert.equal(s.approvals.a1.timeScalePreview, null);
+  assert.equal(s.approvals.a1.acknowledgeRequired, false);
+  s = reduce(
+    s,
+    ev(
+      'approval_request',
+      {
+        approval_id: 'a2',
+        tool: 'sim_set_time_scale',
+        class: 'sim',
+        time_scale_preview: [1, 4],
+      },
+      2,
+    ),
+  );
+  assert.equal(s.approvals.a2.timeScalePreview, null, 'not an object');
+  s = reduce(
+    s,
+    ev('approval_request', { approval_id: 'a3', class: 'engagement' }, 3),
+  );
+  assert.equal(s.approvals.a3.klass, 'unknown');
+  assert.equal(s.approvals.a3.rawClass, 'engagement');
+  assert.equal(s.rows.c1.klass, 'sim');
+});
+
+test('ui theater and ui map directives: normalised, capped, kept in order', () => {
+  let s = reduce(initialState(), ev('turn_start', { turn_id: 't1' }, 1));
+  s = reduce(s, ev('ui', { action: 'theater', id: 'thr:dyn-abc' }, 2));
+  s = reduce(s, ev('ui', { action: 'theater', ids: ['thr:dyn-def'] }, 3));
+  const ids = Array.from({ length: 60 }, (_, i) => `trk:T-${i}`);
+  s = reduce(
+    s,
+    ev('ui', { action: 'map', ids: [...ids, '', null], reason: 'Watch' }, 4),
+  );
+  const [a, b, c] = s.directives;
+  assert.equal(a.action, 'theater');
+  assert.equal(a.id, 'thr:dyn-abc');
+  assert.equal(b.id, 'thr:dyn-def', 'a list-shaped theater directive works');
+  assert.equal(c.action, 'map');
+  assert.equal(c.ids.length, MAP_IDS_MAX);
+  assert.equal(MAP_IDS_MAX, 50);
+  assert.equal(c.reason, 'Watch');
+  assert.ok(c.ids.every((id) => id.startsWith('trk:')));
+  assert.deepEqual(
+    s.turns.t1.blocks
+      .filter((x) => x.kind === 'directive')
+      .map((x) => x.action),
+    ['theater', 'theater', 'map'],
+  );
+  // A replayed directive is recorded as replayed (the view never runs it).
+  s = reduce(
+    s,
+    ev('ui', { action: 'map', ids: ['thr:x'] }, 5, { replay: true, at: null }),
+  );
+  assert.equal(s.directives.at(-1).replay, true);
 });

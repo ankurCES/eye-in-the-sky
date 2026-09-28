@@ -25,7 +25,13 @@
 #
 # THEATER ids come from godseye_uav/theaters.py — the single source of truth
 # for home, AO and demo geometry. This script does not keep its own list; an
-# unknown id is rejected here, before anything binds a port.
+# unknown id is rejected here, before anything binds a port. With THEATER
+# unset, --theater is not passed: the app boots the theater persisted in
+# $STORE/theater.json (a theater set from chat survives a restart), else the
+# table default (WG §4.1.4).
+#
+# Map data (geocoding, mapped sites) is on: --geodata on. Real-data hydration
+# of the safety loop stays off unless GODSEYE_REAL_DATA says otherwise.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,8 +64,12 @@ PY="$ROOT/.venv/bin/python"
 [ -x "$PY" ] || PY="$(command -v python3)"
 echo "[start] python: $PY"
 
-# Theater: default and validation both come from the table, not from here.
-THEATER="${THEATER:-$("$PY" -c 'from godseye_uav import theaters; print(theaters.DEFAULT_THEATER_ID)')}"
+# Theater: validation comes from the table, not from here. Unset = let the app
+# restore the persisted theater (else the table default); only a THEATER you
+# set is passed as --theater.
+THEATER="${THEATER:-}"
+THEATER_ARGS=()
+if [ -n "$THEATER" ]; then THEATER_ARGS=(--theater "$THEATER"); fi
 if ! "$PY" - "$THEATER" <<'PYTHEATER'
 import sys
 from godseye_uav import theaters
@@ -73,6 +83,10 @@ if problems:
     for p in problems:
         print("   " + p, file=sys.stderr)
     sys.exit(1)
+if not sys.argv[1]:
+    print(f"[start] theater: the one persisted in the store, else "
+          f"{theaters.DEFAULT_THEATER_ID} (set THEATER to choose)")
+    sys.exit(0)
 try:
     t = theaters.get(sys.argv[1])
 except KeyError as exc:
@@ -120,9 +134,11 @@ fi
 # command line: argv is readable by every local user (`ps`), a process's
 # environment only by its owner. app.py reads GODSEYE_TOKEN and removes it
 # from its own environment before anything (the analyst's CLI) is spawned.
-echo "[start] sim+MCP+bridge: theater=$THEATER sim=:$AIRSIM_PORT mcp=:$MCP_PORT bridge=:$BRIDGE_PORT"
+THEATER_SHOWN="${THEATER:-persisted, else default}"
+echo "[start] sim+MCP+bridge: theater=$THEATER_SHOWN sim=:$AIRSIM_PORT mcp=:$MCP_PORT bridge=:$BRIDGE_PORT"
 GODSEYE_TOKEN="$TOKEN" "$PY" -m godseye_uav.app --headless \
-  --theater "$THEATER" \
+  ${THEATER_ARGS[@]+"${THEATER_ARGS[@]}"} \
+  --geodata on \
   --sim-port "$AIRSIM_PORT" \
   --port "$BRIDGE_PORT" \
   --mcp-port "$MCP_PORT" \
@@ -146,14 +162,18 @@ echo "        MCP      : http://127.0.0.1:$MCP_PORT/mcp"
 echo "        bridge   : http://127.0.0.1:$BRIDGE_PORT/snapshot"
 echo "        UI       : http://localhost:$UI_PORT"
 echo "        console  : http://127.0.0.1:$BRIDGE_PORT/  (built UI, same origin; needs 'npm run build')"
-echo "        theater  : $THEATER"
+echo "        theater  : $THEATER_SHOWN"
 echo "        store    : $STORE"
 echo ""
 # Only the well-known dev default is echoed; a token you chose stays out of
 # the terminal and of any log this output is redirected into.
 if [ "$TOKEN" = "dev-token" ]; then TOKEN_SHOWN="dev-token"; else TOKEN_SHOWN='"$TOKEN"'; fi
+# The demo flies a table theater: name it only when THEATER was given (it
+# checks the server's theater and says so if they differ).
+DEMO_THEATER=""
+if [ -n "$THEATER" ]; then DEMO_THEATER=" --theater $THEATER"; fi
 echo "[start] fly the scripted demo against this stack:"
-echo "        $PY $ROOT/scripts/demo_mission.py --mcp-url http://127.0.0.1:$MCP_PORT/mcp --token $TOKEN_SHOWN --theater $THEATER"
+echo "        $PY $ROOT/scripts/demo_mission.py --mcp-url http://127.0.0.1:$MCP_PORT/mcp --token $TOKEN_SHOWN$DEMO_THEATER"
 echo ""
 echo "[start] Ctrl-C to stop everything."
 

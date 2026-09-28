@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as Cesium from 'cesium';
 
 import {
   ALARM_INSET_CLASS,
@@ -7,10 +8,22 @@ import {
   MAP_HIDDEN_CLASS,
   MAP_INSET_CLASS,
   MAP_INSET_VAR,
+  OVERVIEW_CLASS,
+  SHOW_AREA_DEFAULT_RADIUS_M,
+  SHOW_AREA_FLIGHT_S,
+  SHOW_AREA_GROUND_MAX_M,
+  SHOW_AREA_GROUND_MIN_M,
+  SHOW_AREA_MIN_EXTENT_M,
+  SHOW_AREA_PAD,
+  SHOW_AREA_PITCH_DEG,
+  SHOW_AREA_STARTUP_WAIT_MS,
   TRACKING_PORT_CSS,
+  areaBounds,
+  areaRectangle,
   createDeferredTrackingPort,
   createTrackingPort,
   defaultKeyholeGeometry,
+  plausibleGround,
 } from './trackingPort.js';
 
 // ---- a small fake page ------------------------------------------------------
@@ -741,4 +754,531 @@ test('a failed start rejects whenReady and makes enter() resolve false', async (
   deferred.fail(new Error('Cesium could not start'));
   assert.equal(await entering, false);
   await assert.rejects(deferred.whenReady(), /Cesium could not start/);
+});
+
+// ---- map overview (WG v2 §4.2.7) --------------------------------------------
+
+/** The standard harness plus a camera and a UAV layer with a context overlay. */
+function overviewHarness(options) {
+  const h = harness(options);
+  const camera = {
+    views: [],
+    flights: [],
+    frustum: { fovy: 1.0 },
+    setView(view) {
+      camera.views.push(view);
+    },
+    flyTo(flight) {
+      camera.flights.push(flight);
+    },
+  };
+  h.viewer.camera = camera;
+  const context = {
+    active: [],
+    visibility: [],
+    pickCb: null,
+    unsubscribed: 0,
+  };
+  Object.assign(h.uavLayer, {
+    setContextActive(on) {
+      context.active.push(on);
+      return on;
+    },
+    setContextVisibility(kinds) {
+      context.visibility.push(kinds);
+      return { sites: true, forces: true, ...kinds };
+    },
+    onContextPick(cb) {
+      context.pickCb = cb;
+      return () => {
+        context.unsubscribed += 1;
+        context.pickCb = null;
+      };
+    },
+    getContextStatus: () => ({ status: 'ok', sites: { drawn: 3 } }),
+  });
+  return { ...h, camera, context };
+}
+
+const KHERSON = { bbox: [46.6, 32.5, 46.7, 32.7] };
+
+function cartographicOf(cartesian) {
+  const c = Cesium.Cartographic.fromCartesian(cartesian);
+  return {
+    lat: Cesium.Math.toDegrees(c.latitude),
+    lon: Cesium.Math.toDegrees(c.longitude),
+    height: c.height,
+  };
+}
+
+test('areaRectangle is Rectangle.fromDegrees(w, s, e, n), padded 15 %', () => {
+  const rect = areaRectangle({ bbox: [10, 20, 11, 22] });
+  assert.ok(rect instanceof Cesium.Rectangle);
+  const deg = (r) => Cesium.Math.toDegrees(r);
+  // Centre (10.5, 21); half-extents 0.5 and 1 degree, each grown 15 %.
+  assert.ok(Math.abs(deg(rect.south) - (10.5 - 0.575)) < 1e-9);
+  assert.ok(Math.abs(deg(rect.north) - (10.5 + 0.575)) < 1e-9);
+  assert.ok(Math.abs(deg(rect.west) - (21 - 1.15)) < 1e-6);
+  assert.ok(Math.abs(deg(rect.east) - (21 + 1.15)) < 1e-6);
+  assert.ok(rect.west < rect.east, 'west and east are not swapped');
+  assert.ok(rect.south < rect.north, 'south and north are not swapped');
+  assert.equal(SHOW_AREA_PAD, 0.15);
+});
+
+test('a centre without a radius frames 2 km; nothing frames under 1 km', () => {
+  const around = areaBounds({ center: [47.64, -122.14] });
+  assert.equal(SHOW_AREA_DEFAULT_RADIUS_M, 2000);
+  assert.ok(Math.abs(around.halfHeightM - 2000 * 1.15) < 1e-6);
+  assert.ok(Math.abs(around.halfWidthM - 2000 * 1.15) < 1e-6);
+  const sized = areaBounds({ center: [47.64, -122.14], radiusM: 5000 });
+  assert.ok(Math.abs(sized.halfHeightM - 5750) < 1e-6);
+  const tiny = areaBounds({ bbox: [47.64, -122.14, 47.6401, -122.1399] });
+  assert.equal(SHOW_AREA_MIN_EXTENT_M, 1000);
+  assert.equal(tiny.halfHeightM, 500);
+  assert.equal(tiny.halfWidthM, 500);
+  // Across the antimeridian (Fiji): west > east is a crossing, not an error.
+  const fiji = areaBounds({ bbox: [-17, 179.5, -16, -179.5] });
+  assert.ok(Math.abs(Math.abs(fiji.centerLon) - 180) < 1e-9);
+  for (const bad of [
+    null,
+    {},
+    { bbox: [1, 2, 3] },
+    { bbox: [50, 0, 40, 1] },
+    { bbox: [0, 0, 100, 1] },
+    { center: ['x', 1] },
+  ])
+    assert.equal(areaBounds(bad), null);
+});
+
+test('hidden, showArea is a synchronous setView at -60 deg, looking at the centre', async () => {
+  const h = overviewHarness();
+  h.port.setMapVisible(false);
+  const shown = h.port.showArea(KHERSON, { animate: true });
+  assert.equal(h.camera.views.length, 1, 'set before showArea returned');
+  assert.equal(h.camera.flights.length, 0, 'never a flight while hidden');
+  assert.equal(await shown, true);
+  const [view] = h.camera.views;
+  assert.equal(view.orientation.heading, 0);
+  assert.ok(
+    Math.abs(
+      view.orientation.pitch - Cesium.Math.toRadians(SHOW_AREA_PITCH_DEG),
+    ) < 1e-12,
+  );
+  assert.equal(SHOW_AREA_PITCH_DEG, -60);
+  const at = cartographicOf(view.destination);
+  // Due south of the centre, as far back as it is high over tan(60).
+  assert.ok(Math.abs(at.lon - 32.6) < 1e-6);
+  assert.ok(at.lat < 46.65);
+  const backM = (46.65 - at.lat) * 111320;
+  assert.ok(Math.abs(at.height / backM - Math.tan(Math.PI / 3)) < 0.05);
+  // The whole padded area fits the vertical field of view.
+  const bounds = areaBounds(KHERSON);
+  const range = Math.hypot(backM, at.height);
+  assert.ok(
+    range >=
+      (0.99 * Math.hypot(bounds.halfWidthM, bounds.halfHeightM)) /
+        Math.tan(0.5),
+  );
+});
+
+test('visible with animate, showArea flies for 1.5 s and resolves on arrival', async () => {
+  const h = overviewHarness();
+  const shown = h.port.showArea(KHERSON, { animate: true });
+  assert.equal(h.camera.views.length, 0);
+  assert.equal(h.camera.flights.length, 1);
+  const [flight] = h.camera.flights;
+  assert.equal(flight.duration, SHOW_AREA_FLIGHT_S);
+  assert.equal(SHOW_AREA_FLIGHT_S, 1.5);
+  flight.complete();
+  assert.equal(await shown, true);
+
+  const cancelled = h.port.showArea(KHERSON, { animate: true });
+  h.camera.flights[1].cancel();
+  assert.equal(await cancelled, false);
+
+  // Without `animate`, a visible map is set, not flown.
+  assert.equal(await h.port.showArea(KHERSON), true);
+  assert.equal(h.camera.views.length, 1);
+  assert.equal(h.camera.flights.length, 2);
+});
+
+test('reduced motion turns every showArea into a setView', async () => {
+  const h = overviewHarness();
+  h.win.matchMedia = (query) => ({
+    matches: query === '(prefers-reduced-motion: reduce)',
+  });
+  assert.equal(await h.port.showArea(KHERSON, { animate: true }), true);
+  assert.equal(h.camera.flights.length, 0);
+  assert.equal(h.camera.views.length, 1);
+});
+
+test('showArea never fights the cockpit, and releases a tracked entity', async () => {
+  const h = overviewHarness();
+  h.cockpit.enterAs('Drone1');
+  assert.equal(await h.port.showArea(KHERSON), false);
+  assert.equal(h.camera.views.length, 0);
+  h.cockpit.exit({ restoreTracking: false });
+
+  h.viewer.trackedEntity = { id: 'uav:Drone1' };
+  const untracks = h.calls.untrack;
+  assert.equal(await h.port.showArea({ center: [46.64, 32.6] }), true);
+  assert.equal(h.viewer.trackedEntity, undefined);
+  assert.equal(h.calls.untrack, untracks + 1);
+
+  assert.equal(await h.port.showArea({ bbox: 'nowhere' }), false);
+  assert.equal(h.camera.views.length, 1, 'a bad target moves nothing');
+});
+
+/** Record the order of the camera calls showArea makes. */
+function flightLog(h) {
+  const log = [];
+  const { setView, flyTo } = h.camera;
+  h.camera.setView = (view) => {
+    log.push('setView');
+    setView(view);
+  };
+  h.camera.flyTo = (flight) => {
+    log.push('flyTo');
+    flyTo(flight);
+  };
+  h.camera.cancelFlight = () => log.push('cancel');
+  return log;
+}
+
+test('showArea cancels a flight queued behind the hidden map before framing, hidden or visible', async () => {
+  // Review: GEV's startup fly-ins (camera.js flyToAustin, uavAutoStart) froze
+  // while the map was hidden and resumed on its first frame, overriding the
+  // setView: the first map entry ended over Austin or the old theater.
+  const h = overviewHarness();
+  const log = flightLog(h);
+  h.port.setMapVisible(false);
+  h.camera.flyTo({ destination: 'Austin, 600 m' });
+  assert.equal(await h.port.showArea(KHERSON), true);
+  assert.deepEqual(log, ['flyTo', 'cancel', 'setView']);
+  h.port.setMapVisible(true);
+  log.length = 0;
+  const shown = h.port.showArea(KHERSON, { animate: true });
+  assert.deepEqual(log, ['cancel', 'flyTo']);
+  h.camera.flights.at(-1).complete();
+  assert.equal(await shown, true);
+});
+
+test('while the boot-time UAV start runs, showArea waits for it, then cancels its flight', async () => {
+  const h = overviewHarness();
+  const log = flightLog(h);
+  let finishStart;
+  const startup = new Promise((resolve) => {
+    finishStart = resolve;
+  });
+  h.port.attachData(h.dataManager, { startup });
+  h.port.setMapVisible(false);
+  const shown = h.port.showArea(KHERSON);
+  await flush();
+  assert.deepEqual(log, [], 'nothing framed while the start may still fly');
+  h.camera.flyTo({ destination: 'lead drone home + 25 km' }); // uavAutoStart
+  finishStart();
+  assert.equal(await shown, true);
+  assert.deepEqual(log, ['flyTo', 'cancel', 'setView']);
+  // Once the start is over, a hidden showArea is synchronous again.
+  log.length = 0;
+  h.port.showArea(KHERSON);
+  assert.deepEqual(log, ['cancel', 'setView']);
+});
+
+test('a boot start that never settles delays showArea only up to its cap', async () => {
+  const h = overviewHarness();
+  h.port.attachData(h.dataManager, { startup: new Promise(() => {}) });
+  const shown = h.port.showArea(KHERSON);
+  await flush();
+  assert.equal(h.camera.views.length, 0);
+  assert.equal(SHOW_AREA_STARTUP_WAIT_MS, 3000);
+  h.timers.run(SHOW_AREA_STARTUP_WAIT_MS);
+  assert.equal(await shown, true);
+  assert.equal(h.camera.views.length, 1);
+});
+
+test('showArea never puts the camera underground on an unrefined terrain tile', async () => {
+  // Review: offline, globe.getHeight at a far AO read -46114 m and the map
+  // went black with the camera 38 km under the ellipsoid.
+  const h = overviewHarness();
+  h.port.setMapVisible(false);
+  let tile = -46114;
+  h.viewer.scene.globe = { getHeight: () => tile };
+  const bounds = areaBounds(KHERSON);
+  const rangeM =
+    Math.hypot(bounds.halfWidthM, bounds.halfHeightM) / Math.tan(0.5);
+  const up = rangeM * Math.sin(Math.PI / 3);
+  const heightAt = () => cartographicOf(h.camera.views.at(-1).destination);
+
+  assert.equal(await h.port.showArea(KHERSON), true);
+  assert.ok(heightAt().height > up * 0.5, 'above the ground');
+  assert.ok(Math.abs(heightAt().height - up) < 50, 'an implausible tile is 0');
+  // The caller's known ground (the theater's ground_msl_m) wins.
+  assert.equal(await h.port.showArea({ ...KHERSON, groundM: 925 }), true);
+  assert.ok(Math.abs(heightAt().height - (925 + up)) < 50);
+  assert.equal(await h.port.showArea({ ...KHERSON, groundM: -9e4 }), true);
+  assert.ok(Math.abs(heightAt().height - up) < 50, 'a bad hint is ignored');
+  // A plausible globe height is still used without a hint.
+  tile = 300;
+  assert.equal(await h.port.showArea(KHERSON), true);
+  assert.ok(Math.abs(heightAt().height - (300 + up)) < 50);
+
+  assert.equal(SHOW_AREA_GROUND_MIN_M, -500);
+  assert.equal(SHOW_AREA_GROUND_MAX_M, 9000);
+  for (const bad of [-46114, 9001, -501, NaN, Infinity, null, '12', undefined])
+    assert.equal(plausibleGround(bad), null, String(bad));
+  for (const ok of [-430, 0, 925, 8849]) assert.equal(plausibleGround(ok), ok);
+});
+
+test('in the overview over a narrow bottom sheet the credits sit above it, never hidden', () => {
+  // Review: at 420 px the sheet covered the Cesium credits and "Data
+  // attribution"; the overview must keep them visible and clickable.
+  const rules = TRACKING_PORT_CSS.split('\n').filter((line) =>
+    line.includes('#cesium-credits'),
+  );
+  assert.equal(rules.length, 1);
+  const [rule] = rules;
+  assert.ok(
+    rule.includes(
+      `body.${OVERVIEW_CLASS}.${ALARM_INSET_CLASS} #cesium-credits{`,
+    ),
+  );
+  assert.ok(
+    rule.endsWith(`{bottom:calc(var(${ALARM_INSET_VAR},0px) + 8px)!important}`),
+  );
+  assert.doesNotMatch(rule, /display|visibility|opacity/);
+});
+
+test('the overview hides GEV chrome, keyhole and cockpit HUD, never credits or alarms', () => {
+  // The credits' lift above the narrow sheet (the one overview rule that
+  // names them) is checked above; every other overview rule hides.
+  const rules = TRACKING_PORT_CSS.split('\n').filter(
+    (line) =>
+      line.includes(OVERVIEW_CLASS) && !line.includes(ALARM_INSET_CLASS),
+  );
+  const selectors = rules.join('\n');
+  for (const hidden of [
+    '#title-bar',
+    '#command-dock',
+    '#left-panel-stack',
+    '#right-context-rail',
+    '#intel-hud',
+    '#first-run-launcher',
+    '#cockpit-hud',
+    '#safe-frame-overlay',
+    '#scope-mask',
+    '.celestial-ring-overlay',
+    '#cockpit-cloud-effects',
+  ])
+    assert.ok(selectors.includes(`${OVERVIEW_CLASS} ${hidden}`), hidden);
+  assert.match(rules.at(-1), /\{display:none!important\}/);
+  assert.doesNotMatch(
+    selectors,
+    /cesium-credits|uav-alarm-stack|cesiumContainer/,
+  );
+});
+
+test('enterOverview switches the UAV and context layers on, never the cockpit', async () => {
+  const h = overviewHarness();
+  assert.equal(h.port.enterOverview(), true);
+  assert.equal(h.body.classList.contains(OVERVIEW_CLASS), true);
+  assert.equal(h.port.isOverview(), true);
+  assert.deepEqual(h.context.active, [true]);
+  assert.ok(h.head.children.some((el) => el.textContent === TRACKING_PORT_CSS));
+  // The UAV layer waits for the data phase, then comes on once.
+  assert.deepEqual(h.calls.enabled, []);
+  h.port.attachData(h.dataManager);
+  await flush();
+  assert.deepEqual(
+    h.calls.enabled.map(([id, on]) => [id, on]),
+    [['uav', true]],
+  );
+  assert.equal(h.cockpit.active, false, 'the overview is not the cockpit');
+  assert.deepEqual(h.calls.track, []);
+
+  assert.equal(h.port.exitOverview(), true);
+  assert.equal(h.body.classList.contains(OVERVIEW_CLASS), false);
+  assert.deepEqual(h.context.active, [true, false]);
+});
+
+test('setOverlayVisibility forwards per-kind switches to the context layer', () => {
+  const h = overviewHarness();
+  assert.deepEqual(h.port.setOverlayVisibility({ sites: false }), {
+    sites: false,
+    forces: true,
+  });
+  assert.deepEqual(h.context.visibility, [{ sites: false }]);
+  assert.equal(h.port.setOverlayVisibility(null), null);
+});
+
+test('onPick reports map picks only while in overview', () => {
+  const h = overviewHarness();
+  const picks = [];
+  const off = h.port.onPick((pick) => picks.push(pick));
+  assert.equal(typeof h.context.pickCb, 'function', 'subscribed once');
+  h.context.pickCb({ id: 'sit:dyn-k:way/1' });
+  assert.deepEqual(picks, [], 'not in overview yet');
+  h.port.enterOverview();
+  h.context.pickCb({ id: 'sit:dyn-k:way/1' });
+  h.context.pickCb({ id: 'veh:Drone1' });
+  h.context.pickCb({ id: '' });
+  h.context.pickCb(null);
+  assert.deepEqual(picks, [{ id: 'sit:dyn-k:way/1' }, { id: 'veh:Drone1' }]);
+  off();
+  h.context.pickCb({ id: 'veh:Drone1' });
+  assert.equal(picks.length, 2);
+});
+
+test('supports() names what this build can do', () => {
+  const h = overviewHarness();
+  for (const name of [
+    'showArea',
+    'enterOverview',
+    'exitOverview',
+    'setOverlayVisibility',
+    'onPick',
+    'overlayStatus',
+    'setViewportInset',
+  ])
+    assert.equal(h.port.supports(name), true, name);
+  assert.equal(h.port.supports('teleport'), false);
+  assert.deepEqual(h.port.overlayStatus(), {
+    status: 'ok',
+    sites: { drawn: 3 },
+  });
+
+  // A port with no camera and a plain UAV layer can't show areas.
+  const bare = harness();
+  assert.equal(bare.port.supports('showArea'), false);
+  assert.equal(bare.port.supports('onPick'), false);
+  assert.equal(bare.port.overlayStatus(), null);
+  bare.port.destroy();
+  h.port.destroy();
+  assert.equal(h.port.supports('showArea'), false, 'nothing after destroy');
+});
+
+test('in the overview, bare GEV shortcut keys are held back as when hidden', () => {
+  const h = overviewHarness();
+  const key = (k) => ({
+    key: k,
+    stopped: false,
+    stopPropagation() {
+      this.stopped = true;
+    },
+  });
+  const before = key('c');
+  h.win.fire('keydown', before, { capture: true });
+  assert.equal(before.stopped, false, 'tracking view: GEV keys work');
+  h.port.enterOverview();
+  const c = key('c');
+  h.win.fire('keydown', c, { capture: true });
+  assert.equal(c.stopped, true);
+  const h1 = key('h');
+  h.documentElement.fire('keydown', h1);
+  assert.equal(h1.stopped, true);
+  h.port.exitOverview();
+  const after = key('h');
+  h.documentElement.fire('keydown', after);
+  assert.equal(after.stopped, false);
+});
+
+test('destroy leaves the overview and drops the pick subscription', () => {
+  const h = overviewHarness();
+  h.port.onPick(() => {});
+  h.port.enterOverview();
+  h.port.destroy();
+  assert.equal(h.body.classList.contains(OVERVIEW_CLASS), false);
+  assert.deepEqual(h.context.active, [true, false]);
+  assert.equal(h.context.unsubscribed, 1);
+  assert.equal(h.port.enterOverview(), false);
+});
+
+// ---- the deferred port's overview queue ---------------------------------------
+
+/** A real-port stand-in that records every call in order. */
+function recordingPort() {
+  const calls = [];
+  let pickCb = null;
+  const port = {
+    calls,
+    emitPick: (pick) => pickCb?.(pick),
+    whenReady: async () => {},
+    enter: async () => true,
+    exit() {},
+    isTracking: () => false,
+    onChange: () => () => {},
+    setMapVisible: (v) => calls.push(['setMapVisible', v]),
+    setViewportInset: (v) => calls.push(['setViewportInset', v]),
+    openMissionPanel: () => true,
+    keyhole: () => null,
+    supports: (name) => name !== 'onPick',
+    showArea(target, options) {
+      calls.push(['showArea', target, options]);
+      return Promise.resolve(true);
+    },
+    enterOverview: () => (calls.push(['enterOverview']), true),
+    exitOverview: () => (calls.push(['exitOverview']), true),
+    setOverlayVisibility: (kinds) => (
+      calls.push(['setOverlayVisibility', kinds]),
+      kinds
+    ),
+    onPick(cb) {
+      pickCb = cb;
+      return () => {
+        pickCb = null;
+      };
+    },
+    overlayStatus: () => ({ status: 'ok' }),
+  };
+  return port;
+}
+
+test('the deferred port queues overview calls and replays them in order', async () => {
+  const deferred = createDeferredTrackingPort();
+  assert.equal(deferred.supports('showArea'), true, 'queued, so supported');
+  assert.equal(deferred.supports('teleport'), false);
+  assert.equal(deferred.overlayStatus(), null);
+  deferred.setMapVisible(false);
+  const shown = deferred.showArea(KHERSON, { animate: false });
+  assert.equal(deferred.enterOverview(), true);
+  deferred.setOverlayVisibility({ sites: false });
+  deferred.exitOverview();
+  deferred.enterOverview();
+  const picks = [];
+  deferred.onPick((pick) => picks.push(pick));
+
+  const real = recordingPort();
+  deferred.attach(real);
+  assert.deepEqual(real.calls, [
+    ['setMapVisible', false],
+    ['showArea', KHERSON, { animate: false }],
+    ['enterOverview'],
+    ['setOverlayVisibility', { sites: false }],
+    ['exitOverview'],
+    ['enterOverview'],
+  ]);
+  assert.equal(await shown, true);
+
+  // After attach, calls go straight through; picks are forwarded.
+  assert.equal(await deferred.showArea(KHERSON), true);
+  assert.equal(real.calls.at(-1)[0], 'showArea');
+  real.emitPick({ id: 'sit:dyn-k:way/1' });
+  assert.deepEqual(picks, [{ id: 'sit:dyn-k:way/1' }]);
+  assert.equal(deferred.supports('onPick'), false, 'the real port decides');
+  assert.deepEqual(deferred.overlayStatus(), { status: 'ok' });
+
+  deferred.attach(null);
+  real.emitPick({ id: 'veh:Drone1' });
+  assert.equal(picks.length, 1, 'detached ports are not heard');
+});
+
+test('a failed start answers queued overview calls false', async () => {
+  const deferred = createDeferredTrackingPort();
+  const shown = deferred.showArea(KHERSON);
+  deferred.enterOverview();
+  deferred.fail(new Error('Cesium could not start'));
+  assert.equal(await shown, false);
+  assert.equal(deferred.supports('showArea'), false);
+  assert.equal(await deferred.showArea(KHERSON), false);
+  assert.equal(deferred.enterOverview(), false);
 });

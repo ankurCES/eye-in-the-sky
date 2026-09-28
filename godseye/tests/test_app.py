@@ -9,7 +9,7 @@ The packaged app itself is exercised by one opt-in test (it opens a window):
 
 The end-to-end tests run ``python -m godseye_uav.app --headless`` in its own
 process, from a cwd outside the repo (as a Finder launch would), on ports from
-52600-52799, then stop it with SIGTERM/SIGINT the way start.sh and a terminal
+53750-53799 (A12's range, WG §4.3), then stop it with SIGTERM/SIGINT the way start.sh and a terminal
 do.
 """
 from __future__ import annotations
@@ -49,7 +49,10 @@ GS = Path(__file__).resolve().parents[1]           # godseye/
 REPO = GS.parent
 START_SH = GS / "start.sh"
 LAUNCHER = REPO / "eye-in-the-sky"
-_PORTS = list(range(52600, 52800))
+_PORTS = list(range(53750, 53800))            # A12: 53750-53799 here, 53700-53749 in test_host
+#: Every app this module launches stays offline (WG §4.1.10): no map data, no
+#: real-data hydration, whatever the developer's environment says.
+OFFLINE_ARGS = ("--geodata", "off", "--real-data", "off")
 _rng = random.Random(os.getpid() ^ time.time_ns())
 
 
@@ -123,6 +126,7 @@ def test_parser_defaults():
     assert a.no_chat is False and a.model is None and a.debug is False
     assert a.effort is None
     assert appmod.DEFAULT_PORT == 8780
+    assert a.geodata == "on" and a.real_data is None and a.airframe is None
 
 
 @pytest.mark.parametrize("flag", ["--window", "--browser", "--headless"])
@@ -169,6 +173,39 @@ def test_config_from_args(tmp_path, monkeypatch):
     assert real.sim_backend == "real" and real.sim_port == 41451
     assert real.port == 9000 and real.mcp_port == 8791
     assert real.store_dir.is_absolute() and real.ui_dir.is_absolute()
+
+
+@pytest.mark.parametrize(("argv", "geodata", "real_data"), [
+    ([], True, None),                                  # map data on; $GODSEYE_REAL_DATA decides
+    (["--geodata", "off"], False, None),
+    (["--real-data", "off"], True, False),             # explicit off: the env cannot undo it
+    (["--real-data", "direct"], True, "direct"),
+    (["--real-data", "gev"], True, True),
+    (["--geodata", "on", "--real-data", "off"], True, False),
+])
+def test_geodata_and_real_data_flags_map_onto_the_host_config(argv, geodata, real_data):
+    """WG §4.1.10: map data (on by default in the app) is separate from the
+    safety loop's hydration (off by default)."""
+    cfg = appmod._config_from_args(build_parser().parse_args(argv), "tok")
+    assert cfg.geodata is geodata
+    assert cfg.real_data == real_data and type(cfg.real_data) is type(real_data)
+    assert HostConfig(theater=None).geodata is False           # in-process hosts: offline
+    assert HostConfig(theater=None).real_data is None
+    assert HostConfig(theater=None).airframe is None
+
+
+def test_the_new_flags_refuse_values_they_do_not_know(capsys):
+    from godseye_uav import safety
+
+    for bad in (["--geodata", "maybe"], ["--real-data", "yes"], ["--airframe", "zeppelin"]):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(bad)
+    capsys.readouterr()
+    for af in sorted(safety.AIRFRAMES):
+        cfg = appmod._config_from_args(build_parser().parse_args(["--airframe", af]), "tok")
+        assert cfg.airframe == af
+    assert set(safety.AIRFRAMES) == {"quad_suas_electric", "group3_fixed_wing"}
+    assert set(appmod.REAL_DATA_MODES) == {"off", "direct", "gev"}
 
 
 def test_token_precedence():
@@ -244,6 +281,31 @@ def test_the_startup_banner_never_prints_the_token(tmp_path, capsys, source, har
     assert (f"harness config: {where} (0600)" in line) == harness
 
 
+@pytest.mark.parametrize(("boot", "theater_line", "warning"), [
+    (None, "theater  : default (Redmond), AirSim default", None),
+    (types.SimpleNamespace(source="store", epoch=3, error=None),
+     "theater  : default (Redmond), AirSim default; restored from the store (epoch 3)", None),
+    (types.SimpleNamespace(source="default", epoch=0, error="theater.json is unreadable"),
+     "theater  : default (Redmond), AirSim default",
+     ("WARNING  : the persisted theater was not restored (theater.json is unreadable); "
+      "booted default")),
+])
+def test_the_startup_banner_says_where_the_theater_came_from(tmp_path, capsys, boot,
+                                                             theater_line, warning):
+    host = types.SimpleNamespace(
+        theater=types.SimpleNamespace(id="default", place="Redmond", label="AirSim default"),
+        url="http://127.0.0.1:1/", mcp_url="http://127.0.0.1:1/mcp", mcp_port=None,
+        token="t", store_dir=tmp_path / "store", ui_built=True, ui_dir=tmp_path, boot=boot,
+        server=types.SimpleNamespace(geodata_enabled=True, real=None),
+        chat_summary=lambda: {"available": False, "reason": "off"})
+    appmod._describe(host, token_source="generated", harness_file=None)
+    lines = [ln.removeprefix(f"{appmod.PREFIX} ") for ln in capsys.readouterr().out.splitlines()]
+    assert lines[0] == theater_line
+    assert (warning in lines) if warning else not any("WARNING" in ln for ln in lines)
+    assert "map data : on (geocoding and mapped sites); real-data hydration off" in lines
+    assert lines[-1].startswith("analyst  :")               # still the last line
+
+
 def test_airsim_client_resolution_is_a_noop_when_importable():
     assert appmod.ensure_airsim_client() is None
 
@@ -287,7 +349,7 @@ class AppProc:
             argv = [sys.executable, "-m", "godseye_uav.app", "--headless",
                     "--port", str(port), "--mcp-port", str(mcp_port),
                     "--store", str(tmp / "data" / "store"), "--ui-dir", str(tmp / "ui"),
-                    "--no-chat", *args]
+                    "--no-chat", *OFFLINE_ARGS, *args]
             with open(self.log, "w") as fh:
                 self.proc = subprocess.Popen(argv, cwd=str(tmp), env=env, stdout=fh,
                                              stderr=subprocess.STDOUT, text=True)
@@ -371,6 +433,38 @@ def test_headless_app_generates_and_records_its_token_without_printing_it(tmp_pa
                       headers={"Authorization": f"Bearer {token}"}, timeout=10)
         assert r.status_code == 200
         assert app.stop(signal.SIGINT) == 0              # Ctrl-C
+    finally:
+        app.kill()
+
+
+def test_headless_app_restores_the_stores_theater_offline(tmp_path):
+    """E2E (§4.1.4): a theater set from chat is in <store>/theater.json; the
+    app, launched with no --theater (as start.sh does), boots it with its
+    epoch and airframe, says so, and runs with map data and hydration off."""
+    from godseye_uav import theater_switch
+
+    store = tmp_path / "data" / "store"
+    store.mkdir(parents=True)
+    t = theaters.make_dynamic(label="Bengaluru centre", place="Bengaluru",
+                              center=(12.9716, 77.5946), half_extent_m=2940.0,
+                              home=(12.9716, 77.5946), home_alt_msl_m=920.0,
+                              provenance=None)
+    srv = types.SimpleNamespace(theater=t, airframe_id="group3_fixed_wing", theater_epoch=5,
+                                theater_set_at_ms=1, theater_set_via="console",
+                                theater_previous=None)
+    theater_switch.persist(store, theater_switch.state_of(srv))
+    app = AppProc(tmp_path, [], _child_env())
+    try:
+        cfg = httpx.get(f"http://127.0.0.1:{app.port}/app/config", timeout=10).json()
+        assert cfg["theater"] == {"id": t.id, "label": "Bengaluru centre", "epoch": 5}
+        out = app.output()
+        assert f"theater  : {t.id} (Bengaluru), Bengaluru centre; restored from the store " \
+               "(epoch 5)" in out
+        assert "map data : off (geocoding and mapped sites); real-data hydration off" in out
+        doc = json.loads((store / "theater.json").read_text())
+        assert (doc["theater_id"], doc["epoch"], doc["airframe"], doc["set_via"]) == (
+            t.id, 5, "group3_fixed_wing", "boot")
+        assert app.stop(signal.SIGTERM) == 0
     finally:
         app.kill()
 
@@ -569,7 +663,7 @@ def test_start_sh_runs_the_single_process_host_on_the_legacy_ports():
     assert "-m godseye_uav.launch" not in src.split("PYTHEATER")[-1]
     for flag in ('--port "$BRIDGE_PORT"', '--mcp-port "$MCP_PORT"',
                  '--sim-port "$AIRSIM_PORT"', '--store "$STORE"',
-                 '--theater "$THEATER"', "$REAL_FLAG"):
+                 '--geodata on', "$REAL_FLAG"):
         assert flag in src, flag
     # The token reaches the app through its environment, never its argv (ps).
     assert 'GODSEYE_TOKEN="$TOKEN" "$PY" -m godseye_uav.app --headless' in src
@@ -581,6 +675,56 @@ def test_start_sh_runs_the_single_process_host_on_the_legacy_ports():
                  "UI       : http://localhost:$UI_PORT"):
         assert line in src, line
     subprocess.run(["bash", "-n", str(START_SH)], check=True)
+
+
+def _start_sh_fragment(src: str, first: str, last: str) -> str:
+    start = src.index(first)
+    return src[start:src.index(last, start) + len(last)]
+
+
+def _start_sh_argv(theater: str | None) -> tuple[list[str], str]:
+    """Run start.sh's own theater lines, app command and demo hint with the
+    app replaced by an argv printer: nothing binds a port (WG §4.1.10)."""
+    src = START_SH.read_text(encoding="utf-8")
+    script = "\n".join([
+        "set -euo pipefail",
+        'printargs() { printf "%s\\n" "$@"; }',
+        'PY=printargs ROOT=/r TOKEN=dev-token AIRSIM_PORT=1 BRIDGE_PORT=2 MCP_PORT=3',
+        'STORE=/s REAL_FLAG="" TOKEN_SHOWN=dev-token',
+        _start_sh_fragment(src, 'THEATER="${THEATER:-}"', "fi"),
+        _start_sh_fragment(src, 'THEATER_SHOWN=', '$REAL_FLAG').replace(" &", ""),
+        _start_sh_fragment(src, 'DEMO_THEATER=""', "$DEMO_THEATER\""),
+    ])
+    env = {k: v for k, v in os.environ.items() if k != "THEATER"}
+    if theater is not None:
+        env["THEATER"] = theater
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                         env=env, timeout=30, check=True).stdout
+    lines = out.splitlines()                          # banner, app argv, demo hint (2)
+    return lines[lines.index("-m"):-2], "\n".join(lines[-2:])
+
+
+def test_start_sh_passes_geodata_on_and_the_theater_only_when_set():
+    """With THEATER unset the app restores the store's theater (§4.1.4), so
+    start.sh must not pin one; the demo hint then omits --theater too."""
+    argv, hint = _start_sh_argv(None)
+    assert argv[:3] == ["-m", "godseye_uav.app", "--headless"]
+    assert "--theater" not in argv
+    assert argv[argv.index("--geodata") + 1] == "on"
+    assert "demo_mission.py" in hint and "--theater" not in hint
+    argv, hint = _start_sh_argv("iran-isfahan")
+    assert argv[argv.index("--theater") + 1] == "iran-isfahan"
+    assert argv[argv.index("--geodata") + 1] == "on"
+    assert hint.endswith("--token dev-token --theater iran-isfahan")
+    src = START_SH.read_text(encoding="utf-8")
+    assert "DEFAULT_THEATER_ID)')}" not in src             # no default pinned by the script
+    assert "--real-data" not in src                        # hydration keeps its own default
+    # The table check still runs with THEATER unset, and then boots nothing itself.
+    block = re.search(r"<<'PYTHEATER'\n(.*?)\nPYTHEATER", src, re.DOTALL).group(1)
+    ran = subprocess.run([sys.executable, "-", ""], input=block, capture_output=True,
+                         text=True, env=_child_env(), timeout=60, check=False)
+    assert ran.returncode == 0, ran.stderr
+    assert "persisted in the store, else default" in ran.stdout
 
 
 def test_repo_root_launcher_is_executable_and_forwards_to_the_app():
@@ -700,7 +844,7 @@ def _main_argv(tmp_path: Path) -> list[str]:
     port, sim = _rng.sample(_PORTS, 2)
     return ["--window", "--port", str(port), "--sim-port", str(sim), "--token", "fallback-t",
             "--store", str(tmp_path / "data" / "store"), "--ui-dir", str(tmp_path / "ui"),
-            "--no-chat"]
+            "--no-chat", *OFFLINE_ARGS]
 
 
 @pytest.fixture

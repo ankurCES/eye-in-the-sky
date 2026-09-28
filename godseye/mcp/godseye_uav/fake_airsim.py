@@ -84,6 +84,12 @@ Fidelity model (what this fake does and does NOT model)
   set (vertical cylinders). There is NO terrain model — see
   :meth:`FakeAirSim.line_of_sight` for exactly what is and is not modelled.
 * **Link (M9):** degraded = stale telemetry, lost = telemetry RPCs error.
+* **Sim speed (D5):** `set_time_scale(1..10)` runs physics, object routes, the
+  sun and `sim_elapsed_s()` that many times faster than the wall clock, in
+  sub-steps no larger than MAX_TICK_DT_S. Datalink timers stay in wall time.
+* **Runtime origin (WG A2):** `relocate_origin(geo)` moves the NED origin and
+  parks every vehicle at it; scene objects keep their lat/lon/alt and routed
+  objects keep their geodetic paths.
 * **Randomness:** all sim noise draws from an injectable/seedable
   `random.Random` (`FakeAirSim(seed=...)` / :meth:`FakeAirSim.seed`).
 
@@ -126,6 +132,13 @@ TAKEOFF_RATE = 2.0
 #: machine look like a short-legged airframe. `safety.MAX_TICK_DT_S` is the
 #: same clamp on the fuel side and has always counted its own remainder.
 MAX_TICK_DT_S = 0.1
+#: Sim speed (D5): sim seconds per wall second, x1-x10, fake only. Physics,
+#: object routes, the sun and `sim_elapsed_s` run at it; the datalink timers
+#: (`set_link_state` durations, DEGRADED_HOLD_S) stay in wall-clock seconds.
+#: `_integrate` splits each scaled tick into `ceil(scale)` sub-steps so no
+#: single physics step ever flies more than MAX_TICK_DT_S.
+MIN_TIME_SCALE = 1.0
+MAX_TIME_SCALE = 10.0
 
 IMG_W, IMG_H = 256, 144  # fake frame size (kept stable: bridge + tests rely on it)
 DEFAULT_FOV_DEG = 90.0  # AirSim's default camera horizontal FOV
@@ -270,6 +283,11 @@ class _ObjectRoute:
     idx: int = 0
     done: bool = False
     pos: NedPoint | None = None  # None = resync from the object's stored geo
+    #: The origin `waypoints` and `pos` are expressed about. None = the sim's
+    #: current origin (legacy). `set_object_route` pins it at the object's
+    #: own start, and `relocate_origin` pins any unpinned route to the OLD
+    #: origin, so a runtime theater change never moves a convoy.
+    anchor: HomeGeoPoint | None = None
 
 
 @dataclass
@@ -321,7 +339,8 @@ class FakeAirSim:
     """One-msgpack-rpc-server fake for the multirotor surface."""
 
     def __init__(self, home: GeoPoint = DEFAULT_HOME, port: int = 41451,
-                 rng: random.Random | None = None, seed: int | None = None):
+                 rng: random.Random | None = None, seed: int | None = None,
+                 *, clock: Callable[[], float] | None = None):
         self.home_geo = HomeGeoPoint.from_geo(home)
         self.port = port
         self._vehicles: dict[str, _Vehicle] = {"Drone1": _Vehicle("Drone1")}
@@ -331,7 +350,20 @@ class FakeAirSim:
         self._stop = threading.Event()
         self._abort = threading.Event()  # set by cancelLastTask; clears on next task
         self._server: Server | None = None
-        self._last_tick = time.monotonic()
+        #: The one wall clock physics, the sun and `sim_elapsed_s` read
+        #: (monotonic seconds). Injectable (`clock=`) so a test can drive the
+        #: fake deterministically; production uses time.monotonic. Datalink
+        #: timers and the RPC wait deadlines stay on time.monotonic.
+        self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
+        #: Guards the clock triple (epoch, epoch_at, scale) so `sim_time()`
+        #: never reads a half-rebased clock. Lock order: _lock -> _clock_lock.
+        self._clock_lock = threading.Lock()
+        # D5 sim speed: sim seconds per wall second (MIN..MAX_TIME_SCALE).
+        self._time_scale = 1.0
+        # Scaled seconds since construction, rebased at every scale change.
+        self._elapsed_base_s = 0.0
+        self._elapsed_at = self._clock()
+        self._last_tick = self._clock()
         # Physics time the MAX_TICK_DT_S clamp dropped, and how often. Read
         # them out of `environment()`; they are the only record that the
         # aircraft flew less than the wall clock the fuel model charged.
@@ -367,7 +399,7 @@ class FakeAirSim:
         self._weather["enabled"] = 0.0
         # M6 sim clock: epoch is LOCAL SOLAR time at the home longitude.
         self._sim_epoch = _parse_datetime(DEFAULT_SIM_TIME)
-        self._sim_epoch_at = time.monotonic()
+        self._sim_epoch_at = self._clock()
         self._clock_speed = 1.0
         self._tod_enabled = True
         # M9 datalink per vehicle + the stale-telemetry cache a degraded link serves.
@@ -385,7 +417,7 @@ class FakeAirSim:
         # The clock starts when the loop does, not when the object was built:
         # the gap between construction and `start()` is not starved physics
         # and must not be charged as lost sim time.
-        self._last_tick = time.monotonic()
+        self._last_tick = self._clock()
         self._phys = threading.Thread(target=self._physics_loop, daemon=True)
         self._phys.start()
         self._t = threading.Thread(target=srv.start, daemon=True)
@@ -407,18 +439,32 @@ class FakeAirSim:
 
     # -- physics ---------------------------------------------------------
     def _integrate(self) -> None:
+        """One physics tick: the wall slice since the last one, at sim speed.
+
+        The WALL slice is clamped to MAX_TICK_DT_S first (a starved process
+        must not teleport anything), then scaled to sim time and flown as
+        `ceil(scale)` equal sub-steps, so every sub-step is <= the clamped
+        wall slice <= MAX_TICK_DT_S whatever the sim speed (D5). Vehicles and
+        routed objects share each sub-step. At x1 this is exactly one step of
+        the clamped slice, i.e. the pre-D5 behaviour.
+        """
         with self._lock:
-            now = time.monotonic()
+            now = self._clock()
             raw = now - self._last_tick
             dt = min(raw, MAX_TICK_DT_S)
+            scale = self._time_scale
             if raw > MAX_TICK_DT_S:
                 # See MAX_TICK_DT_S: the excess is dropped, never silently.
+                # Counted in SIM seconds: that is the physics that went missing.
                 self._tick_clamped += 1
-                self._tick_lost_s += raw - MAX_TICK_DT_S
+                self._tick_lost_s += (raw - MAX_TICK_DT_S) * scale
             self._last_tick = now
-            for v in self._vehicles.values():
-                self._step_vehicle(v, dt)
-            self._advance_objects(dt)
+            n = max(1, math.ceil(scale))
+            sub = dt * scale / n
+            for _ in range(n):
+                for v in self._vehicles.values():
+                    self._step_vehicle(v, sub)
+                self._advance_objects(sub)
 
     def _step_vehicle(self, v: _Vehicle, dt: float) -> None:
         """Advance ONE vehicle by `dt`, holding the invariant below.
@@ -566,8 +612,9 @@ class FakeAirSim:
             gp = self._objects.get(name)
             if gp is None or route.done or not route.waypoints:
                 continue
+            anchor = route.anchor or self.home_geo
             if route.pos is None:  # first tick, or the object was teleported
-                route.pos = geodetic_to_ned(gp, self.home_geo.geo)
+                route.pos = geodetic_to_ned(gp, anchor.geo)
             cur = route.pos
             tgt = route.waypoints[route.idx]
             dx, dy, dz = tgt.x - cur.x, tgt.y - cur.y, tgt.z - cur.z
@@ -586,7 +633,7 @@ class FakeAirSim:
                 ux, uy, uz = dx / dist, dy / dist, dz / dist
                 route.pos = NedPoint(cur.x + ux * step, cur.y + uy * step,
                                      cur.z + uz * step)
-            self._objects[name] = ned_to_geodetic(route.pos, self.home_geo)
+            self._objects[name] = ned_to_geodetic(route.pos, anchor)
 
     def _update_attitude(self, v: _Vehicle, dt: float) -> None:
         """Derive a smoothed body attitude from the velocity vector.
@@ -965,7 +1012,7 @@ class FakeAirSim:
         actually wants. ``clock_speed`` is AirSim's celestial clock multiplier
         (0.0 freezes the sun). Returns the new sim time.
         """
-        with self._lock:
+        with self._lock, self._clock_lock:
             if datetime_str:
                 self._sim_epoch = _parse_datetime(datetime_str)
             if clock_speed is not None:
@@ -974,13 +1021,65 @@ class FakeAirSim:
                 self._tod_enabled = bool(enabled)
                 if not enabled:
                     self._sim_epoch = _parse_datetime(DEFAULT_SIM_TIME)
-            self._sim_epoch_at = time.monotonic()
+            self._sim_epoch_at = self._clock()
             return self._sim_epoch
 
     def sim_time(self) -> datetime:
-        """M6: current sim datetime (local solar time at home), clock-advanced."""
-        elapsed = (time.monotonic() - self._sim_epoch_at) * self._clock_speed
-        return self._sim_epoch + timedelta(seconds=elapsed)
+        """M6: current sim datetime (local solar time at home), clock-advanced.
+
+        Advances at `clock_speed x time_scale` sim seconds per wall second:
+        the celestial multiplier times the D5 sim speed. `set_time_scale`
+        rebases it, so it is continuous across a speed change.
+        """
+        with self._clock_lock:
+            elapsed = ((self._clock() - self._sim_epoch_at)
+                       * self._clock_speed * self._time_scale)
+            return self._sim_epoch + timedelta(seconds=elapsed)
+
+    # -- D5 sim speed ------------------------------------------------------
+    @property
+    def time_scale(self) -> float:
+        """Sim seconds per wall second (D5), MIN_TIME_SCALE..MAX_TIME_SCALE."""
+        return self._time_scale
+
+    def set_time_scale(self, scale: float) -> float:
+        """D5: run physics, routes and the sun `scale` x faster. Returns the old scale.
+
+        Accepts MIN_TIME_SCALE..MAX_TIME_SCALE (1-10) inclusive, anything else
+        (and a bool, NaN or a non-number) raises ValueError and changes
+        nothing. The celestial clock and `sim_elapsed_s` are rebased at the
+        change, so neither jumps. Datalink timers stay in wall-clock seconds.
+        """
+        try:
+            new = float(scale)
+        except (TypeError, ValueError):
+            raise ValueError(f"time scale must be a number, got {scale!r}") from None
+        # NaN fails the range test; a bool is refused (float(True) is 1.0).
+        if isinstance(scale, bool) or not (MIN_TIME_SCALE <= new <= MAX_TIME_SCALE):
+            raise ValueError(
+                f"time scale must be between {MIN_TIME_SCALE:g} and "
+                f"{MAX_TIME_SCALE:g}, got {scale!r}")
+        with self._lock, self._clock_lock:
+            now = self._clock()
+            prev = self._time_scale
+            self._sim_epoch += timedelta(seconds=(now - self._sim_epoch_at)
+                                         * self._clock_speed * prev)
+            self._sim_epoch_at = now
+            self._elapsed_base_s += (now - self._elapsed_at) * prev
+            self._elapsed_at = now
+            self._time_scale = new
+            return prev
+
+    def sim_elapsed_s(self) -> float:
+        """Sim seconds since this fake was built, at the sim speed (D5).
+
+        Monotonic and continuous across `set_time_scale`; independent of the
+        celestial clock (a frozen or reset sun does not stop it). The wargame
+        engine paces its cycles on it. Memory only.
+        """
+        with self._clock_lock:
+            return (self._elapsed_base_s
+                    + (self._clock() - self._elapsed_at) * self._time_scale)
 
     def sun_position(self, lat: float | None = None,
                      lon: float | None = None) -> tuple[float, float]:
@@ -1176,9 +1275,20 @@ class FakeAirSim:
         """
         if name not in self._objects:
             raise KeyError(f"no spawned object named {name!r}")
-        pts = [geodetic_to_ned(_as_geopoint(w, self.home_geo.geo.altitude),
-                               self.home_geo.geo) for w in waypoints]
-        route = _ObjectRoute(pts, max(0.0, float(speed_mps)), bool(loop))
+        # The route lives in a tangent frame anchored at the OBJECT, pinned
+        # here. Two reasons. The NED <-> geodetic pair is only a local model:
+        # anchored at the sim origin, a convoy 20 km out (a group-3 AO) jumped
+        # 23.7 m sideways and 31 m DOWN on its first routed tick (measured);
+        # anchored at itself it starts exactly where it stands and arrives
+        # within the model's local error. And a pinned frame is what lets
+        # relocate_origin leave the route alone. Waypoints given without an
+        # altitude still default to the home altitude, as before.
+        anchor = HomeGeoPoint.from_geo(self._objects[name])
+        default_alt = self.home_geo.geo.altitude
+        pts = [geodetic_to_ned(_as_geopoint(w, default_alt), anchor.geo)
+               for w in waypoints]
+        route = _ObjectRoute(pts, max(0.0, float(speed_mps)), bool(loop),
+                             anchor=anchor)
         with self._lock:
             self._object_routes[name] = route
         return route
@@ -1201,6 +1311,100 @@ class FakeAirSim:
         route = self._object_routes.get(name)
         if route is not None:
             route.pos = None
+
+    def object_geo(self, name: str) -> tuple[float, float, float] | None:
+        """Ground truth `(lat, lon, alt_hae)` of a spawned object, or None.
+
+        Memory only, under `_lock` (the wargame thread reads it; §3.10). The
+        altitude is HAE, the datum every stored object position uses. None
+        means no object of that name exists (never spawned, or destroyed).
+        """
+        with self._lock:
+            gp = self._objects.get(_s(name))
+        if gp is None:
+            return None
+        return (gp.latitude, gp.longitude, gp.altitude)
+
+    # -- runtime theater (A2; theater_switch.switch step 2b) ---------------
+    def _park(self, v: _Vehicle) -> None:
+        """Put one vehicle on the ground at NED 0: landed, disarmed, idle.
+
+        Caller holds `_lock`. Any running maneuver is marked cancelled so a
+        waiter on it unblocks; the collision flag is cleared (a parked
+        vehicle is serviceable). Heading is kept, like a parked airframe.
+        """
+        if not v.task.done:
+            v.task.cancelled = True
+        v.task = _Task("none", done=True)
+        v.ned = NedPoint(0.0, 0.0, 0.0)
+        v.vel = NedPoint(0.0, 0.0, 0.0)
+        v.air_vel = NedPoint(0.0, 0.0, 0.0)
+        v.landed, v.armed = True, False
+        v.wind_limited = False
+        v.collision = False
+        v.pitch_deg = v.roll_deg = 0.0
+
+    def relocate_origin(self, geo: GeoPoint | HomeGeoPoint) -> dict:
+        """Move the sim's NED origin to `geo` (lat, lon, alt HAE). Returns it.
+
+        The fake's copy of the origin (§4.1.3 step 2b). Under `_lock`, in one
+        step: the origin moves; EVERY vehicle is parked at NED 0 (the new
+        home), landed and disarmed; the GPS-denial last-good fixes and the
+        degraded-link telemetry cache are cleared (both hold old-origin
+        positions). Scene objects keep their lat/lon/alt, which is how they
+        are stored. Routed objects are re-anchored: every route is pinned to
+        the frame its NED waypoints were written in (`set_object_route` pins
+        it at the object; a legacy unpinned route is pinned to the OLD
+        origin here), so a convoy keeps its geodetic path exactly.
+        (Converting its waypoints NED -> geo with the old origin and geo ->
+        NED with the new one was measured at 7,324 km off and 9,273 km
+        underground for Redmond -> Bengaluru, and 38 m off / 48 m low for a
+        25 km move: the points fall below the new origin's tangent plane.)
+
+        The caller (theater_switch) proves every vehicle landed and idle
+        first; this method does not refuse. The return value is the origin in
+        `getHomeGeoPoint`'s shape, for the switch's cross-check.
+        """
+        new = geo.geo if isinstance(geo, HomeGeoPoint) else geo
+        lat, lon, alt = (float(new.latitude), float(new.longitude),
+                         float(new.altitude))
+        if not (math.isfinite(lat) and math.isfinite(lon) and math.isfinite(alt)
+                and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise ValueError(f"origin must be a finite lat/lon/alt, got {new!r}")
+        with self._lock:
+            old = self.home_geo
+            self.home_geo = HomeGeoPoint.from_geo(GeoPoint(lat, lon, alt))
+            for v in self._vehicles.values():
+                self._park(v)
+            for route in self._object_routes.values():
+                if route.anchor is None:
+                    route.anchor = old
+            self._last_good_geo.clear()
+            self._stale_cache.clear()
+            g = self.home_geo.geo
+            return {"latitude": g.latitude, "longitude": g.longitude,
+                    "altitude": g.altitude}
+
+    def park_vehicle(self, name: str) -> dict:
+        """Park one vehicle at home (NED 0): landed, disarmed, collision cleared.
+
+        Used to revive a vehicle (Phase B). An unknown name raises KeyError
+        rather than minting a vehicle (a spawned object is not one either).
+        Its GPS-denial fix and degraded-link cache entries are dropped.
+        """
+        key = _s(name) or "Drone1"
+        with self._lock:
+            v = self._vehicles.get(key)
+            if v is None or key in self._objects:
+                raise KeyError(f"no vehicle named {key!r}")
+            self._park(v)
+            self._last_good_geo.pop(key, None)
+            self._stale_cache.pop(f"state:{key}", None)
+            self._stale_cache.pop(f"gps:{key}", None)
+            g = self.home_geo.geo
+            return {"vehicle": key, "latitude": g.latitude,
+                    "longitude": g.longitude, "altitude": g.altitude,
+                    "landed": True}
 
     def environment(self) -> dict:
         """One-call environment summary (INTREP 'sensor conditions', PLAN 4.7)."""
@@ -1232,6 +1436,8 @@ class FakeAirSim:
             # outruns the airframe is exactly how an RTB fails to reach home.
             "sim_tick_clamped": self._tick_clamped,
             "sim_time_lost_s": round(self._tick_lost_s, 3),
+            # D5 sim speed: sim seconds per wall second (1.0 = real time).
+            "time_scale": self._time_scale,
         }
 
     def _reported_geo(self, v: _Vehicle) -> GeoPoint:

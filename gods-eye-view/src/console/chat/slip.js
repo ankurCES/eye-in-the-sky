@@ -19,7 +19,14 @@
  *
  * model: { approval, assessment, vehicle, before, queue:{index,total},
  *          conflicts:[{title}], caveats:[str], detections:{ok, at_ms}|null,
+ *          fleet:[vehicle facts + busy] (theater and speed slips),
  *          now, reducedMotion }
+ *
+ * Deny-only (WG spec §3.6, §4.2.1, §4.2.2): an unknown approval class, a
+ * theater or speed slip whose preview is missing or incomplete, or one that
+ * is blocked (a failing check, or `assessment.theater.ok === false`) shows
+ * only [Deny], with the reason on a line above it. No Approve element exists.
+ * `denyOnlyOf(approval, assessment)` is the single decision point.
  * deps:  { decide(decision, note) → Promise, revalidate() → assessment,
  *          announce(text, {assertive}), clock:{setTimeout, clearTimeout, now},
  *          raf, caf, ResizeObserver, getRect(el), doc }
@@ -36,6 +43,7 @@ import {
   approveVerb,
   bidiSafe,
   capitalize,
+  classApprovable,
   classMeta,
   coord,
   countdown,
@@ -56,6 +64,22 @@ import {
 } from './format.js';
 import { grantOffered, grantScopeOf } from './reducer.js';
 import { staleSummary } from './validate.js';
+import {
+  unknownDenyNote,
+  unknownInfoNodes,
+  unknownLine,
+} from './slipUnknown.js';
+import {
+  PREVIEW_MISSING,
+  blockedLine,
+  isPreviewTool,
+  previewProblem,
+} from './validateTheater.js';
+import {
+  theaterInfoNodes,
+  theaterPlace,
+  timeScaleInfoNodes,
+} from './slipTheater.js';
 
 // Titles, summaries, consequences and args carry analyst- and map-sourced
 // text: no bidi control reaches the slip (see format.js stripBidi).
@@ -172,7 +196,7 @@ export function filedText(approval) {
       if (a.scope === 'session') {
         return `Approved by you${at}, with ${grantPhrase(a)} allowed until you start a new session.`;
       }
-      return `Approved by you${at}. ${a.title}${vehicle ? `, ${vehicle}` : ''}.`;
+      return `Approved by you${at}. ${a.title}${filedObject(a, vehicle)}.`;
     case 'denied':
       return `Denied by you${at}.${a.note ? ` Your note: “${a.note}”` : ''}`;
     case 'expired': {
@@ -196,6 +220,43 @@ export function filedText(approval) {
     default:
       return '';
   }
+}
+
+/** What a filed approval acted on: the vehicle, the theater or the speed. */
+function filedObject(a, vehicle) {
+  if (a.tool === 'sim_set_theater') {
+    const place = theaterPlace(a);
+    return place ? `, ${place}` : '';
+  }
+  if (a.tool === 'sim_set_time_scale') {
+    const to = a.args?.scale ?? a.timeScalePreview?.to;
+    return isNum(to) ? `, ×${to}` : '';
+  }
+  return vehicle ? `, ${vehicle}` : '';
+}
+
+/**
+ * Why a slip can only be denied, or null (WG spec §3.6, §4.2.1, §4.2.2):
+ * an unknown class, a missing or incomplete preview, or a blocked theater or
+ * speed change. A Deny-only slip has no Approve element in the DOM.
+ * @returns {{kind:'unknown'|'preview'|'blocked', line:string, note:string|null}|null}
+ */
+export function denyOnlyOf(approval, assessment) {
+  const a = approval || {};
+  if (!classApprovable(a.klass)) {
+    return {
+      kind: 'unknown',
+      line: unknownLine(a.rawClass),
+      note: unknownDenyNote(a.rawClass),
+    };
+  }
+  if (a.klass === 'sim' && isPreviewTool(a.tool)) {
+    if (previewProblem(a))
+      return { kind: 'preview', line: PREVIEW_MISSING, note: null };
+    const line = blockedLine(a, assessment);
+    if (line) return { kind: 'blocked', line, note: null };
+  }
+  return null;
 }
 
 const FILED_ICON = {
@@ -433,7 +494,7 @@ function table(rows, head = null) {
                 {},
                 ...(Array.isArray(cell) ? cell : [cell]).map((part) =>
                   typeof part === 'string' &&
-                  /^(Estimated|Measured|Assumed|Requested)$/.test(part)
+                  /^(Estimated|Measured|Assumed|Requested|Mapped)$/.test(part)
                     ? tag(part)
                     : part,
                 ),
@@ -575,6 +636,12 @@ export function createSlip(initialModel, deps = {}) {
     role: 'alert',
     hidden: true,
   });
+  // The reason a slip is Deny-only (unknown class, missing preview, blocked).
+  const denyLineEl = h('p', {
+    class: 'ic-slip__blocked ic-slip__denyonly',
+    role: 'note',
+    hidden: true,
+  });
   const actionsEl = h('div', { class: 'ic-slip__actions' });
   const policyEl = h('p', { class: 'ic-slip__policy' });
   const pendingEl = h(
@@ -586,6 +653,7 @@ export function createSlip(initialModel, deps = {}) {
     grantEl,
     ackEl,
     errorEl,
+    denyLineEl,
     actionsEl,
     policyEl,
   );
@@ -612,8 +680,12 @@ export function createSlip(initialModel, deps = {}) {
   let buttons = [];
 
   // ---- arming ----
-  const needsAck = () =>
-    model.approval.klass === 'safety_override' && ackBox.checked !== true;
+  const ackOffered = () =>
+    classApprovable(model.approval.klass) &&
+    (model.approval.klass === 'safety_override' ||
+      model.approval.acknowledgeRequired === true);
+  const needsAck = () => ackOffered() && ackBox.checked !== true;
+  const denyOnly = () => denyOnlyOf(model.approval, model.assessment);
   const isPending = () =>
     !filed &&
     (model.approval.state === 'pending' || model.approval.state === 'deciding');
@@ -746,9 +818,15 @@ export function createSlip(initialModel, deps = {}) {
 
   function attemptApprove() {
     if (!isPending() || deciding || !armed || needsAck()) return;
+    // A Deny-only slip never approves, even if a stale button were pressed.
+    if (denyOnly()) return;
     if (typeof deps.revalidate === 'function') {
       const fresh = deps.revalidate();
-      if (fresh && fresh.state !== model.assessment?.state) {
+      if (
+        fresh &&
+        (fresh.state !== model.assessment?.state ||
+          denyOnlyOf(model.approval, fresh) != null)
+      ) {
         model = { ...model, assessment: fresh };
         render(true);
         startArming();
@@ -874,6 +952,18 @@ export function createSlip(initialModel, deps = {}) {
       ? 'Approve and allow for session'
       : approveVerb(a.tool, a.klass);
     const list = [];
+    const only = denyOnly();
+    if (only) {
+      // Deny-only: no Approve element exists in the DOM (WG spec §4.2.1).
+      list.push(
+        makeButton('deny', denyLabel(), {
+          primary: true,
+          action: 'deny',
+          preset: only.note,
+        }),
+      );
+      return { v: 'deny_only', list };
+    }
     if (v === 'failed') {
       list.push(
         makeButton('deny', 'Deny and re-plan', {
@@ -921,7 +1011,8 @@ export function createSlip(initialModel, deps = {}) {
     const a = model.approval;
     const v = slipVariant(a, model.assessment);
     const offered = grantOffered(a) && grantBox.checked === true;
-    const key = `${v}|${offered}|${noteText() ? 1 : 0}`;
+    const only = denyOnly();
+    const key = `${v}|${offered}|${noteText() ? 1 : 0}|${only ? only.kind : ''}`;
     if (!force && key === variant) return;
     const focusedAction = buttons.find((b) => doc?.activeElement === b.el);
     variant = key;
@@ -1245,6 +1336,23 @@ export function createSlip(initialModel, deps = {}) {
 
   function infoNodes() {
     const a = model.approval;
+    // Unknown class: only what the server sent, as text (WG spec §4.2.1).
+    if (!classApprovable(a.klass))
+      return unknownInfoNodes(a, { h, segmentNodes });
+    if (a.klass === 'sim' && isPreviewTool(a.tool)) {
+      const ctx = {
+        approval: a,
+        fleet: Array.isArray(model.fleet) ? model.fleet : [],
+        assessment: model.assessment,
+        tag,
+        table,
+        now: model.now,
+        rightNow: rightNowLine,
+      };
+      return a.tool === 'sim_set_theater'
+        ? theaterInfoNodes(ctx)
+        : timeScaleInfoNodes(ctx);
+    }
     const vehicle = approvalVehicle(a);
     const nodes = [];
     const summary = segmentNodes(a.summary);
@@ -1335,11 +1443,15 @@ export function createSlip(initialModel, deps = {}) {
         );
       }
     }
-    const override = a.klass === 'safety_override';
-    setHidden(ackEl, !override);
-    if (override) setText(ackTextEl, ackCopy(a.tool, vehicle));
-    setText(policyEl, policyLine(a.klass));
-    setHidden(policyEl, !policyLine(a.klass));
+    const ack = ackOffered();
+    setHidden(ackEl, !ack);
+    if (ack) setText(ackTextEl, ackCopy(a.tool, vehicle));
+    const policy = policyLine(a.klass, a.tool);
+    setText(policyEl, policy);
+    setHidden(policyEl, !policy);
+    const only = denyOnly();
+    setText(denyLineEl, only ? only.line : '');
+    setHidden(denyLineEl, !only);
     const err = a.error
       ? `Couldn't send your decision: ${a.error}. Try again.`
       : '';
@@ -1383,7 +1495,11 @@ export function createSlip(initialModel, deps = {}) {
         model.approval.summary,
         model.approval.consequences,
         model.approval.dry_run,
+        model.approval.theaterPreview,
+        model.approval.timeScalePreview,
+        model.approval.rawClass,
         model.assessment,
+        model.fleet,
         model.vehicle,
         model.before,
         model.conflicts,
@@ -1476,7 +1592,7 @@ export function createSlip(initialModel, deps = {}) {
       // ⌘Enter in the note field DENIES with the note. It never approves.
       event.preventDefault?.();
       event.stopPropagation?.();
-      if (!event.repeat) decide('deny');
+      if (!event.repeat) decide('deny', denyOnly()?.note ?? null);
     }
   });
   noteField.addEventListener('input', () => renderButtons());

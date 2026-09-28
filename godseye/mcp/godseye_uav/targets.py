@@ -582,12 +582,21 @@ def match_ob(name: str) -> tuple[ObClass, dict]:
 
     Returns (entry, match_evidence). match_evidence cites the exact token
     sequence that justified the classification, so a SALUTE can say *why*.
+
+    An auto-labelled spawn is named `{ob_class}_{seq}` (e.g.
+    `sam_short_range_7`). When that prefix is an OB key it wins over a
+    keyword match that disagrees ("explicit ob_class key (sequence suffix)"),
+    so the perceived class equals the spawned one: 5 of 34 classes used to
+    come out as a neighbour with a different envelope (D7 #6). When the
+    keyword match already agrees, its evidence is returned unchanged.
     """
     raw = (name or "").strip()
     key = raw.lower().replace("-", "_").replace(" ", "_")
     if key in OB_LIBRARY:                      # explicit OB class key
         return OB_LIBRARY[key], {"matched": key, "rule": "explicit ob_class key",
                                  "specificity": 1.0}
+    seq = re.fullmatch(r"(.+)_\d+", key)
+    seq_key = seq.group(1) if seq and seq.group(1) in OB_LIBRARY else None
     toks = _tokens(raw)
     best: ObClass | None = None
     best_rank: tuple[int, int] = (0, 0)
@@ -600,6 +609,10 @@ def match_ob(name: str) -> tuple[ObClass, dict]:
             rank = (len(kwt), len(kw))
             if rank > best_rank:
                 best, best_rank, best_kw = entry, rank, kw
+    if seq_key is not None and (best is None or best.key != seq_key):
+        return OB_LIBRARY[seq_key], {"matched": seq_key,
+                                     "rule": "explicit ob_class key (sequence suffix)",
+                                     "specificity": 1.0}
     if best is None:
         return UNCLASSIFIED, {"matched": None, "rule": "no order-of-battle cue in name",
                               "specificity": 0.0, "tokens": toks}

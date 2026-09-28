@@ -566,3 +566,77 @@ def test_replay_reports_no_mismatch_when_the_closing_row_is_honest(tmp_path):
         report = reopened.replay()
         assert report.tasks == []
         assert report.state_event_mismatches == []
+
+
+# ------------------------- journal rows carry the theater (WG §4.1.4, A5)
+
+
+def test_replay_copies_the_task_theater_into_fields(tmp_path):
+    """The boot re-gate aborts work planned in another theater, so replay
+    must say which theater each interrupted task was journaled in."""
+    with Store(tmp_path) as store:
+        handle = {"task_id": "t-dyn", "tool": "uav_fly_route",
+                  "vehicle": "Drone1", "state": "queued"}
+        store.log_task(handle, "submitted", theater="dyn-x", theater_epoch=3,
+                       params={"waypoints": [{"lat": 1.0, "lon": 2.0,
+                                              "alt_m": 60.0}],
+                               "speed_mps": 8.0})
+        store.log_fuel("Drone1", 70.0, "cruise", bingo_fuel_pct=25.0)
+    with Store(tmp_path) as reopened:
+        rec = reopened.replay().tasks[0]
+    assert rec.fields["theater"] == "dyn-x"
+    assert rec.fields["state"] == "queued"
+    assert rec.as_dict()["fields"]["theater"] == "dyn-x"
+
+
+def test_the_theater_survives_a_later_row_that_omits_it(tmp_path):
+    """The queue's own "started" row carries no theater; the fold keeps the
+    one journaled on submit, and a newer row's value wins."""
+    with Store(tmp_path) as store:
+        handle = {"task_id": "t1", "tool": "uav_goto_gps",
+                  "vehicle": "Drone1", "state": "queued"}
+        store.log_task(handle, "submitted", theater="default",
+                       params={"lat": 1.0, "lon": 2.0, "alt_m": 60.0})
+        store.log_task({**handle, "state": "executing"}, "started")
+        other = {"task_id": "t2", "tool": "uav_goto_gps",
+                 "vehicle": "Drone1", "state": "queued"}
+        store.log_task(other, "submitted", theater="default",
+                       params={"lat": 1.0, "lon": 2.0, "alt_m": 60.0})
+        store.log_task({**other, "state": "executing"}, "resumed",
+                       theater="dyn-y")
+        store.log_fuel("Drone1", 70.0, "cruise", bingo_fuel_pct=25.0)
+        report = store.replay()
+    by_id = {r.id: r for r in report.tasks}
+    assert by_id["t1"].fields["theater"] == "default"
+    assert by_id["t1"].fields["state"] == "executing"
+    assert by_id["t2"].fields["theater"] == "dyn-y"
+
+
+def test_a_legacy_row_replays_with_no_theater_and_the_same_decision(tmp_path):
+    """Rows journaled before the field existed say None, never a guess; the
+    resume-or-abort verdict is untouched by the new field."""
+    with Store(tmp_path) as store:
+        _interrupt(store)
+        store.log_fuel("Drone1", 70.0, "cruise", bingo_fuel_pct=25.0)
+        report = store.replay()
+    rec = report.tasks[0]
+    assert rec.fields == {"state": "executing", "mission_id": None,
+                          "theater": None}
+    assert rec.decision == RESUME
+
+
+def test_replay_copies_the_mission_theater_into_fields(tmp_path):
+    with Store(tmp_path) as store:
+        store.log_mission("m1", "started", vehicle="Drone1",
+                          kind="recon_route", theater="dyn-x",
+                          theater_epoch=2)
+        store.log_mission("m2", "started", vehicle="Drone1",
+                          kind="grid_search")                 # legacy row
+        store.log_fuel("Drone1", 80.0, "cruise", bingo_fuel_pct=25.0)
+        report = store.replay()
+    by_id = {m.id: m for m in report.missions}
+    assert by_id["m1"].fields["theater"] == "dyn-x"
+    assert by_id["m1"].fields["kind"] == "recon_route"
+    assert by_id["m2"].fields["theater"] is None
+    assert by_id["m2"].fields["kind"] == "grid_search"
+    assert all(m.decision == RESUME for m in report.missions)

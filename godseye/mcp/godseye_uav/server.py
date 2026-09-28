@@ -247,6 +247,36 @@ REAL_DATA_ENV = "GODSEYE_REAL_DATA"
 REAL_DATA_TRUE = frozenset({"1", "true", "yes", "on", "enable", "enabled"})
 REAL_DATA_FALSE = frozenset({"", "0", "false", "no", "off", "disable", "disabled"})
 
+#: WG §4.1.5: `real_data="direct"` / `GODSEYE_REAL_DATA=direct` hydrates the
+#: safety loop straight from Re:Earth and Open-Meteo, with no GEV proxy.
+REAL_DATA_DIRECT = "direct"
+
+#: WG §3.10/R25: the on-demand geodata switch (geocoding, mapped sites and
+#: proposal ground samples), separate from hydration (`srv.real`). Unset = OFF.
+GEODATA_ENV = "GODSEYE_GEODATA"
+
+#: WG §4.1.6: the shortest pause between two safety-monitor passes. At sim
+#: speed xN the pass interval is `interval_s / N`, never below this.
+MONITOR_MIN_SLEEP_S = 0.05
+
+#: WG §4.1.9 #9: the safety monitor re-lists the sim's vehicles every this many
+#: passes and unions the answer with the names it already ticks, so a drone
+#: created after boot is monitored within this many passes.
+ROSTER_REFRESH_PASSES = 20
+
+#: WG §4.1.4: resumable tools the boot re-gate lets through with no route
+#: gate (`_resume_route` returns no waypoints): none moves the aircraft
+#: across the AO.
+RESUME_NO_GATE_TOOLS = frozenset({"uav_takeoff", "uav_land", "uav_hover"})
+
+#: WG §3.10 `_submit` guard messages (one sentence each; the UI shows them).
+SWITCH_RUNNING_MESSAGE = "A theater switch is running; plan again when it finishes."
+THEATER_CHANGED_MESSAGE = "The theater changed after this plan was checked; plan again."
+#: Commands that never use the NED origin (they hold or descend in place), so
+#: they pass the `theater_integrity` refusal: an operator can always land
+#: (review A). Everything that flies somewhere is still refused.
+INTEGRITY_EXEMPT_TOOLS = frozenset({"uav_land", "uav_hover"})
+
 #: `alt_agl_m` came from MEASURED terrain under the aircraft.
 AGL_SOURCE_TERRAIN = "terrain:gev"
 #: `alt_agl_m` is the pre-existing height above the LAUNCH DATUM — the NED
@@ -468,6 +498,8 @@ def resolve_real_data(spec: Any) -> Any:
       as-is, which is how the tests inject a recorded, offline fetch;
     * `True` — build the default client on `GODSEYE_GEV_ORIGIN`;
     * `False` — OFF, whatever the environment says;
+    * `"direct"` — the default client in direct mode (Re:Earth + Open-Meteo,
+      no GEV proxy; WG §4.1.5), as is `GODSEYE_REAL_DATA=direct`;
     * `None` — read `GODSEYE_REAL_DATA`, defaulting to OFF.
 
     An environment value that is neither truthy nor falsey raises. It would
@@ -478,7 +510,8 @@ def resolve_real_data(spec: Any) -> Any:
     """
     if spec is False:
         return None
-    if spec is not None and spec is not True:
+    direct = isinstance(spec, str) and spec.strip().lower() == REAL_DATA_DIRECT
+    if spec is not None and spec is not True and not direct:
         if not hasattr(spec, "terrain"):
             raise ValueError(
                 f"real_data={spec!r} is neither a RealWorldData client nor a "
@@ -493,10 +526,12 @@ def resolve_real_data(spec: Any) -> Any:
         value = raw.strip().lower()
         if value in REAL_DATA_FALSE:
             return None
-        if value not in REAL_DATA_TRUE:
+        direct = value == REAL_DATA_DIRECT
+        if value not in REAL_DATA_TRUE and not direct:
             raise ValueError(
                 f"{REAL_DATA_ENV}={raw!r} is not a recognised switch; use one "
-                f"of {sorted(REAL_DATA_TRUE)} or {sorted(REAL_DATA_FALSE - {''})}. "
+                f"of {sorted(REAL_DATA_TRUE)}, {REAL_DATA_DIRECT!r} or "
+                f"{sorted(REAL_DATA_FALSE - {''})}. "
                 "It is refused rather than read as 'off', because a typo that "
                 "silently disables real-world data is indistinguishable from "
                 "having it.")
@@ -505,7 +540,43 @@ def resolve_real_data(spec: Any) -> Any:
     # No instance-wide fallback ground plane: with none, an unknown terrain
     # height comes back None and FLAGGED instead of a plausible-looking number,
     # and the AGL consumer falls back to the launch datum *visibly*.
+    if direct:
+        return realdata.default_client(fallback_ground_msl_m=None, direct=True)
     return realdata.default_client(fallback_ground_msl_m=None)
+
+
+def resolve_geodata(spec: Any) -> bool:
+    """Turn the `geodata=` constructor switch into a bool (WG §3.10, R25).
+
+    `True`/`False` (or "on"/"off") win; `None` reads `GODSEYE_GEODATA` and
+    defaults to OFF, so in-process tests and the legacy launcher never reach a
+    geocoder. An unrecognised value RAISES, for the same reason
+    `resolve_real_data` does: a typo that silently turns map data off is
+    indistinguishable from having it off on purpose.
+    """
+    if isinstance(spec, bool):
+        return spec
+    if spec is None:
+        import os
+
+        raw = os.environ.get(GEODATA_ENV)
+        if raw is None:
+            return False
+        name, value = f"{GEODATA_ENV}={raw!r}", raw.strip().lower()
+    elif isinstance(spec, str):
+        name, value = f"geodata={spec!r}", spec.strip().lower()
+    else:
+        raise ValueError(f"geodata={spec!r} is neither a bool nor 'on'/'off'")
+    if value in REAL_DATA_TRUE:
+        return True
+    if value in REAL_DATA_FALSE:
+        return False
+    raise ValueError(
+        f"{name} is not a recognised switch; use one of {sorted(REAL_DATA_TRUE)} "
+        f"or {sorted(REAL_DATA_FALSE - {''})}")
+
+
+_resolve_geodata = resolve_geodata
 
 
 def error(code: str, message: str, retryable: bool = False, **extra: Any) -> dict:
@@ -737,6 +808,48 @@ class UavBackend:
         """NED -> (lat, lon, alt_HAE). The origin altitude is HAE, so this is."""
         geo = ned_to_geodetic(NedPoint(n, e, d), self.home)
         return geo.latitude, geo.longitude, geo.altitude
+
+    # ---- runtime theater (WG §3.10, §4.1.3 step 2c) ----
+    def relocate(self, new_home: GeoPoint, fix: Any) -> None:
+        """Move this backend's copy of the NED origin to `new_home` (HAE).
+
+        `fix` is the `geo.AltitudeFix` the switch computed ONCE for this
+        activation (T1): nothing is converted here. `home_declared` becomes the
+        HAE point too, so a later reader never re-applies the geoid. The four
+        fields are replaced from locals, so a telemetry read in flight sees the
+        old origin or the new one, never a half-moved one. A non-finite or
+        out-of-range point raises and leaves the old origin in place (the
+        switch's cross-check then fails loudly).
+        """
+        lat, lon = float(new_home.latitude), float(new_home.longitude)
+        alt = float(new_home.altitude)
+        if not (math.isfinite(lat) and math.isfinite(lon) and math.isfinite(alt)
+                and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise ValueError(
+                f"relocate needs a finite WGS84 point, got ({lat}, {lon}, {alt})")
+        geo = GeoPoint(lat, lon, alt)
+        home = HomeGeoPoint.from_geo(geo)
+        self.home_declared = geo
+        self.home_fix = fix
+        self.home_geo = geo
+        self.home = home
+
+    async def home_rpc(self) -> GeoPoint:
+        """The origin as the SIM reports it (`getHomeGeoPoint`), HAE.
+
+        The switch's step 2e compares this with every in-process copy: the
+        in-process copies agreeing with each other proves nothing if the
+        simulator itself is somewhere else.
+        """
+        raw = await self._call(self.client.getHomeGeoPoint)
+
+        def pick(key: str) -> float:
+            value = raw.get(key) if isinstance(raw, dict) else getattr(raw, key, None)
+            if value is None:
+                raise RuntimeError(f"getHomeGeoPoint carried no {key}: {raw!r}")
+            return float(value)
+
+        return GeoPoint(pick("latitude"), pick("longitude"), pick("altitude"))
 
     def _thread_client(self):
         c = getattr(self._local, "client", None)
@@ -1330,6 +1443,8 @@ class GodseyeUavServer:
         lost_link_plan: LostLinkPlan | dict | None = None,
         real_data: Any = None,
         public_url: str | None = None,
+        airframe: Any = None,
+        geodata: Any = None,
     ):
         self.backend = backend
         self.store = store
@@ -1368,6 +1483,7 @@ class GodseyeUavServer:
                     f"envelope home is {off_m / 1000.0:.1f} km from theater "
                     f"{self.theater.id!r}'s home",
                     **self.theater_mismatch)
+        self._init_switch_hooks(airframe=airframe, geodata=geodata)
         self.lost_link_plan = (lost_link_plan if isinstance(lost_link_plan, LostLinkPlan)
                                else LostLinkPlan.from_dict(lost_link_plan))
         self.monitors: dict[str, SafetyMonitor] = {}
@@ -1443,6 +1559,9 @@ class GodseyeUavServer:
         self._monitor_task: Any = None
         self._monitor_stop = threading.Event()
         self._monitor_errors: list[str] = []
+        #: Safety-monitor passes started by the current `_monitor_loop` (the
+        #: roster refresh cadence, D7 #9).
+        self._monitor_passes = 0
         # ---- real-world data (REAL_DATA_INTEGRATION.md) ----
         #: The ingestion client, or None when the layer is OFF. Resolved before
         #: the tools are registered so their descriptions can say which it is.
@@ -1478,6 +1597,7 @@ class GodseyeUavServer:
         #: is replaced there by the address actually being served.
         self._public_url_pinned = public_url is not None
         self._register_tools()
+        self._register_theater_tools()
         self._register_resources()
         # T4c: restart = replay -> resume-or-abort-and-RTH. Runs at boot so the
         # decision exists before the first command is accepted.
@@ -1506,7 +1626,9 @@ class GodseyeUavServer:
     def monitor_for(self, vehicle: str) -> SafetyMonitor:
         mon = self.monitors.get(vehicle)
         if mon is None:
-            fm = FuelModel()
+            # WG §4.1.6: a new monitor prices the theater's airframe and
+            # inherits the current sim speed.
+            fm = FuelModel(airframe=self.airframe_id, time_scale=self.time_scale)
             fm.home = self.envelope.home
             mon = SafetyMonitor(envelope=self.envelope, fuel=fm,
                                 link=self._new_link_monitor())
@@ -1519,6 +1641,153 @@ class GodseyeUavServer:
     @property
     def fuels(self) -> dict[str, FuelModel]:
         return {v: m.fuel for v, m in self.monitors.items()}
+
+    # ---------------------------------------------------------------- #
+    # Runtime theater and sim-speed hooks (WG §3.10; A6a)               #
+    # ---------------------------------------------------------------- #
+
+    def _init_switch_hooks(self, *, airframe: Any, geodata: Any) -> None:
+        """The state a runtime theater switch (`theater_switch.switch`) and
+        sim speed need. Called from `__init__` once the theater is resolved
+        and before anything builds a fuel model."""
+        from . import safety as _safety
+
+        #: Guards `_switching` and the wargame starting/active flips, and is
+        #: held across `_submit`'s check-and-queue so no command can slip in
+        #: between a switch starting and the queue being checked.
+        self._mode_lock = threading.Lock()
+        #: Set for the whole switch; `tick_once` and `_submit` refuse under it.
+        self._switching = threading.Event()
+        #: `tick_once` bodies in flight; `wait_ticks_idle` drains it.
+        self._ticks_inflight = 0
+        self._ticks_lock = threading.Lock()
+        #: Bumped by every switch; the host may restore it (§4.1.4).
+        self.theater_epoch: int = 0
+        self.theater_set_at_ms: int | None = None
+        self.theater_set_via: str | None = None      # "console" | "mcp" | "boot"
+        self.theater_previous: dict | None = None    # {id, label}
+        #: Non-None after a failed origin cross-check: every `_submit` but
+        #: land and hover refuses, and `_enforce` flies nothing.
+        self.theater_integrity_error: str | None = None
+        #: Vehicles whose enforcement the latch has suppressed (audited once).
+        self._enforce_suspended: set[str] = set()
+        #: Every other copy of the NED origin: `.relocate(GeoPoint)`, `.home_geo`.
+        self.origin_holders: list = []
+        #: `Callable[[dict], None]`, run after a switch; the app host adds one.
+        self.theater_listeners: list = []
+        #: Set by restart recovery when it finishes (A6b); a switch waits for it.
+        self.boot_recovery_done = threading.Event()
+        #: The airframe every new fuel model prices (D5); a switch may change it.
+        self.airframe_id: str = _safety.get_airframe(airframe).id
+        #: Sim seconds per wall second (D5); `set_time_scale` is the only writer.
+        self.time_scale: float = 1.0
+        #: On-demand geodata (geocoding, sites, ground samples), R25.
+        self.geodata_enabled: bool = resolve_geodata(geodata)
+        #: Measured wall period of the last safety-monitor pass.
+        self.monitor_period_s: float = DEFAULT_TICK_S
+        self.geo_cache = self._build_geo_cache()
+        self.sites = self._cached_sites()
+
+    def _build_geo_cache(self) -> Any:
+        """The shared geodata cache: `<store>/geodata-cache`, memory-only for
+        an in-memory store (§4.1.5 wiring)."""
+        from . import geo_http
+
+        root = getattr(self.store, "root", None)
+        return geo_http.default_cache(None if root is None else root / "geodata-cache")
+
+    def _cached_sites(self) -> Any:
+        """Mapped sites for the current theater from the cache ONLY (never the
+        network). With geodata off, an empty set saying so."""
+        from . import sites as _sites
+
+        bbox = self.theater.bbox()
+        if not self.geodata_enabled:
+            return _sites.empty_set(_sites.GEODATA_OFF_REASON, bbox=bbox)
+        return _sites.cached_sites(bbox, cache=self.geo_cache)
+
+    def _register_theater_tools(self) -> None:
+        """`theater_tools.register(self)`: the 5 Phase A tools (A7).
+
+        Until that module is merged only its OWN absence is tolerated; any
+        other import error inside it propagates.
+        """
+        import importlib
+
+        name = f"{__package__}.theater_tools"
+        try:
+            theater_tools = importlib.import_module(name)
+        except ModuleNotFoundError as exc:
+            if exc.name != name:
+                raise
+            return
+        theater_tools.register(self)
+
+    def attach_origin_holder(self, holder: Any) -> None:
+        """Add another copy of the NED origin a switch must move (§4.1.3 2d).
+
+        `holder` has `.relocate(GeoPoint)` and `.home_geo -> GeoPoint`. It is
+        refused if it lacks either, rather than failing mid-switch.
+        """
+        if not callable(getattr(holder, "relocate", None)) or not hasattr(holder, "home_geo"):
+            raise TypeError("an origin holder needs .relocate(GeoPoint) and .home_geo")
+        if holder not in self.origin_holders:
+            self.origin_holders.append(holder)
+
+    async def wait_ticks_idle(self, timeout_s: float) -> bool:
+        """Wait until no `tick_once` body is running; False on timeout.
+
+        Polls every 10 ms. The switch sets `_switching` first, so a tick that
+        starts after that returns at once and cannot keep this waiting.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            with self._ticks_lock:
+                if self._ticks_inflight == 0:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.01)
+
+    def set_time_scale(self, scale: float) -> dict:
+        """Run the fake simulator `scale`x faster (D5, §4.1.6). `{scale, previous}`.
+
+        Updates the fake and every monitor's fuel clock; new monitors inherit
+        it. Raises ValueError under real AirSim (no `backend.sim`) or outside
+        1-10, changing nothing. Audited as `time_scale_changed`.
+        """
+        sim = getattr(self.backend, "sim", None)
+        if sim is None:
+            raise ValueError(
+                "real AirSim: sim speed is set by the simulator's own "
+                "ClockSpeed; runtime sim speed is only supported on the fake")
+        previous = float(sim.set_time_scale(scale))
+        new = float(sim.time_scale)
+        self.time_scale = new
+        for mon in self.monitors.values():
+            mon.fuel.time_scale = new
+        self.store.log_audit("time_scale_changed", f"sim speed x{previous:g} -> x{new:g}",
+                             scale=new, previous=previous)
+        return {"scale": new, "previous": previous}
+
+    def _submit_refusal(self, gate_epoch: int | None, tool: str | None = None) -> dict | None:
+        """The `_submit` guards (§3.10), checked under `_mode_lock`.
+
+        `tool` in `INTEGRITY_EXEMPT_TOOLS` (land, hover) passes the
+        `theater_integrity` refusal: neither uses the origin (review A).
+        """
+        if self._switching.is_set():
+            return {"rejected": True, "error": "theater_changed",
+                    "message": SWITCH_RUNNING_MESSAGE}
+        if self.theater_integrity_error and tool not in INTEGRITY_EXEMPT_TOOLS:
+            return {"rejected": True, "error": "theater_integrity",
+                    "message": ("The simulation origin failed its cross-check, so "
+                                "no command is accepted until a restart: "
+                                f"{self.theater_integrity_error}")}
+        if gate_epoch is not None and gate_epoch != self.theater_epoch:
+            return {"rejected": True, "error": "theater_changed",
+                    "message": THEATER_CHANGED_MESSAGE}
+        return None
 
     # ---------------------------------------------------------------- #
     # Real-world data (REAL_DATA_INTEGRATION.md)                        #
@@ -1908,14 +2177,21 @@ class GodseyeUavServer:
             raise RuntimeError(
                 "the real-world data layer is OFF on this server; construct it "
                 f"with real_data=True / a client, or set {REAL_DATA_ENV}=1")
+        # §4.1.9 #11: captured BEFORE the blocking fetch; a result for a theater
+        # (or epoch) that is no longer current is dropped, never published.
+        key, theater = self._real_data_key(), self.theater
         try:
-            self.real_world = self.theater.hydrate(
+            result = theater.hydrate(
                 self.real, allow_network=allow_network,
                 floor_clearance_agl_m=self.envelope.min_agl_m)
-            self.real_data_error = None
         except Exception as exc:  # noqa: BLE001 — recorded and surfaced
-            self.real_data_error = f"{type(exc).__name__}: {exc}"
+            if key == self._real_data_key():
+                self.real_data_error = f"{type(exc).__name__}: {exc}"
             raise
+        if not self._publish_real_world(key, result, source="hydrate"):
+            raise RuntimeError(
+                f"the theater changed while real data for {key[0]!r} was "
+                "loading; that result was dropped. Hydrate again.")
         status = self.real_data_status()
         if load_ao_terrain and allow_network:
             # Resident DEM for the AO. Without it the hot path's cached-only
@@ -1988,20 +2264,30 @@ class GodseyeUavServer:
 
     def start_real_data(self, *, interval_s: float = 300.0,
                         load_ao_terrain: bool = True) -> Any:
-        """Hydrate now on a daemon thread, then keep refreshing off every hot path."""
+        """Hydrate now on a daemon thread, then keep refreshing off every hot path.
+
+        §4.1.9 #11: the closure captures `(theater.id, theater_epoch)`, and
+        `publish` drops (audit `real_data_stale_dropped`) any result whose
+        pair is no longer current, so a slow hydration can never land real
+        data for the old area after a theater switch. A refresher already
+        running is stopped first (without waiting), so there is only ever one.
+        """
         if self.real is None:
             return None
         from .realdata import BackgroundRefresher
 
+        self.stop_real_data()
+        key, t = self._real_data_key(), self.theater
+
         def publish(result: Any) -> None:
-            self.real_world = result
-            theaters.set_real_data(self.theater.id, result)
+            if not self._publish_real_world(key, result, source="refresher"):
+                return
             # The AO lattice has to be loaded on THIS path too. Without it the
             # background route hydrates the four feeds and leaves every hot-path
             # terrain read a cache miss — real data that is present and never
             # consulted, which is the defect this whole wave is about. It runs
             # on the refresher's own daemon thread, so it blocks nothing.
-            if load_ao_terrain:
+            if load_ao_terrain and key == self._real_data_key():
                 try:
                     self.prefetch_ao_terrain()
                 except Exception as exc:  # noqa: BLE001 — recorded, loop survives
@@ -2010,18 +2296,50 @@ class GodseyeUavServer:
 
         refresher = BackgroundRefresher(
             self.real, interval_s=interval_s, on_result=publish,
-            theater_id=self.theater.id, home_lat=self.theater.home_lat,
-            home_lon=self.theater.home_lon, bbox=self.theater.bbox(),
-            static_home_msl_m=self.theater.home_alt_msl_m,
-            floor_points=self.theater.terrain_sample_points(),
+            theater_id=t.id, home_lat=t.home_lat,
+            home_lon=t.home_lon, bbox=t.bbox(),
+            static_home_msl_m=t.home_alt_msl_m,
+            floor_points=t.terrain_sample_points(),
             floor_clearance_agl_m=self.envelope.min_agl_m)
         self._real_refresher = refresher.start()
         return self._real_refresher
 
     def stop_real_data(self) -> None:
+        """Stop the background refresher WITHOUT waiting for it (§4.1.9 #11):
+        a hydration in flight finishes on its own daemon thread and its result
+        is dropped by `publish`'s epoch check, so a switch never blocks here."""
         refresher, self._real_refresher = self._real_refresher, None
         if refresher is not None:
-            refresher.stop()
+            refresher.stop(wait=False)
+
+    def _real_data_key(self) -> tuple[str, int]:
+        """What a real-data result must still match to be published."""
+        return (self.theater.id, self.theater_epoch)
+
+    def _publish_real_world(self, key: tuple[str, int], result: Any, *,
+                            source: str) -> bool:
+        """Publish a hydration captured at `key`, or drop it if stale.
+
+        Checked and written under `_mode_lock`, the lock a switch sets
+        `_switching` under, so a result can never be written between a switch
+        starting and the switch clearing `real_world`.
+        """
+        with self._mode_lock:
+            current = (not self._switching.is_set()
+                       and key == self._real_data_key())
+            if current:
+                self.real_world = result
+                self.real_data_error = None
+                theaters.set_real_data(key[0], result)
+            now_key = self._real_data_key()
+        if not current:
+            self.store.log_audit(
+                "real_data_stale_dropped",
+                f"real data for {key[0]} (epoch {key[1]}) finished after the "
+                "theater changed; dropped",
+                theater_id=key[0], epoch=key[1], current_theater_id=now_key[0],
+                current_epoch=now_key[1], source=source)
+        return current
 
     # ---- restart recovery (T4c) ----
     def _boot_replay(self):
@@ -2041,7 +2359,10 @@ class GodseyeUavServer:
             if not rec.vehicle:
                 continue
             action = {"vehicle": rec.vehicle, "decision": rec.decision, "reason": rec.reason,
-                      "kind": rec.kind, "id": rec.id, "tool": rec.tool, "params": rec.params}
+                      "kind": rec.kind, "id": rec.id, "tool": rec.tool, "params": rec.params,
+                      # WG §4.1.4: the theater the work was planned in (None
+                      # for a legacy row); the re-gate aborts a mismatch.
+                      "theater": (rec.fields or {}).get("theater")}
             self.boot_actions.append(action)
         if self.boot_actions:
             self.store.log_audit(
@@ -2053,6 +2374,20 @@ class GodseyeUavServer:
         # `_restore_persisted_state`).
         self.boot_restored = self._restore_persisted_state(report)
         return report
+
+    def _theater_stamp(self) -> dict:
+        """`theater` and `theater_epoch` for a journal row (WG §4.1.4): the
+        boot re-gate aborts resumable work planned in another theater."""
+        return {"theater": self.theater.id, "theater_epoch": self.theater_epoch}
+
+    def _fuel_row(self, record: dict) -> dict:
+        """A fuel journal row's fields (WG §4.1.4, V21): the integrator's
+        record plus the airframe and the theater. `airframe` is the energy
+        model that priced the burn, which is `srv.airframe_id` for every
+        monitor this server builds; the restart restores a row only when it
+        matches (`_restore_fuel`)."""
+        return {**record, "airframe": record.get("airframe") or self.airframe_id,
+                **self._theater_stamp()}
 
     # ---- restart recovery: the LOAD half (T4c / M11 / M12) ----
     def _restore_persisted_state(self, report) -> dict:
@@ -2109,10 +2444,12 @@ class GodseyeUavServer:
 
         Configuration (airframe, rate table, capacity, home, RTB speed) comes
         from the model this process constructed; the flown STATE comes from the
-        row. The one exception is the airframe id, which travels with the
-        state: replaying a burn under a different energy model would re-price
-        every second of it, so a row that names an airframe wins and brings its
-        own rate table with it.
+        row. WG §4.1.4: a row is restored only when its `airframe` is the one
+        this server booted with (`srv.airframe_id`). A row naming another
+        airframe is not re-priced onto this one and does not swap the energy
+        model: the vehicle starts on a full tank, audited as
+        `fuel_restore_airframe_mismatch`. A legacy row with no `airframe` is
+        restored as before, with a note.
 
         A row that will not rebuild is REPORTED and skipped, never swallowed
         and never fatal — same treatment `_restore_intel` gives a track record
@@ -2151,16 +2488,23 @@ class GodseyeUavServer:
                     f"(pre-airframe journal); the configured {state.get('airframe')!r} "
                     "energy model is kept and the recovered burn rate may not "
                     "be the one that was flown")
-            elif airframe != state.get("airframe"):
-                notes.append(
-                    f"journal airframe {airframe!r} != configured "
-                    f"{state.get('airframe')!r}; the JOURNAL's model wins, so "
-                    "the recovered burn is priced by the airframe that flew it")
-                state["airframe"] = airframe
-                # Drop this process's derived numbers so `from_dict` rebuilds
-                # them from the airframe that actually flew.
-                for k in ("rates", "airframe_profile", "capacity_s_cruise"):
-                    state.pop(k, None)
+            elif airframe != self.airframe_id:
+                # WG §4.1.4: the theater's airframe is chosen at boot (the
+                # persisted one, or `--airframe`). A burn flown by another
+                # airframe is not this aircraft's fuel clock, so it is NOT
+                # restored: the vehicle starts on a full tank of the booted
+                # airframe, and the audit trail says why.
+                why = (f"the persisted fuel row was flown by airframe {airframe!r} "
+                       f"but this server runs {self.airframe_id!r}; a burn is not "
+                       "carried across airframes, so the vehicle starts on a full tank")
+                self.store.log_audit(
+                    "fuel_restore_airframe_mismatch", f"{vehicle}: {why}",
+                    vehicle=vehicle, row_airframe=airframe, airframe=self.airframe_id,
+                    row_fuel_pct=row.get("fuel_pct"),
+                    row_bingo_latched=row.get("bingo_latched"))
+                out.append(self._unrestored(vehicle, row, why, absent=absent,
+                                            notes=notes))
+                continue
             latched = row.get("bingo_latched")
             if latched is None:
                 absent.append("bingo_latched")
@@ -2328,31 +2672,178 @@ class GodseyeUavServer:
         }
 
     async def apply_boot_recovery(self) -> list[dict]:
-        """Execute the boot decisions: RTH what is unsafe, resume what is not."""
-        applied: list[dict] = []
-        for vehicle in self.recovery.vehicles():
-            decision = self.recovery.decision_for(vehicle)
-            reasons = self.recovery.reasons_for(vehicle)
-            if decision == ABORT_RTH:
-                handle = await self._force_rtb(
-                    vehicle, reason="restart_recovery",
-                    detail="; ".join(reasons) or "interrupted work at restart")
-                applied.append({"vehicle": vehicle, "decision": ABORT_RTH,
-                                "task": handle, "reasons": reasons})
-                continue
-            for act in self.boot_actions:
-                if act["vehicle"] != vehicle or act["decision"] != RESUME:
+        """Execute the boot decisions: RTH what is unsafe, re-gate and resume
+        what is not (T4c; WG §4.1.4, D7 #1).
+
+        A RESUME is re-checked against the theater this process BOOTED in
+        before anything flies it. Work planned in another theater aborts
+        ("planned in X, booted in Y"); every route runs through `_gate`
+        (geofence and fuel, from where the aircraft is now). Any failure
+        aborts the vehicle with `_force_rtb(vehicle, "restart_recovery")` and
+        a `restart_resume_regate_failed` audit row; a pass submits with the
+        gate's epoch and audits `restart_resume_regated`. A legacy row with no
+        `theater` is re-gated but never aborted for a theater mismatch.
+
+        The `finally` sets `boot_recovery_done` (D7 #12): a theater switch
+        refuses until restart recovery has finished, successfully or not.
+        """
+        try:
+            applied: list[dict] = []
+            for vehicle in self.recovery.vehicles():
+                decision = self.recovery.decision_for(vehicle)
+                reasons = self.recovery.reasons_for(vehicle)
+                if decision == ABORT_RTH:
+                    handle = await self._force_rtb(
+                        vehicle, reason="restart_recovery",
+                        detail="; ".join(reasons) or "interrupted work at restart")
+                    applied.append({"vehicle": vehicle, "decision": ABORT_RTH,
+                                    "task": handle, "reasons": reasons})
                     continue
-                if not act.get("tool") or not act.get("params"):
-                    continue
-                task = self.tasking.submit(vehicle, act["tool"], dict(act["params"]),
-                                           idempotency_key=f"resume:{act['id']}",
-                                           allow_queue=True)
-                self.store.log_task(task.handle(), "resumed", params=task.params,
-                                    recovered_from=act["id"])
-                applied.append({"vehicle": vehicle, "decision": RESUME,
-                                "task": task.handle(), "reasons": reasons})
-        return applied
+                # A mission row carries no params: its route is the task row
+                # recovered alongside it, which is what gets re-gated.
+                acts = [a for a in self.boot_actions
+                        if a["vehicle"] == vehicle and a["decision"] == RESUME
+                        and a.get("tool") and a.get("params")]
+                if acts:
+                    applied.extend(await self._resume_vehicle(vehicle, acts, reasons))
+            return applied
+        finally:
+            self.boot_recovery_done.set()
+
+    async def _resume_vehicle(self, vehicle: str, acts: list[dict],
+                              reasons: list[str]) -> list[dict]:
+        """Re-gate every RESUME action of one vehicle, then submit them all, or
+        abort the vehicle to RTB on the first that fails (WG §4.1.4)."""
+        checked: list[tuple[dict, dict | None]] = []
+        for act in acts:
+            why, gate = await self._regate_resume(vehicle, act)
+            if why is not None:
+                return [await self._abort_resume(vehicle, act, why, gate, reasons)]
+            checked.append((act, gate))
+        out: list[dict] = []
+        for act, gate in checked:
+            epoch = self.theater_epoch if gate is None else gate["theater_epoch"]
+            handle = self._submit(vehicle, act["tool"], dict(act["params"]),
+                                  f"resume:{act['id']}", gate_epoch=epoch,
+                                  allow_queue=True)
+            if handle.get("rejected"):
+                # Nothing was queued for this one; the aircraft is not left
+                # airborne with nobody flying it.
+                out.append(await self._abort_resume(
+                    vehicle, act, str(handle.get("message") or handle.get("error")),
+                    gate, reasons))
+                return out
+            if handle.get("status") == "accepted":
+                self.store.log_task(handle, "resumed",
+                                    params=self._journal_payload(dict(act["params"])),
+                                    recovered_from=act["id"], **self._theater_stamp())
+            self.store.log_audit(
+                "restart_resume_regated",
+                f"{vehicle}: {act['tool']} re-gated in {self.theater.id} and resumed",
+                vehicle=vehicle, tool=act["tool"], recovered_from=act["id"],
+                task_id=handle.get("task_id"), status=handle.get("status"),
+                planned_theater=act.get("theater"), gated=gate is not None,
+                bingo_fuel_pct=None if gate is None else gate.get("bingo_fuel_pct"),
+                **self._theater_stamp())
+            out.append({"vehicle": vehicle, "decision": RESUME, "task": handle,
+                        "reasons": reasons})
+        return out
+
+    async def _regate_resume(self, vehicle: str,
+                             act: dict) -> tuple[str | None, dict | None]:
+        """One RESUME action against the booted theater: (why it fails or
+        None, the gate result or None when there was no route to gate)."""
+        planned, booted = act.get("theater"), self.theater.id
+        if planned is not None and planned != booted:
+            return f"planned in {planned}, booted in {booted}", None
+        try:
+            waypoints, speed = self._resume_route(act["tool"], act["params"])
+        except ValueError as exc:
+            return str(exc), None
+        if not waypoints:
+            return None, None
+        try:
+            gate = await self._gate(vehicle, waypoints, speed)
+        except Exception as exc:  # noqa: BLE001 — a malformed row is ungateable
+            return (f"{act['tool']} could not be re-gated "
+                    f"({type(exc).__name__}: {exc})"), None
+        # Exactly as the tool gates it: an RTH is refused only by the
+        # envelope, never by a fuel shortfall (it is the way home).
+        failed = (bool(gate.get("envelope_violations"))
+                  if act["tool"] == "uav_return_to_home" else not gate.get("ok"))
+        return (self._regate_failure(act["tool"], gate) if failed else None), gate
+
+    def _resume_route(self, tool: str, params: Any) -> tuple[list[dict], float]:
+        """What the boot re-gate checks for one resumable command (WG §4.1.4):
+        `(waypoints, speed)`. No waypoints means there is no route to gate.
+        Raises ValueError for a command that cannot be re-gated."""
+        if not isinstance(params, dict):  # a journal defect, reported like the rest
+            raise ValueError(  # noqa: TRY004 — one error type for "not re-gateable"
+                f"{tool} carries unreadable params; not re-gateable")
+        p = params
+
+        def speed() -> float:
+            try:
+                value = float(p.get("speed_mps") or 10.0)
+            except (TypeError, ValueError):
+                raise ValueError(f"{tool} carries an unreadable speed_mps "
+                                 f"{p.get('speed_mps')!r}; not re-gateable") from None
+            if not math.isfinite(value):
+                raise ValueError(f"{tool} carries a non-finite speed; not re-gateable")
+            return value
+
+        if tool == "uav_fly_route":
+            wps = p.get("waypoints")
+            if not isinstance(wps, list) or not wps:
+                raise ValueError("uav_fly_route carries no waypoints; not re-gateable")
+            return list(wps), speed()
+        if tool == "uav_goto_gps":
+            alt = p.get("alt_agl_m") if p.get("alt_agl_m") is not None else p.get("alt_m")
+            if p.get("lat") is None or p.get("lon") is None or alt is None:
+                raise ValueError("uav_goto_gps carries no complete point; not re-gateable")
+            return [{"lat": p["lat"], "lon": p["lon"], "alt_m": alt}], speed()
+        if tool == "uav_return_to_home":
+            home = self.envelope.home
+            if home is None:
+                raise ValueError("no home configured in the safety envelope; "
+                                 "uav_return_to_home is not re-gateable")
+            return [{"lat": home[0], "lon": home[1], "alt_m": 0.0}], speed()
+        if tool in RESUME_NO_GATE_TOOLS:
+            return [], 0.0
+        raise ValueError(f"{tool} is not re-gateable at restart")
+
+    @staticmethod
+    def _regate_failure(tool: str, gate: dict) -> str:
+        """One sentence for a failed boot re-gate."""
+        if gate.get("error"):
+            detail = str(gate["error"])
+        elif gate.get("envelope_violations"):
+            detail = "envelope " + ", ".join(map(str, gate["envelope_violations"]))
+        elif gate.get("bingo_latched"):
+            detail = "BINGO latched"
+        else:
+            detail = (f"fuel: needs {gate.get('required_pct')}%, "
+                      f"has {gate.get('available_pct')}%")
+        return f"{tool} failed its re-gate ({detail})"
+
+    async def _abort_resume(self, vehicle: str, act: dict, why: str,
+                            gate: dict | None, reasons: list[str]) -> dict:
+        """A RESUME the re-gate refused: forced RTB instead (WG §4.1.4). The
+        recovery record is corrected too, so `uav://safety/geofence` reports
+        the decision actually taken."""
+        act["decision"], act["reason"] = ABORT_RTH, f"restart re-gate: {why}"
+        for rec in self.recovery.interrupted:
+            if rec.id == act["id"] and rec.vehicle == vehicle:
+                rec.decision, rec.reason = ABORT_RTH, act["reason"]
+        self.store.log_audit(
+            "restart_resume_regate_failed",
+            f"{vehicle}: {why}; RTB instead of resuming {act['tool']}",
+            vehicle=vehicle, tool=act["tool"], recovered_from=act["id"],
+            planned_theater=act.get("theater"), booted_theater=self.theater.id,
+            reason=why, gate=gate, theater_epoch=self.theater_epoch)
+        handle = await self._force_rtb(vehicle, reason="restart_recovery", detail=why)
+        return {"vehicle": vehicle, "decision": ABORT_RTH, "task": handle,
+                "reasons": [*reasons, why], "regate_failed": why}
 
     # ---- queue executor (T2): runs inside the per-vehicle worker ----
     async def _execute(self, task, ctx) -> dict:
@@ -3024,13 +3515,19 @@ class GodseyeUavServer:
 
         Starting every plan at `envelope.home` omitted the ingress leg and the
         whole M15 headwind penalty; both are priced here.
+
+        The result carries `theater_epoch`, read BEFORE the first await: a
+        caller passes it to `_submit(gate_epoch=...)`, which refuses the
+        command if a theater switch completed in between (§4.1.9 #10).
         """
+        epoch = self.theater_epoch
         fm = self.fuel_for(vehicle)
         try:
             tele = await self._telemetry(vehicle)
         except Exception as exc:  # no silent fallback: an ungateable plan is rejected
             gate = {"ok": False, "error": f"telemetry unavailable: {type(exc).__name__}: {exc}",
-                    "envelope_violations": ["telemetry_unavailable"], "required_pct": None}
+                    "envelope_violations": ["telemetry_unavailable"], "required_pct": None,
+                    "theater_epoch": epoch}
             self.store.log_audit("preflight_reject", "gate could not read telemetry",
                                  vehicle=vehicle, gate=gate)
             return gate
@@ -3054,17 +3551,28 @@ class GodseyeUavServer:
         gate["bingo_fuel_pct"] = round(
             fm.bingo_fuel_pct(start, start_agl, wind_ne=wind_ne), 2)
         gate["ok"] = gate["ok"] and not violations
+        gate["theater_epoch"] = epoch
         if not gate["ok"]:
             self.store.log_audit("preflight_reject", "pre-flight gate rejected plan",
                                  vehicle=vehicle, gate=gate)
         return gate
 
     def _submit(self, vehicle: str, tool: str, params: dict,
-                idempotency_key: str | None, **kw) -> dict:
-        """Submit through the queue, honouring the busy contract (T2)."""
+                idempotency_key: str | None, *, gate_epoch: int | None = None,
+                **kw) -> dict:
+        """Submit through the queue, honouring the busy contract (T2).
+
+        WG §3.10: refused while a theater switch runs, after a failed origin
+        cross-check, and when `gate_epoch` (the `_gate` result's
+        `theater_epoch`) is not the current epoch. The check and the queue
+        submission share `_mode_lock`, so a switch cannot start in between.
+        """
         try:
-            task = self.tasking.submit(vehicle, tool, params,
-                                       idempotency_key=idempotency_key, **kw)
+            with self._mode_lock:
+                refusal = self._submit_refusal(gate_epoch, tool)
+                if refusal is None:
+                    task = self.tasking.submit(vehicle, tool, params,
+                                               idempotency_key=idempotency_key, **kw)
         except VehicleBusyError as exc:
             self.store.log_audit("busy", f"{tool} rejected: vehicle busy",
                                  vehicle=vehicle, tool=tool,
@@ -3072,6 +3580,11 @@ class GodseyeUavServer:
             return {"status": "busy", "current": exc.current.handle(),
                     "rejected_tool": tool, "vehicle": vehicle,
                     "mission_status": self.mission_flags.get(vehicle)}
+        if refusal is not None:
+            self.store.log_audit("submit_refused", refusal["message"],
+                                 vehicle=vehicle, tool=tool, error=refusal["error"],
+                                 gate_epoch=gate_epoch, theater_epoch=self.theater_epoch)
+            return {**refusal, "rejected_tool": tool, "vehicle": vehicle}
         handle = task.handle()
         if task.replays:
             # T4b: a replayed key returns the ORIGINAL handle and re-executes
@@ -3082,7 +3595,8 @@ class GodseyeUavServer:
         handle["status"] = "accepted"
         self.store.log_task(handle, "submitted",
                             params=self._journal_payload(params),
-                            idempotency_key=idempotency_key)
+                            idempotency_key=idempotency_key,
+                            **self._theater_stamp())
         return handle
 
     #: Payload keys whose full contents are deliberately kept OUT of the task
@@ -3168,7 +3682,27 @@ class GodseyeUavServer:
 
         This is the loop R5 said did not exist: without it `fuel_pct` is a
         constant 100.0 and BINGO can never fire.
+
+        WG §3.10: while a theater switch runs this returns
+        `{"skipped": "theater switch"}` without reading anything (every drone
+        is proven landed and idle first). A body in flight is counted in
+        `_ticks_inflight`, which the switch drains (`wait_ticks_idle`) before
+        it moves the origin, so no tick straddles a switch.
         """
+        # Checked and counted under one lock, which `wait_ticks_idle` also
+        # reads under: a tick either sees the switch flag or is counted.
+        with self._ticks_lock:
+            if self._switching.is_set():
+                return {"skipped": "theater switch"}
+            self._ticks_inflight += 1
+        try:
+            return await self._tick_once_body(vehicle, now)
+        finally:
+            with self._ticks_lock:
+                self._ticks_inflight -= 1
+
+    async def _tick_once_body(self, vehicle: str, now: float | None) -> dict:
+        """`tick_once` proper (one sample, one verdict)."""
         mon = self.monitor_for(vehicle)
         link_up, tele, link_err = True, None, None
         try:
@@ -3237,7 +3771,8 @@ class GodseyeUavServer:
             self._merge_terrain_floor(vehicle, verdict, src, landed=landed_now)
             # T5: persist the integral so a restart can recover the fuel clock.
             self.store.log_fuel(vehicle, bingo_fuel_pct=verdict["bingo"]["bingo_fuel_pct"],
-                                wind_source=wind_source, **verdict["fuel_record"])
+                                wind_source=wind_source,
+                                **self._fuel_row(verdict["fuel_record"]))
         self.ticks[vehicle] = verdict
         await self._audit_tick(vehicle, verdict)
         await self._enforce(vehicle, verdict)
@@ -3397,9 +3932,30 @@ class GodseyeUavServer:
             self.loal_events.append({"vehicle": vehicle, **event})
 
     async def _enforce(self, vehicle: str, verdict: dict) -> None:
-        """Act on the verdict: BINGO force-RTB, geofence breach, lost link."""
+        """Act on the verdict: BINGO force-RTB, geofence breach, lost link.
+
+        Suspended while `theater_integrity_error` is latched (review A): the
+        origin copies disagreed, so any RTB would be projected through an
+        untrusted origin (measured: 5,489 km N / 1,454 km E). Every drone was
+        proven landed before the move and `_submit` refuses anything that
+        flies, so nothing is airborne to protect; the verdict says so and the
+        first suppressed action per vehicle is audited.
+        """
         reasons = list(verdict.get("rtb_reasons") or [])
         event = verdict.get("link_event") or {}
+        if self.theater_integrity_error:
+            verdict["enforcement_suspended"] = "theater_integrity"
+            wanted = (reasons or event.get("event") in ("loal_declared", "loal_escalated")
+                      or verdict.get("bingo", {}).get("latched"))
+            if wanted and vehicle not in self._enforce_suspended:
+                self._enforce_suspended.add(vehicle)
+                self.store.log_audit(
+                    "enforcement_suspended",
+                    "safety action not flown: the simulation origin failed its "
+                    "cross-check", vehicle=vehicle, rtb_reasons=reasons,
+                    link_event=event.get("event"),
+                    integrity_error=self.theater_integrity_error)
+            return
         if event.get("event") in ("loal_declared", "loal_escalated"):
             await self._execute_lost_link(vehicle, verdict)
             return
@@ -3463,7 +4019,7 @@ class GodseyeUavServer:
         self._rtb_task[vehicle] = task
         handle = task.handle()
         self.store.log_task(handle, "submitted", params=task.params,
-                            safety_reason=reason)
+                            safety_reason=reason, **self._theater_stamp())
         self.store.sync()
         return handle
 
@@ -3512,7 +4068,8 @@ class GodseyeUavServer:
             idempotency_key=f"safety-loal:{vehicle}:{action.value}:{self._safety_seq}",
             privileged=True, uncancellable=True)
         self.store.log_task(task.handle(), "submitted", params=params,
-                            safety_reason=f"lost_link:{action.value}")
+                            safety_reason=f"lost_link:{action.value}",
+                            **self._theater_stamp())
         self.store.sync()
         return {"action": action.value, "task": task.handle()}
 
@@ -3589,9 +4146,21 @@ class GodseyeUavServer:
         except Exception as exc:  # noqa: BLE001 — recorded, loop still runs
             self._monitor_errors.append(f"boot_recovery: {type(exc).__name__}: {exc}")
             self.store.log_audit("restart_recovery_failed", str(exc))
+            # WG §4.1.4: recovery is over, if badly; a switch may go ahead.
+            self.boot_recovery_done.set()
         names: list[str] = list(vehicles) if vehicles else []
         roster_confirmed = bool(vehicles)
+        self._monitor_passes = 0
         while not self._monitor_stop.is_set():
+            pass_t0 = time.monotonic()
+            self._monitor_passes += 1
+            if (roster_confirmed and not vehicles and self._monitor_passes > 1
+                    and (self._monitor_passes - 1) % ROSTER_REFRESH_PASSES == 0):
+                # D7 #9: a drone created after boot is picked up within
+                # ROSTER_REFRESH_PASSES passes; a name the sim stops listing is
+                # still ticked (its telemetry failing is a lost link, not a
+                # reason to stop watching it).
+                names = await self._refresh_roster(names)
             if not roster_confirmed:
                 # The roster is the sim's to answer, and a failure used to come
                 # back as the literal ["Drone1"] — so the safety loop ticked
@@ -3622,7 +4191,41 @@ class GodseyeUavServer:
                 except Exception as exc:  # noqa: BLE001 — surfaced, never silent
                     self._monitor_errors.append(f"{v}: {type(exc).__name__}: {exc}")
                     self.store.log_audit("tick_failed", str(exc), vehicle=v)
-            await asyncio.sleep(interval_s)
+            # §4.1.6 / D7 #13: at sim speed xN a pass covers N times the
+            # ground, so the pause shrinks with it (never below 50 ms). The
+            # measured wall period is published for the caveats and tests.
+            await asyncio.sleep(self._monitor_sleep_s(interval_s))
+            self.monitor_period_s = time.monotonic() - pass_t0
+
+    def _monitor_sleep_s(self, interval_s: float) -> float:
+        """The pause between two monitor passes at the current sim speed."""
+        return max(MONITOR_MIN_SLEEP_S, float(interval_s) / max(1.0, self.time_scale))
+
+    async def _refresh_roster(self, names: list[str]) -> list[str]:
+        """Re-list the sim's vehicles and union them with `names` (D7 #9).
+
+        Additive only: a failed listing keeps every known name (reported as
+        the roster degradation, as at boot), and a name the sim no longer
+        lists stays monitored.
+        """
+        try:
+            listed = [str(v) for v in await self.backend.list_vehicles()]
+        except Exception as exc:  # noqa: BLE001 — surfaced, never faked
+            detail = f"{type(exc).__name__}: {exc}"
+            if self.vehicle_roster_error != detail:
+                self._monitor_errors.append(f"list_vehicles: {detail}")
+                self.store.log_audit("vehicle_roster_unavailable", detail,
+                                     refresh=True, monitored=list(names))
+            self.vehicle_roster_error = detail
+            return names
+        self.vehicle_roster_error = None
+        added = [v for v in listed if v not in names]
+        if added:
+            self.store.log_audit(
+                "vehicle_roster_refreshed",
+                f"{len(added)} vehicle(s) joined the safety monitor: {', '.join(added)}",
+                added=added, monitored=[*names, *added])
+        return [*names, *added]
 
     # ---- intel helpers ----
     async def _sensor_conditions(self, vehicle: str, camera: str = "0", *,
@@ -3792,7 +4395,7 @@ class GodseyeUavServer:
         record = fm.fuel_record(reason="operator_fuel_reset")
         if line is not None:
             record["bingo_fuel_pct"] = line
-        self.store.log_fuel(vehicle, **record)
+        self.store.log_fuel(vehicle, **self._fuel_row(record))
         self.store.log_audit(
             "fuel_reset",
             f"{vehicle} fuel {fuel_before}% -> {fm.fuel_pct}% by operator override"
@@ -4193,6 +4796,9 @@ class GodseyeUavServer:
         the preview and the flight can never disagree.
         """
         from .missions import dry_run
+        # §4.1.9 #10: the epoch this plan is checked under, read before the
+        # first await (`_launch_mission` hands it to `_submit`).
+        epoch = self.theater_epoch
         fm = self.fuel_for(vehicle)
         self._stamp_phase_fov(plan)
         try:
@@ -4200,7 +4806,8 @@ class GodseyeUavServer:
         except Exception as exc:  # no silent fallback: an ungateable plan is rejected
             gate = {"ok": False, "required_pct": None, "est_time_s": None,
                     "error": f"telemetry unavailable: {type(exc).__name__}: {exc}",
-                    "envelope_violations": ["telemetry_unavailable"]}
+                    "envelope_violations": ["telemetry_unavailable"],
+                    "theater_epoch": epoch}
             self.store.log_audit("preflight_reject", "gate could not read telemetry",
                                  vehicle=vehicle, gate=gate)
             return {**plan.to_dict(), "mission_kind": plan.kind, "executed": False,
@@ -4219,6 +4826,7 @@ class GodseyeUavServer:
         gate["wind_ne_mps"] = [round(wind_ne[0], 2), round(wind_ne[1], 2)]
         gate["wind_source"] = wind_source
         gate["bingo_fuel_pct"] = product["bingo_fuel_pct"]
+        gate["theater_epoch"] = epoch
         product["wind_source"] = wind_source
         if not gate["ok"]:
             self.store.log_audit("preflight_reject", "pre-flight gate rejected plan",
@@ -4271,7 +4879,13 @@ class GodseyeUavServer:
                               {"waypoints": plan.to_route(),
                                "speed_mps": plan.speed_mps,
                                "captures": plan.captures},
-                              idempotency_key, mission_id=mission_id)
+                              idempotency_key, mission_id=mission_id,
+                              gate_epoch=gate.get("theater_epoch"))
+        if handle.get("rejected"):
+            # §3.10: a theater switch ran (or is running) since this plan was
+            # gated, or the origin failed its cross-check. Nothing was queued.
+            self._repath.pop(mission_id, None)
+            return {**handle, "kind": plan.kind, "gate": gate, **(extra or {})}
         if handle.get("status") in ("busy", "duplicate"):
             # Nothing was queued under THIS mission id (busy flew nothing; a
             # duplicate belongs to the original mission), so the loop armed
@@ -5185,7 +5799,10 @@ class GodseyeUavServer:
             if not gate["ok"] and gate.get("envelope_violations"):
                 return {"rejected": True, "gate": gate}
             handle = self._submit(vehicle, "uav_return_to_home",
-                                  {"speed_mps": speed_mps}, idempotency_key)
+                                  {"speed_mps": speed_mps}, idempotency_key,
+                                  gate_epoch=gate.get("theater_epoch"))
+            if handle.get("rejected"):
+                return handle
             handle["bingo_fuel_pct"] = gate.get("bingo_fuel_pct")
             return handle
 
@@ -5214,7 +5831,9 @@ class GodseyeUavServer:
             handle = self._submit(vehicle, "uav_goto_gps",
                                   {"lat": lat, "lon": lon, "alt_m": alt_m,
                                    "alt_agl_m": alt_m, "speed_mps": speed_mps},
-                                  idempotency_key)
+                                  idempotency_key, gate_epoch=gate.get("theater_epoch"))
+            if handle.get("rejected"):
+                return handle
             handle["alt_agl_m"] = float(alt_m)
             handle["bingo_fuel_pct"] = gate["bingo_fuel_pct"]
             handle["plan_required_pct"] = gate["required_pct"]
@@ -5237,7 +5856,9 @@ class GodseyeUavServer:
                 return {"rejected": True, "gate": gate}
             handle = self._submit(vehicle, "uav_fly_route",
                                   {"waypoints": waypoints, "speed_mps": speed_mps},
-                                  idempotency_key)
+                                  idempotency_key, gate_epoch=gate.get("theater_epoch"))
+            if handle.get("rejected"):
+                return handle
             handle["bingo_fuel_pct"] = gate["bingo_fuel_pct"]
             handle["plan_required_pct"] = gate["required_pct"]
             return handle
@@ -6760,9 +7381,13 @@ class GodseyeUavServer:
                 "terrain_floor": floor,
                 "real_data": self.real_data_status(),
                 "home_datums": home_block,
+                # WG §3.4: `epoch` (the switch counter the bridge re-reads the
+                # geofence on) and `dynamic` (a chat-defined, non-table AO).
                 "theater": {"id": self.theater.id, "label": self.theater.label,
                             "ao": self.theater.ao_list(),
-                            "ground_elevation_msl_m": self.theater.home_alt_msl_m},
+                            "ground_elevation_msl_m": self.theater.home_alt_msl_m,
+                            "epoch": self.theater_epoch,
+                            "dynamic": bool(getattr(self.theater, "dynamic", False))},
                 # None unless the enforced envelope was built for a different
                 # theater than the one everything theater-derived comes from.
                 "theater_mismatch": self.theater_mismatch,

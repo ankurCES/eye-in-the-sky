@@ -18,6 +18,19 @@ with ``tool_suffix``), ``400`` ``401`` ``403`` ``404`` ``429`` ``500`` ``529``,
 or, with ``configure(redirect_to=<url>)``, on another origin), ``hang``,
 ``html`` (200 text/html).
 
+``script`` (WG §4.5, A14): ``configure(mode="script", script=[[step, ...], ...])``.
+Each inner list answers one operator message: the stub counts the user TEXT
+messages in the conversation to pick the list, and the assistant ``tool_use``
+turns since that message to pick the step. A step ``{"tool": "<bare name>",
+"input": {...}, "text": "optional"}`` becomes ``tool_use`` ``mcp__godseye__<tool>``.
+``{"$ref": "<tool>.<dotted.path>"}`` anywhere in ``input`` (or as the whole
+input) resolves against the most recent ``tool_result`` of that tool; paths take
+keys, numeric indices and ``[key=value]`` filters (``vehicles[name=Drone1].lat``).
+An exhausted list replies "Done (scripted)."; a ref that does not resolve replies
+"Script error: ..." and ends the turn. Requests that offer no ``mcp__`` tool
+(the CLI's side calls) get "OK" and never consume a step. ``script_log()`` lists
+what each scripted request did.
+
 ``messages()`` lists the engine's ``/v1/messages`` requests; the settings' own
 HTTP checks (user agent ``eye-in-the-sky-...``) are in ``probes()``.
 """
@@ -36,7 +49,12 @@ from . import pick_port
 
 TEST_KEYS = frozenset({"test-key-123", "test-key-456"})
 MODES = ("ok", "tool", "400", "401", "403", "404", "429", "500", "529", "reject_thinking",
-         "echo_key", "redirect", "hang", "html")
+         "echo_key", "redirect", "hang", "html", "script")
+#: The analyst's in-process MCP server prefix (analyst_policy.TOOL_PREFIX).
+SCRIPT_TOOL_PREFIX = "mcp__godseye__"
+SCRIPT_DONE = "Done (scripted)."
+_REF_TOKEN = re.compile(r"\[([^\]]*)\]|([^.\[\]]+)")
+_REMINDER = "<system-reminder>"
 THINKING_REJECTION = ("thinking.type: Input tag 'adaptive' found using 'type' does not match "
                       "any of the expected tags: 'disabled', 'enabled'")
 _ERRORS = {
@@ -159,6 +177,145 @@ def _stream(msg: dict) -> str:
                                       "usage": {"output_tokens": 2}}))
     out.append(_sse("message_stop", {"type": "message_stop"}))
     return "".join(out)
+
+
+class ScriptError(ValueError):
+    """A scripted step could not be built (bad ref, missing result)."""
+
+
+def _texts(content) -> list[str]:
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    return [c.get("text", "") for c in content
+            if isinstance(c, dict) and c.get("type") == "text"
+            and isinstance(c.get("text"), str)]
+
+
+def _is_operator_message(msg: dict) -> bool:
+    """A user message the operator typed: text that is not only CLI reminders,
+    and no tool results."""
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    if isinstance(content, list) and any(
+            isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+        return False
+    return any(t.strip() and not t.lstrip().startswith(_REMINDER) for t in _texts(content))
+
+
+def _bare(name: str) -> str:
+    return name.removeprefix(SCRIPT_TOOL_PREFIX)
+
+
+def _result_value(block: dict):
+    """A tool_result's payload: its text parsed as JSON (whole, else the first
+    text block that parses), else the raw text."""
+    texts = _texts(block.get("content"))
+    for candidate in ("".join(texts), *texts):
+        try:
+            return json.loads(candidate)
+        except ValueError:
+            continue
+    return "".join(texts)
+
+
+def script_position(messages: list) -> tuple[int, int, dict]:
+    """(operator message index, tool_use turns since it, latest result per tool).
+
+    Index -1 means no operator message yet."""
+    msgs = [m for m in messages if isinstance(m, dict)]
+    names: dict[str, str] = {}
+    results: dict[str, object] = {}
+    op, steps = -1, 0
+    for m in msgs:
+        content = m.get("content") if isinstance(m.get("content"), list) else []
+        if m.get("role") == "assistant":
+            uses = [c for c in content if isinstance(c, dict) and c.get("type") == "tool_use"]
+            for c in uses:
+                names[str(c.get("id"))] = _bare(str(c.get("name", "")))
+            steps += 1 if uses else 0
+        elif _is_operator_message(m):
+            op, steps = op + 1, 0
+        elif m.get("role") == "user":
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "tool_result":
+                    tool = names.get(str(c.get("tool_use_id")))
+                    if tool:
+                        results[tool] = _result_value(c)
+    return op, steps, results
+
+
+def resolve_path(value, path: str):
+    """Walk ``a.b.0.c`` / ``a[key=value].b`` / ``a[0]`` through ``value``."""
+    cur = value
+    for m in _REF_TOKEN.finditer(path):
+        bracket, key = m.group(1), m.group(2)
+        if bracket is not None and "=" in bracket:
+            k, _, want = bracket.partition("=")
+            if not isinstance(cur, list):
+                raise ScriptError(f"[{bracket}] needs a list")
+            hit = next((el for el in cur if isinstance(el, dict)
+                        and str(el.get(k.strip())) == want.strip()), None)
+            if hit is None:
+                raise ScriptError(f"no element with {k.strip()}={want.strip()}")
+            cur = hit
+            continue
+        token = (bracket if bracket is not None else key).strip()
+        if isinstance(cur, list):
+            if not token.lstrip("-").isdigit():
+                raise ScriptError(f"{token!r} is not an index")
+            try:
+                cur = cur[int(token)]
+            except IndexError:
+                raise ScriptError(f"index {token} out of range") from None
+        elif isinstance(cur, dict):
+            if token not in cur:
+                raise ScriptError(f"no key {token!r}")
+            cur = cur[token]
+        else:
+            raise ScriptError(f"cannot read {token!r} from a {type(cur).__name__}")
+    return cur
+
+
+def resolve_refs(value, results: dict):
+    """Replace every ``{"$ref": "<tool>.<path>"}`` in ``value``."""
+    if isinstance(value, dict):
+        if set(value) == {"$ref"}:
+            ref = str(value["$ref"])
+            tool, _, path = ref.partition(".")
+            if tool not in results:
+                raise ScriptError(f"{ref}: no result from {tool} yet")
+            return resolve_path(results[tool], path) if path else results[tool]
+        return {k: resolve_refs(v, results) for k, v in value.items()}
+    if isinstance(value, list):
+        return [resolve_refs(v, results) for v in value]
+    return value
+
+
+def script_reply(script, messages: list, tool_names: list[str]) -> tuple[list[dict], str, dict]:
+    """(blocks, stop_reason, log entry) for one scripted request."""
+    if not any(str(n).startswith("mcp__") for n in tool_names):
+        return [{"type": "text", "text": "OK"}], "end_turn", {"side_call": True}
+    op, steps, results = script_position(messages)
+    lists = script if isinstance(script, list) else []
+    log = {"message": op, "step": steps}
+    if op < 0 or op >= len(lists) or steps >= len(lists[op] or []):
+        return [{"type": "text", "text": SCRIPT_DONE}], "end_turn", {**log, "done": True}
+    step = lists[op][steps]
+    try:
+        tool = str(step["tool"])
+        args = resolve_refs(step.get("input", {}), results)
+        if not isinstance(args, dict):
+            raise ScriptError(f"{tool}: the input resolved to a {type(args).__name__}")
+    except (KeyError, TypeError, ScriptError) as exc:
+        text = f"Script error: {exc}"
+        return [{"type": "text", "text": text}], "end_turn", {**log, "error": str(exc)}
+    blocks = [{"type": "text", "text": str(step.get("text") or f"Calling {tool}.")},
+              {"type": "tool_use", "id": "toolu_stub" + uuid.uuid4().hex[:16],
+               "name": SCRIPT_TOOL_PREFIX + tool, "input": args}]
+    return blocks, "tool_use", {**log, "tool": tool, "input": args}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -289,6 +446,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _reply(self, mode: str, body: dict, model: str) -> tuple[list[dict], str]:
         msgs = [m for m in body.get("messages") or [] if isinstance(m, dict)]
+        if mode == "script":
+            names = [t.get("name", "") for t in body.get("tools") or [] if isinstance(t, dict)]
+            blocks, stop, entry = script_reply(self.server.script, msgs, names)
+            self.server.log_script(entry)
+            return blocks, stop
         # The CLI may put a role:"system" message after the tool results:
         # the turn's state is in the last USER message.
         users = [m for m in msgs if m.get("role") == "user"]
@@ -323,10 +485,16 @@ class _Server(ThreadingHTTPServer):
         self.tool_input: dict = {}
         self.redirect_to = ""
         self.url = ""
+        self.script: list = []
+        self.script_entries: list[dict] = []
 
     def record(self, rec: dict) -> None:
         with self.lock:
             self.requests.append(rec)
+
+    def log_script(self, entry: dict) -> None:
+        with self.lock:
+            self.script_entries.append(entry)
 
 
 class StubAnthropic:
@@ -350,11 +518,22 @@ class StubAnthropic:
 
     def configure(self, **kw: object) -> None:
         """``mode``, ``retry_after``, ``hang_s``, ``tool_suffix``, ``tool_input``,
-        ``redirect_to`` (the origin ``redirect`` mode sends the client to)."""
+        ``redirect_to`` (the origin ``redirect`` mode sends the client to),
+        ``script`` (a list of step lists, one per operator message)."""
         for k, v in kw.items():
-            if not hasattr(self._server, k) or k in ("lock", "requests", "url"):
+            if not hasattr(self._server, k) or k in ("lock", "requests", "url",
+                                                      "script_entries"):
                 raise AttributeError(k)
+            if k == "script" and not (isinstance(v, list) and all(
+                    isinstance(steps, list) for steps in v)):
+                raise TypeError("script is a list of step lists")
             setattr(self._server, k, v)
+
+    def script_log(self) -> list[dict]:
+        """One entry per scripted request: ``{message, step, tool, input}``,
+        ``{..., done}``, ``{..., error}`` or ``{side_call}``."""
+        with self._server.lock:
+            return list(self._server.script_entries)
 
     @property
     def requests(self) -> list[dict]:
@@ -372,6 +551,7 @@ class StubAnthropic:
     def reset(self) -> None:
         with self._server.lock:
             self._server.requests.clear()
+            self._server.script_entries.clear()
 
     def start(self) -> Self:
         self._thread.start()

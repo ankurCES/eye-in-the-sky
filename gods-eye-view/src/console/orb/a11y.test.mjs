@@ -275,3 +275,54 @@ test('List view keeps keyboard focus on a row across graph polls', () => {
   view.setGraph(changed);
   assert.equal(dom.doc.activeElement, outside);
 });
+
+test('List view: an unknown type reads "Unrecognised (force)" in lilac; sites sit in their own band (WG §4.2.1, §4.2.6)', () => {
+  const host = stubElement('div');
+  const view = createOrbListView(host);
+  const graph = makeGraph(20);
+  graph.nodes.push(
+    {
+      id: 'frc:red-sam-1',
+      type: 'force',
+      label: '<img src=x onerror=alert(1)>',
+      status: 'ok',
+      salience: 0.6,
+      attrs: {},
+    },
+    {
+      id: 'sit:dyn-x:way/1',
+      type: 'site',
+      label: 'Kherson International',
+      group: 'air',
+      status: 'critical',
+      salience: 0.4,
+      attrs: { category: 'airfield' },
+    },
+  );
+  view.setGraph(graph);
+  const row = (id) =>
+    findNode(host, (el) => el.attrs?.['data-id'] === id && el.tag === 'tr');
+  const force = row('frc:red-sam-1');
+  assert.equal(text(force.children[0]), 'Unrecognised (force)');
+  assert.match(force.children[0].className, /ic-orb-list__type--unrecognised/);
+  assert.equal(force.children[2].attrs['data-status'], 'unknown');
+  assert.equal(text(force.children[2]), 'Not assessed');
+  assert.ok(text(force.children[1]).includes('<img src=x onerror=alert(1)>'));
+  assert.equal(
+    findNode(host, (el) => el.tag === 'img'),
+    null,
+  );
+  const site = row('sit:dyn-x:way/1');
+  assert.equal(text(site.children[0]), 'Site');
+  assert.equal(site.children[2].attrs['data-status'], 'mapped');
+  assert.equal(text(site.children[2]), 'Mapped, not verified');
+  assert.equal(text(site.children[3]), 'Mapped');
+  // Band order: sites between missions and contacts, the force in Other.
+  const groups = groupByBand(graph.nodes).map((g) => g.key);
+  assert.ok(groups.indexOf('site') > groups.indexOf('mission'));
+  assert.ok(groups.indexOf('site') < groups.indexOf('track'));
+  assert.equal(
+    groupByBand(graph.nodes).find((g) => g.key === 'other').nodes[0].id,
+    'frc:red-sam-1',
+  );
+});

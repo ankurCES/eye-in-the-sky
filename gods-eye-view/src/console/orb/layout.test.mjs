@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 
 import {
   BANDS,
+  BAND_ORDER,
   CAP_SPAN_DEG,
+  GRATICULE_PARALLELS,
   EDGE_POINTS,
   EDGE_STRIDE,
   SECTORS,
@@ -17,6 +19,12 @@ import {
   wrapLon,
 } from './layout.js';
 import { makeGraph, shuffled } from './fixtures.test.mjs';
+import {
+  SITE_BAND,
+  placeSectorRow,
+  sectorRowLon,
+  siteSectorKey,
+} from './contextBands.js';
 
 const at = (layout, id) => {
   const i = layout.index.get(id);
@@ -465,4 +473,298 @@ test('the graph fixture is contract-shaped and sized as asked', () => {
       );
     }
   }
+});
+
+test('band latitudes are pinned: the ISR bands as before, plus the site band and the lower belt top (WG §4.2.6)', () => {
+  const lat = Object.fromEntries(
+    Object.entries(BANDS).map(([key, band]) => [key, band.lat]),
+  );
+  assert.deepEqual(lat, {
+    theater: 90,
+    feed: 80,
+    poi: 72,
+    vehicle: 60,
+    mission: 50,
+    site: 42,
+    track: 6,
+    other: -31,
+    unit: -36,
+    equipment: -46,
+    report: -58,
+    alarm: -74,
+  });
+  assert.equal(BANDS.theater.ringLat, 85);
+  assert.equal(BANDS.track.latTop, 35, 'the contact belt top moves from 38');
+  assert.equal(BANDS.track.latBottom, -26);
+  assert.equal(BANDS.alarm.latTop, -68);
+  assert.equal(BANDS.alarm.latBottom, -86);
+  assert.equal(BANDS.site.slotsPerSector, 12);
+  assert.equal(BANDS.site.slotDeg, 3);
+  assert.equal(BANDS.site, SITE_BAND);
+  assert.deepEqual(BAND_ORDER, [
+    'theater',
+    'feed',
+    'poi',
+    'vehicle',
+    'mission',
+    'site',
+    'track',
+    'other',
+    'unit',
+    'equipment',
+    'report',
+    'alarm',
+  ]);
+  assert.equal(GRATICULE_PARALLELS.beltTop, 38.5, 'moved from 44');
+  assert.equal(GRATICULE_PARALLELS.beltBottom, -28.5);
+  assert.equal(GRATICULE_PARALLELS.alarmCap, -63);
+  assert.equal(GRATICULE_PARALLELS.emptyRow, 6);
+  assert.ok(
+    GRATICULE_PARALLELS.sectorNames < GRATICULE_PARALLELS.beltTop &&
+      GRATICULE_PARALLELS.sectorNames > BANDS.track.latTop,
+    'sector names sit between the belt line and the contacts',
+  );
+  assert.ok(
+    BANDS.site.lat > GRATICULE_PARALLELS.beltTop &&
+      BANDS.site.lat < BANDS.mission.lat,
+  );
+});
+
+test('an unknown node type goes to the Other band (fail-safe, WG §4.2.1)', () => {
+  const layout = computeLayout({
+    nodes: [
+      { id: 'frc:red-sam-1', type: 'force', status: 'critical' },
+      { id: 'zzz:1', type: 'zzz' },
+      { id: 'x:proto', type: '__proto__' },
+    ],
+    edges: [],
+  });
+  for (const id of layout.ids) {
+    assert.equal(layout.band[layout.index.get(id)], 'other');
+    assert.ok(Math.abs(at(layout, id).lat - BANDS.other.lat) < 1e-4);
+  }
+  assert.equal(layout.counts.other, 3);
+});
+
+const theaterGraph = (active, all = true) => ({
+  nodes: [
+    ...(all || active === 'default'
+      ? [
+          {
+            id: 'thr:default',
+            type: 'theater',
+            attrs: { active: active === 'default' },
+          },
+        ]
+      : []),
+    ...(all || active === 'dyn-x'
+      ? [
+          {
+            id: 'thr:dyn-x',
+            type: 'theater',
+            attrs: { active: active === 'dyn-x' },
+          },
+        ]
+      : []),
+    ...(all
+      ? [{ id: 'thr:baghdad', type: 'theater', attrs: { active: false } }]
+      : []),
+    { id: 'veh:Drone1', type: 'vehicle' },
+  ],
+  edges: [],
+});
+
+test('pole fix: a newly active theater takes the pole in All scope, and the old one rings it (WG §4.2.4)', () => {
+  const before = computeLayout(theaterGraph('default'));
+  assert.equal(at(before, 'thr:default').lat, 90);
+  const ringBefore = at(before, 'thr:baghdad');
+  const after = computeLayout(theaterGraph('dyn-x'), before);
+  assert.equal(
+    at(after, 'thr:dyn-x').lat,
+    90,
+    'the active theater has the pole',
+  );
+  assert.ok(Math.abs(at(after, 'thr:default').lat - 85) < 1e-4);
+  const ringAfter = at(after, 'thr:baghdad');
+  assert.equal(ringAfter.lat, ringBefore.lat, 'bystanders keep their slot');
+  assert.equal(ringAfter.lon, ringBefore.lon);
+  // …and back again.
+  const back = computeLayout(theaterGraph('default'), after);
+  assert.equal(at(back, 'thr:default').lat, 90);
+  assert.ok(Math.abs(at(back, 'thr:dyn-x').lat - 85) < 1e-4);
+  // Deterministic: a fresh layout agrees on the pole.
+  assert.equal(at(computeLayout(theaterGraph('dyn-x')), 'thr:dyn-x').lat, 90);
+});
+
+test('pole fix: in theater scope the new theater replaces the old one on the pole', () => {
+  const before = computeLayout(theaterGraph('default', false));
+  const after = computeLayout(theaterGraph('dyn-x', false), before);
+  assert.equal(after.counts.theater, 1);
+  assert.equal(at(after, 'thr:dyn-x').lat, 90);
+  // No active flag at all: the pole holder keeps the pole.
+  const none = computeLayout({
+    nodes: [
+      { id: 'thr:a', type: 'theater', attrs: {} },
+      { id: 'thr:b', type: 'theater', attrs: {} },
+    ],
+    edges: [],
+  });
+  const again = computeLayout(
+    { nodes: [...none.nodes, { id: 'thr:0', type: 'theater' }], edges: [] },
+    none,
+  );
+  assert.equal(at(again, 'thr:a').lat, 90);
+});
+
+const site = (n, category, { group, salience = 0.4 } = {}) => ({
+  id: `sit:dyn-x:node/${n}`,
+  type: 'site',
+  label: `Site ${n}`,
+  group,
+  salience,
+  status: 'ok',
+  attrs: { category },
+});
+
+test('sites: one row at +42°, inside their sector, 3° slots, sparse sectors spread out', () => {
+  const graph = {
+    nodes: [
+      site(1, 'airfield', { group: 'air' }),
+      site(2, 'airfield', { group: 'air' }),
+      site(3, 'airfield', { group: 'air' }),
+      site(4, 'power', { group: 'infrastructure' }),
+      site(5, 'medical'), // no group: its category's sector (civilian)
+      site(6, 'volcano', { group: 'space-lasers' }), // → unclassified
+    ],
+    edges: [],
+  };
+  const layout = computeLayout(graph);
+  const sectorIndex = (key) => SECTORS.find((s) => s.key === key).index;
+  const expect = {
+    1: 'air',
+    2: 'air',
+    3: 'air',
+    4: 'infrastructure',
+    5: 'civilian',
+    6: 'unclassified',
+  };
+  const slotsSeen = new Set();
+  for (const [n, key] of Object.entries(expect)) {
+    const id = `sit:dyn-x:node/${n}`;
+    const { lat, lon, i } = at(layout, id);
+    assert.equal(layout.band[i], 'site');
+    assert.equal(lat, 42);
+    const sec = SECTORS[sectorIndex(key)];
+    assert.equal(layout.sector[i], sec.index, `${id} in ${key}`);
+    assert.ok(lonDelta(lon, sec.lonCenter) <= 18 - 1.5 + 1e-4);
+    // On the 3° grid: centre ± (k + 0.5) × 3.
+    const offset = wrapLon(lon - sec.lonCenter) + 18 - 1.5;
+    assert.ok(Math.abs(offset / 3 - Math.round(offset / 3)) < 1e-4);
+    slotsSeen.add(`${sec.index}:${Math.round(offset / 3)}`);
+    assert.equal(layout.hidden[i], 0);
+  }
+  assert.equal(slotsSeen.size, 6, 'no two sites share a slot');
+  // Three airfields spread over the sector (12° apart), not piled together.
+  const air = [1, 2, 3]
+    .map((n) => at(layout, `sit:dyn-x:node/${n}`).lon)
+    .sort((a, b) => a - b);
+  assert.ok(
+    air[1] - air[0] >= 9 - 1e-4 && air[2] - air[1] >= 9 - 1e-4,
+    `${air}`,
+  );
+  assert.equal(layout.counts.site, 6);
+  assert.equal(layout.overflow.site, 0);
+  assert.equal(
+    siteSectorKey(
+      { attrs: { category: 'port' } },
+      SECTORS.map((s) => s.key),
+    ),
+    'naval',
+  );
+});
+
+test('sites: a sector draws its 12 most salient; the rest overflow, hidden and counted', () => {
+  const nodes = [];
+  for (let k = 0; k < 15; k += 1)
+    nodes.push(
+      site(k, 'power', { group: 'infrastructure', salience: k / 100 }),
+    );
+  const layout = computeLayout({ nodes, edges: [] });
+  assert.equal(layout.overflow.site, 3);
+  const hidden = layout.ids.filter((id) => layout.hidden[layout.index.get(id)]);
+  assert.deepEqual(
+    hidden.sort(),
+    ['sit:dyn-x:node/0', 'sit:dyn-x:node/1', 'sit:dyn-x:node/2'],
+    'the least salient overflow',
+  );
+  const lons = layout.ids
+    .filter((id) => !layout.hidden[layout.index.get(id)])
+    .map((id) => at(layout, id).lon);
+  assert.equal(new Set(lons.map((l) => l.toFixed(3))).size, 12);
+  // Overflow sits at its sector's centre (so a pick can still show it there).
+  const infra = SECTORS.find((s) => s.key === 'infrastructure');
+  assert.ok(
+    lonDelta(at(layout, 'sit:dyn-x:node/0').lon, infra.lonCenter) < 1e-4,
+  );
+});
+
+test('sites never move when others arrive or leave, and ignore node order', () => {
+  const first = computeLayout({
+    nodes: [
+      site(1, 'airfield', { group: 'air' }),
+      site(2, 'airfield', { group: 'air', salience: 0.2 }),
+      site(3, 'port', { group: 'naval' }),
+    ],
+    edges: [],
+  });
+  const more = {
+    nodes: [
+      site(4, 'airfield', { group: 'air', salience: 0.5 }),
+      site(1, 'airfield', { group: 'air' }),
+      site(2, 'airfield', { group: 'air', salience: 0.2 }),
+      site(5, 'airfield', { group: 'air', salience: 0.1 }),
+      site(3, 'port', { group: 'naval' }),
+    ],
+    edges: [],
+  };
+  const second = computeLayout(more, first);
+  for (const n of [1, 2, 3])
+    assert.equal(
+      at(second, `sit:dyn-x:node/${n}`).lon,
+      at(first, `sit:dyn-x:node/${n}`).lon,
+    );
+  const third = computeLayout(
+    { nodes: more.nodes.filter((node) => !node.id.endsWith('/4')), edges: [] },
+    second,
+  );
+  for (const n of [1, 2, 3, 5])
+    assert.equal(
+      at(third, `sit:dyn-x:node/${n}`).lon,
+      at(second, `sit:dyn-x:node/${n}`).lon,
+    );
+  const shuffledLayout = computeLayout({
+    ...more,
+    nodes: shuffled(more.nodes),
+  });
+  assert.deepEqual([...shuffledLayout.pos], [...computeLayout(more).pos]);
+});
+
+test('placeSectorRow and sectorRowLon are pure helpers', () => {
+  assert.equal(sectorRowLon(0, 0), -16.5);
+  assert.equal(sectorRowLon(0, 11), 16.5);
+  assert.equal(sectorRowLon(5, 6), wrapLon(180 + 1.5));
+  const row = placeSectorRow(
+    [
+      { id: 'a', sector: 2, salience: 0.5 },
+      { id: 'b', sector: 2, salience: 0.5 },
+      { id: 'c', sector: 2, salience: 0.9 },
+    ],
+    {
+      slots: 2,
+      previous: (id) => (id === 'a' ? { sector: 2, slot: 1 } : null),
+    },
+  );
+  assert.deepEqual(row.overflow, ['b'], 'ties break by id');
+  assert.deepEqual(row.slots.get('a'), { sector: 2, slot: 1 }, 'kept its slot');
+  assert.deepEqual(row.slots.get('c'), { sector: 2, slot: 0 });
 });

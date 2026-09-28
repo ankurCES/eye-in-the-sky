@@ -2,14 +2,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createBus } from './bus.js';
 import {
+  CROSSFADE_MS,
   IRIS_OPEN_MS,
   MAIN_FADE_MS,
+  MAP_COPY,
   MODE_COPY,
   MODE_STATES,
   NOTICE_MS,
   STILL_STARTING_MS,
   createIris,
   createModeController,
+  mapTargetOf,
+  theaterGroundFor,
 } from './mode.js';
 
 const flush = async (n = 4) => {
@@ -50,12 +54,39 @@ function fakeClock(start = 5_000_000) {
   };
 }
 
-function fakePort({ enter = true, keyhole = { x: 500, y: 400, r: 180 } } = {}) {
+function fakePort({
+  enter = true,
+  keyhole = { x: 500, y: 400, r: 180 },
+  map = false,
+  showArea = true,
+} = {}) {
   const calls = [];
   const cbs = new Set();
   let tracking = false;
   let pending = null;
+  // The map overview methods (WG spec §4.2.7), only when asked for.
+  const mapMethods = map
+    ? {
+        supports: (name) =>
+          [
+            'showArea',
+            'enterOverview',
+            'exitOverview',
+            'setOverlayVisibility',
+            'onPick',
+          ].includes(name),
+        showArea(target, opts) {
+          calls.push(['showArea', target, opts]);
+          if (showArea === 'throw') return Promise.reject(new Error('no'));
+          return Promise.resolve(showArea);
+        },
+        enterOverview: () => calls.push(['enterOverview']),
+        exitOverview: () => calls.push(['exitOverview']),
+        setOverlayVisibility: (v) => calls.push(['setOverlayVisibility', v]),
+      }
+    : {};
   return {
+    ...mapMethods,
     calls,
     whenReady() {
       calls.push(['whenReady']);
@@ -118,6 +149,7 @@ function setup(opts = {}) {
   const store = {
     lastStageInputAt: opts.lastInput ?? 0,
     vehicle: (name) => (opts.vehicles || {})[name] ?? null,
+    get: () => ({ graph: opts.graph ?? null }),
   };
   const root = attrEl();
   const orbCalls = [];
@@ -148,6 +180,7 @@ function setup(opts = {}) {
     clock,
     iris,
     doc: opts.doc ?? null,
+    mainRect: () => ({ left: 0, top: 0, width: 1000, height: 750 }),
   });
   const modes = [];
   bus.on('mode', (p) => modes.push(p.mode));
@@ -188,6 +221,8 @@ test('states are the contract names verbatim', () => {
     'entering_tracking',
     'tracking',
     'exiting',
+    'entering_map',
+    'map',
   ]);
 });
 
@@ -775,4 +810,472 @@ test('Stay in console returns focus to the Track control when the caption took i
   t.notices()[0].actions[0].run();
   assert.equal(t.mode.state, 'orb');
   assert.equal(doc.activeElement, opener);
+});
+
+// ---- map overview (WG spec §4.2.3, §4.2.7) --------------------------------------
+
+const KHERSON = Object.freeze({
+  ids: ['thr:dyn-kherson'],
+  bbox: [46.6, 32.55, 46.68, 32.67],
+  label: 'Kherson, Ukraine',
+});
+/** `.ic-main` is 1000 × 750 in setup(): the full iris is its centre. */
+const FULL_IRIS = { x: 500, y: 375, r: Math.hypot(1000, 750) / 2 };
+
+function mapSetup(opts = {}) {
+  return setup({ ...opts, port: { map: true, ...(opts.port || {}) } });
+}
+
+test('the map hands the port the theater ground under the area, never a guess outside it', async () => {
+  // Review: offline, the port took a coarse tile's -46114 m as the ground and
+  // the map went black. The theater's own ground is the better number.
+  const graph = {
+    theater: {
+      id: 'dyn-kherson',
+      bbox: [46.59, 32.54, 46.69, 32.68],
+      ground_msl_m: 45.4,
+      home: { alt_msl_m: 47 },
+    },
+  };
+  assert.equal(theaterGroundFor(KHERSON.bbox, graph), 45.4);
+  assert.equal(
+    theaterGroundFor(KHERSON.bbox, {
+      theater: { ...graph.theater, ground_msl_m: null },
+    }),
+    47,
+    'else the home altitude',
+  );
+  assert.equal(theaterGroundFor([12.9, 77.5, 13, 77.6], graph), null);
+  assert.equal(theaterGroundFor(KHERSON.bbox, null), null);
+  assert.equal(theaterGroundFor(KHERSON.bbox, { theater: { id: 'x' } }), null);
+  assert.equal(theaterGroundFor(null, graph), null);
+
+  const t = mapSetup({ graph });
+  t.mode.requestMap(KHERSON);
+  await flush();
+  assert.deepEqual(t.port.calls[1], [
+    'showArea',
+    { bbox: KHERSON.bbox, groundM: 45.4 },
+    { animate: false },
+  ]);
+  const far = mapSetup({ graph });
+  far.mode.requestMap({ ids: ['thr:x'], bbox: [12.9, 77.5, 13, 77.6] });
+  await flush();
+  assert.deepEqual(far.port.calls[1], [
+    'showArea',
+    { bbox: [12.9, 77.5, 13, 77.6] },
+    { animate: false },
+  ]);
+});
+
+test('mapTargetOf checks the bbox and makes the label safe text', () => {
+  const t = mapTargetOf({
+    ids: ['veh:Drone1', 'thr:x', 7],
+    bbox: [1, 2, 3, 4],
+    label: '‮evil‬ <img src=x onerror=alert(1)>',
+  });
+  assert.deepEqual(t.ids, ['veh:Drone1', 'thr:x']);
+  assert.deepEqual(t.bbox, [1, 2, 3, 4]);
+  assert.equal(t.anchor, 'thr:x', 'the theater node anchors the iris');
+  assert.equal(t.label, 'evil <img src=x onerror=alert(1)>');
+  assert.doesNotMatch(t.label, /[‪-‮⁦-⁩]/);
+  assert.equal(mapTargetOf({ bbox: [3, 2, 1, 4] }).bbox, null, 's < n');
+  assert.equal(mapTargetOf({ bbox: [1, 2, 3] }).bbox, null);
+  assert.equal(mapTargetOf({ bbox: [1, 2, 3, NaN] }).bbox, null);
+  assert.equal(mapTargetOf({ bbox: [-95, 0, 1, 1] }).bbox, null);
+  assert.deepEqual(
+    mapTargetOf({ bbox: [10, 179, 11, -179] }).bbox,
+    [10, 179, 11, -179],
+    'across the antimeridian',
+  );
+  assert.equal(mapTargetOf(null).label, null);
+  assert.equal(mapTargetOf({ ids: ['trk:1'] }).anchor, 'trk:1');
+});
+
+test("the operator's Show on map: pre-position hidden, show, overview, iris from the theater node", async () => {
+  const t = mapSetup();
+  assert.equal(t.mode.requestMap(KHERSON), 'entering');
+  assert.equal(t.mode.state, 'entering_map');
+  assert.equal(t.notices()[0].text, MAP_COPY.opening);
+  await flush();
+  assert.deepEqual(t.port.calls, [
+    ['whenReady'],
+    ['showArea', { bbox: KHERSON.bbox }, { animate: false }],
+    ['setMapVisible', true],
+    ['setViewportInset', { right: 446 }],
+    ['enterOverview'],
+    ['setOverlayVisibility', { sites: true }],
+  ]);
+  assert.deepEqual(t.irisCalls[0], [
+    'open',
+    { x: 100, y: 120, r: 8 },
+    FULL_IRIS,
+    { reduced: false },
+  ]);
+  assert.equal(t.mode.state, 'map');
+  assert.equal(t.root.attrs['data-mode'], 'map');
+  assert.deepEqual(t.modes, ['entering_map', 'map']);
+  assert.deepEqual(t.orbCalls.at(-1), ['setOptions', { paused: true }]);
+  assert.deepEqual(t.announced.at(-1), [
+    'Map of Kherson, Ukraine. Press Escape to return to the console.',
+    'polite',
+  ]);
+  assert.equal(t.mode.target.label, 'Kherson, Ukraine');
+  assert.deepEqual(t.notices(), [], 'the progress caption is gone');
+});
+
+test('Back to console from the map: the iris closes onto the node, then the overview ends', async () => {
+  const t = mapSetup();
+  t.mode.requestMap(KHERSON);
+  await flush();
+  t.port.calls.length = 0;
+  await t.mode.exit();
+  await flush();
+  assert.deepEqual(t.modes.slice(-2), ['exiting', 'orb']);
+  assert.deepEqual(t.irisCalls.at(-2), [
+    'close',
+    FULL_IRIS,
+    { x: 100, y: 120, r: 8 },
+    { reduced: false },
+  ]);
+  assert.deepEqual(t.port.calls, [
+    ['exitOverview'],
+    ['setMapVisible', false],
+    ['setViewportInset', { right: 0 }],
+  ]);
+  assert.equal(t.mode.target, null);
+  assert.deepEqual(t.orbCalls.at(-1), ['setOptions', { paused: false }]);
+});
+
+test("the analyst's map: a 3 s notice with Stay in console when the gate passes, then the map", async () => {
+  const t = mapSetup();
+  const r = t.mode.requestMap(KHERSON, {
+    source: 'analyst',
+    reason: 'Watch the recce',
+  });
+  assert.equal(r, 'countdown');
+  const n = t.notices()[0];
+  assert.equal(
+    n.text,
+    'The analyst suggests showing Kherson, Ukraine on the map: "Watch the recce". Opening the map in 3 s.',
+  );
+  assert.equal(n.actions[0].label, 'Stay in console');
+  assert.match(t.announced.at(-1)[0], /Opening the map in 3 s\./);
+  await t.clock.advance(1000);
+  assert.match(t.notices()[0].text, /Opening the map in 2 s\./);
+  assert.equal(t.port.calls.length, 0, 'nothing moves during the notice');
+  await t.clock.advance(NOTICE_MS);
+  assert.equal(t.mode.state, 'map');
+});
+
+test('Stay in console cancels the map notice; nothing moves', async () => {
+  const t = mapSetup();
+  t.mode.requestMap(KHERSON, { source: 'analyst' });
+  assert.equal(
+    t.notices()[0].text,
+    'The analyst suggests showing Kherson, Ukraine on the map. Opening the map in 3 s.',
+  );
+  t.notices()[0].actions[0].run();
+  await t.clock.advance(NOTICE_MS + 1000);
+  assert.equal(t.mode.state, 'orb');
+  assert.deepEqual(t.port.calls, []);
+});
+
+test('the gate: a failed view gate, a busy composer, recent stage input or a pending slip give a static toast with Show on map', async () => {
+  for (const arrange of [
+    (t) => ({ countdown: false }),
+    (t) => {
+      t.setIdle(false);
+      return {};
+    },
+    (t) => {
+      t.store.lastStageInputAt = t.clock.now() - 1000;
+      return {};
+    },
+    (t) => {
+      t.bus.emit('approval:pending', { count: 1 });
+      return {};
+    },
+  ]) {
+    const t = mapSetup();
+    const extra = arrange(t);
+    const r = t.mode.requestMap(KHERSON, {
+      source: 'analyst',
+      reason: 'why',
+      ...extra,
+    });
+    assert.equal(r, 'static');
+    const n = t.notices()[0];
+    assert.equal(n.kind, 'static');
+    assert.equal(
+      n.text,
+      'The analyst suggests showing Kherson, Ukraine on the map: "why".',
+    );
+    assert.deepEqual(
+      n.actions.map((a) => a.label),
+      ['Show on map'],
+    );
+    await t.clock.advance(NOTICE_MS + 1000);
+    assert.equal(t.mode.state, 'orb', 'a static toast never moves the view');
+    n.actions[0].run();
+    await flush();
+    assert.equal(t.mode.state, 'map', 'Show on map is the operator acting');
+  }
+});
+
+test('the gate is checked again when the notice runs out', async () => {
+  const t = mapSetup();
+  t.mode.requestMap(KHERSON, { source: 'analyst' });
+  await t.clock.advance(2000);
+  t.setIdle(false);
+  await t.clock.advance(1500);
+  assert.equal(t.mode.state, 'orb');
+  assert.equal(t.notices()[0].kind, 'static');
+  assert.equal(t.notices()[0].actions[0].label, 'Show on map');
+});
+
+const BENGALURU = Object.freeze({
+  ids: ['thr:dyn-blr'],
+  bbox: [12.95, 77.57, 12.99, 77.62],
+  label: 'Bengaluru centre',
+});
+
+test('in the map an analyst request reads "Moving the map to … in 3 s." with Stay here, then flies', async () => {
+  const t = mapSetup();
+  t.mode.requestMap(KHERSON);
+  await flush();
+  t.port.calls.length = 0;
+  t.mode.requestMap(BENGALURU, { source: 'analyst', reason: 'r' });
+  const n = t.notices()[0];
+  assert.equal(n.text, 'Moving the map to Bengaluru centre in 3 s.');
+  assert.equal(n.actions[0].label, 'Stay here');
+  await t.clock.advance(NOTICE_MS);
+  assert.equal(t.mode.state, 'map');
+  assert.deepEqual(t.port.calls, [
+    ['showArea', { bbox: BENGALURU.bbox }, { animate: true }],
+  ]);
+  assert.equal(t.mode.target.label, 'Bengaluru centre');
+  assert.equal(
+    t.announced.at(-1)[0],
+    'Map of Bengaluru centre. Press Escape to return to the console.',
+  );
+});
+
+test('reduced motion: the map moves with setView (animate false) and the iris is a crossfade', async () => {
+  const t = mapSetup({ reduced: true });
+  t.mode.requestMap(KHERSON);
+  await flush();
+  assert.deepEqual(t.irisCalls[0][3], { reduced: true });
+  t.port.calls.length = 0;
+  t.mode.requestMap(BENGALURU);
+  await flush();
+  assert.deepEqual(t.port.calls, [
+    ['showArea', { bbox: BENGALURU.bbox }, { animate: false }],
+  ]);
+});
+
+test('while tracking an analyst map request is a toast only; Show on map goes tracking → map', async () => {
+  const t = mapSetup();
+  t.mode.requestTrack('Drone1');
+  await flush();
+  assert.equal(t.mode.state, 'tracking');
+  assert.equal(
+    t.mode.requestMap(KHERSON, { source: 'analyst', reason: 'r' }),
+    'static',
+  );
+  await t.clock.advance(NOTICE_MS + 1000);
+  assert.equal(t.mode.state, 'tracking');
+  t.port.calls.length = 0;
+  t.notices()[0].actions[0].run();
+  await flush();
+  assert.equal(t.mode.state, 'map');
+  assert.deepEqual(t.port.names().slice(0, 5), [
+    'exit',
+    'setMapVisible',
+    'setViewportInset',
+    'enterOverview',
+    'setOverlayVisibility',
+  ]);
+  assert.deepEqual(t.port.calls.at(-1), [
+    'showArea',
+    { bbox: KHERSON.bbox },
+    { animate: true },
+  ]);
+});
+
+test('a port without showArea: every map request says so and nothing moves', async () => {
+  const t = setup();
+  assert.equal(t.mode.supportsMap(), false);
+  assert.equal(t.mode.requestMap(KHERSON), 'unsupported');
+  assert.equal(t.notices()[0].text, "The map can't show areas in this build.");
+  assert.equal(
+    t.mode.requestMap(KHERSON, { source: 'analyst' }),
+    'unsupported',
+  );
+  await t.clock.advance(NOTICE_MS + 1000);
+  assert.equal(t.mode.state, 'orb');
+  assert.deepEqual(t.port.calls, []);
+  assert.equal(t.announced.at(-1)[1], 'polite');
+});
+
+test('ids with no position: the analyst request says so; an operator one is ignored', () => {
+  const t = mapSetup();
+  assert.equal(
+    t.mode.requestMap({ ids: ['trk:9'], bbox: null }, { source: 'analyst' }),
+    'ignored',
+  );
+  assert.equal(t.notices()[0].text, MAP_COPY.noLocation);
+  const u = mapSetup();
+  assert.equal(u.mode.requestMap({ ids: ['trk:9'] }), 'ignored');
+  assert.deepEqual(u.notices(), []);
+  assert.equal(u.mode.state, 'orb');
+});
+
+test('map → Track: overview ends, a 150 ms crossfade (no iris), and Esc returns to the map', async () => {
+  const t = mapSetup();
+  t.mode.requestMap(KHERSON);
+  await flush();
+  t.port.calls.length = 0;
+  const opens = t.irisCalls.filter((c) => c[0] === 'open').length;
+  t.mode.requestTrack('Drone1', { source: 'operator' });
+  assert.equal(t.mode.state, 'entering_tracking');
+  assert.equal(t.mode.target, null);
+  await flush();
+  await t.clock.advance(CROSSFADE_MS);
+  assert.equal(t.mode.state, 'tracking');
+  assert.equal(t.mode.fromMap, true);
+  assert.deepEqual(t.port.names().slice(0, 5), [
+    'exitOverview',
+    'whenReady',
+    'setMapVisible',
+    'setViewportInset',
+    'enter',
+  ]);
+  assert.equal(
+    t.irisCalls.filter((c) => c[0] === 'open').length,
+    opens,
+    'the console is already hidden: no second iris',
+  );
+  t.port.calls.length = 0;
+  await t.mode.exit();
+  await flush();
+  assert.equal(t.mode.state, 'map');
+  assert.equal(t.mode.target.label, 'Kherson, Ukraine');
+  assert.deepEqual(t.port.names(), [
+    'exit',
+    'setMapVisible',
+    'setViewportInset',
+    'enterOverview',
+    'setOverlayVisibility',
+    'showArea',
+  ]);
+  assert.deepEqual(t.port.calls.at(-1)[1], { bbox: KHERSON.bbox });
+});
+
+test('tracking entered from the map: Back to console goes to the orb; GEV leaving its cockpit goes to the map', async () => {
+  const t = mapSetup();
+  t.mode.requestMap(KHERSON);
+  await flush();
+  t.mode.requestTrack('Drone1');
+  await flush();
+  await t.clock.advance(CROSSFADE_MS);
+  await t.mode.backToConsole();
+  await flush();
+  assert.equal(t.mode.state, 'orb');
+  assert.equal(t.mode.fromMap, false);
+
+  const u = mapSetup();
+  u.mode.requestMap(KHERSON);
+  await flush();
+  u.mode.requestTrack('Drone1');
+  await flush();
+  await u.clock.advance(CROSSFADE_MS);
+  u.port.gevExit();
+  await flush();
+  assert.equal(u.mode.state, 'map');
+});
+
+test('Stay in console while tracking starts from the map keeps the map', async () => {
+  const t = mapSetup({ port: { enter: 'never' } });
+  t.mode.requestMap(KHERSON);
+  await flush();
+  t.mode.requestTrack('Drone1');
+  await flush();
+  assert.equal(t.mode.state, 'entering_tracking');
+  t.mode.cancel();
+  assert.equal(t.mode.state, 'map');
+  assert.equal(t.mode.target.label, 'Kherson, Ukraine');
+  assert.ok(
+    !t.irisCalls.some((c) => c[0] === 'reset'),
+    'the console stays hidden under the map',
+  );
+});
+
+test('a map that cannot show the area: back to the orb with Try again', async () => {
+  const t = mapSetup({ port: { showArea: false } });
+  t.mode.requestMap(KHERSON);
+  await flush();
+  assert.equal(t.mode.state, 'orb');
+  assert.ok(!t.port.calls.some((c) => c[0] === 'setMapVisible' && c[1]));
+  const n = t.notices()[0];
+  assert.equal(n.kind, 'error');
+  assert.equal(n.text, MAP_COPY.didntOpen);
+  assert.deepEqual(
+    n.actions.map((a) => a.label),
+    ['Try again', 'Stay in console'],
+  );
+  assert.equal(t.announced.at(-1)[1], 'assertive');
+  const u = mapSetup({ port: { showArea: 'throw' } });
+  u.mode.requestMap(KHERSON);
+  await flush();
+  assert.equal(u.mode.state, 'orb');
+});
+
+test('Stay in console while the map opens hides it again', async () => {
+  const t = mapSetup();
+  t.mode.requestMap(KHERSON);
+  assert.equal(t.mode.state, 'entering_map');
+  t.notices()[0].actions[0].run();
+  await flush();
+  assert.equal(t.mode.state, 'orb');
+  assert.equal(t.mode.target, null);
+  assert.ok(!t.port.calls.some((c) => c[0] === 'setMapVisible' && c[1]));
+});
+
+test("'map:request' on the bus: the operator's acts at once, the analyst's follows its countdown flag", async () => {
+  const t = mapSetup();
+  t.bus.emit('map:request', {
+    ...KHERSON,
+    source: 'analyst',
+    reason: 'r',
+    countdown: false,
+  });
+  assert.equal(t.notices()[0].kind, 'static');
+  t.bus.emit('map:request', { ...KHERSON, source: 'operator' });
+  await flush();
+  assert.equal(t.mode.state, 'map');
+  t.bus.emit('map:request', { ...BENGALURU, source: 'something-else' });
+  assert.equal(
+    t.notices()[0].text,
+    'Moving the map to Bengaluru centre in 3 s.',
+    'an unknown source is never the operator',
+  );
+});
+
+test('the Sites switch reaches the overlay while in the map', async () => {
+  const t = mapSetup();
+  t.mode.setOverlays({ sites: false });
+  assert.ok(!t.port.names().includes('setOverlayVisibility'));
+  t.mode.requestMap(KHERSON);
+  await flush();
+  assert.deepEqual(
+    t.port.calls.find((c) => c[0] === 'setOverlayVisibility'),
+    ['setOverlayVisibility', { sites: false }],
+  );
+  t.mode.setOverlays({ sites: true });
+  assert.deepEqual(t.port.calls.at(-1), [
+    'setOverlayVisibility',
+    { sites: true },
+  ]);
+  assert.deepEqual(t.mode.overlays, { sites: true });
 });

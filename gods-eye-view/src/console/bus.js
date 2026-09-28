@@ -9,7 +9,13 @@
  * - `abort:request` {vehicle}
  * - `ask` {text, focused_ids?, draft?}
  * - `search:filter` {ids|null, query, source?}
- * - `mode` {mode:'orb'|'entering_tracking'|'tracking'|'exiting', vehicle?}
+ * - `mode` {mode:'orb'|'entering_tracking'|'tracking'|'entering_map'|'map'|'exiting',
+ *   vehicle?}
+ * - `map:request` {ids, bbox?:[s,w,n,e]|null, label?, reason?,
+ *   source:'operator'|'analyst', countdown?:boolean}: open (or move) the map
+ *   overview (WG §4.2.3, §4.2.7). mode.js opens it at once for the operator,
+ *   and for the analyst shows the 3 s notice, or a static toast when
+ *   `countdown` is false (the view's gate failed).
  * - `alarm:viewed` {id}
  * - `layout` {layout:'wide'|'compact'|'narrow'}
  * - `analyst:availability` {available, reason?, hint?}
@@ -33,6 +39,7 @@ export const BUS_EVENTS = Object.freeze([
   'layout',
   'analyst:availability',
   'approval:pending',
+  'map:request',
   // Additive, between console owners and GEV:
   'inspector:state', // {open, id} from the inspector (plate viewport)
   'gev:status', // {state, phase, message?} from src/main.js (map start-up)

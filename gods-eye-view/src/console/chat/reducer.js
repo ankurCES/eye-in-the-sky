@@ -203,12 +203,22 @@ function addGrants(grants, tools, at, confirmed) {
   return next;
 }
 
+/** A preview object from the server, or null (WG spec §3.6). */
+const previewObj = (value) =>
+  value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+
 function approvalFrom(data, at, seq, replay, turnId) {
   return {
     id: String(data.approval_id),
     callId: str(data.call_id),
     tool: str(data.tool) || '',
     klass: classKey(data.class),
+    // The class word as the server sent it: an unknown class shows it on a
+    // Deny-only slip (WG spec §4.2.1). Never used to decide anything.
+    rawClass: str(data.class),
+    acknowledgeRequired: data.acknowledge_required === true,
+    theaterPreview: previewObj(data.theater_preview),
+    timeScalePreview: previewObj(data.time_scale_preview),
     title: str(data.title) || str(data.tool) || '',
     summary: str(data.summary) || '',
     args: data.args && typeof data.args === 'object' ? data.args : {},
@@ -605,17 +615,28 @@ function onToolResult(state, data, at, replay) {
   });
 }
 
+/** At most this many ids on one `ui map` directive (WG spec §3.7). */
+export const MAP_IDS_MAX = 50;
+
 function onUi(state, data, at, seq, replay) {
   const action = str(data.action);
   if (!action) return state;
+  let ids = arr(data.ids)
+    .filter((v) => v != null && v !== '')
+    .map(String);
+  let id = str(data.id);
+  if (action === 'map') ids = ids.slice(0, MAP_IDS_MAX);
+  // `ui theater` names one `thr:` node; a list-shaped one still works.
+  if (action === 'theater' && !id && ids.length) id = ids[0];
   const directive = {
     kind: 'directive',
     action,
-    ids: arr(data.ids).map(String),
+    ids,
     note: str(data.note),
     vehicle: str(data.vehicle),
     reason: str(data.reason),
-    id: str(data.id),
+    id,
+    label: str(data.label),
     at: at ?? null,
     seq,
     replay: Boolean(replay),

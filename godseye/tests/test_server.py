@@ -1341,7 +1341,10 @@ def test_every_mutating_tool_accepts_an_idempotency_key(server):
                  "uav_assess_threat", "uav_scan_targets", "mission_status",
                  "mission_dry_run", "uav_abort",
                  # Real-world data reads: they observe, they change nothing.
-                 "uav_real_data_status", "uav_deconflict_airspace"}
+                 "uav_real_data_status", "uav_deconflict_airspace",
+                 # WG §3.7: Phase A's read and plan tools (A7). A proposal is
+                 # a plan; nothing changes until sim_set_theater runs.
+                 "geo_lookup", "geo_sites", "theater_propose"}
     missing = [n for n in server.mcp._tool_manager._tools
                if n not in read_only and "idempotency_key" not in schema_of(server, n)]
     assert not missing, f"mutating tools with no idempotency_key: {missing}"
@@ -5357,36 +5360,36 @@ def test_a_fuel_row_naming_an_unknown_airframe_does_not_kill_the_boot(tmp_path):
             "the summary counts an un-restored vehicle as restored")
 
 
-def test_a_journal_that_names_another_airframe_reprices_the_recovered_burn(tmp_path):
-    """from_dict's documented rule, applied by the restore: the JOURNAL wins.
+def test_a_journal_that_names_another_airframe_starts_a_full_tank(tmp_path):
+    """WG §4.1.4 (replaces the old "the JOURNAL wins" rule): a fuel row flown by
+    ANOTHER airframe is not restored.
 
-    Replaying a burn under a different energy model re-prices every second of
-    it, so the airframe travels with the state and brings its own rate table.
-    Keeping this process's configured profile would recover the right fuel
-    percentage on the wrong burn curve — and the BINGO line derived from it
-    would be wrong, quietly.
+    The booted process prices every second by its own airframe. Re-pricing the
+    journal's burn under the other profile would hand back a percentage on the
+    wrong curve, so the vehicle starts a full tank on the booted airframe and
+    the drop is audited `fuel_restore_airframe_mismatch`, never silent.
     """
     from godseye_uav.safety import AIRFRAMES, DEFAULT_AIRFRAME_ID, get_airframe
     other = next(i for i in sorted(AIRFRAMES) if i != DEFAULT_AIRFRAME_ID)
     _seed_fuel_row(tmp_path, airframe=other)
     with _restart_server(tmp_path) as srv:
         fm = srv.fuel_for("Drone1")
-        assert fm.airframe.id == other, (
-            f"the recovered burn is priced by {fm.airframe.id!r}, but the "
-            f"journal says it was flown by {other!r}")
-        profile = get_airframe(other)
-        assert fm.rates == profile.rates_pct_per_s(), (
-            "the fuel percentage came back but the BURN TABLE did not: the "
-            "recovered clock is priced by the wrong energy model")
-        assert fm.capacity_s_cruise == pytest.approx(profile.endurance_cruise_s)
-        # the two profiles really do differ, so the assertions above bite
+        assert fm.airframe.id == DEFAULT_AIRFRAME_ID, (
+            f"the burn is priced by {fm.airframe.id!r}; the booted airframe is "
+            f"{DEFAULT_AIRFRAME_ID!r}")
+        assert fm.fuel_pct == 100.0 and not fm.bingo.tripped, (
+            "a row from another airframe must start a full, un-latched tank")
         default = get_airframe(DEFAULT_AIRFRAME_ID)
-        assert default.endurance_cruise_s != profile.endurance_cruise_s
-        assert default.rates_pct_per_s() != profile.rates_pct_per_s()
+        assert fm.rates == default.rates_pct_per_s()
+        # the two profiles really do differ, so the assertions above bite
+        assert default.rates_pct_per_s() != get_airframe(other).rates_pct_per_s()
         row = next(r for r in srv.boot_restored["fuel"] if r["vehicle"] == "Drone1")
-        assert row["airframe"] == other
-        assert any("JOURNAL" in n for n in row["notes"]), row["notes"]
-        assert "airframe" not in row["fields_absent_from_row"]
+        assert row["restored"] is False and row["row_airframe"] == other
+        assert "Drone1" in srv.boot_restored["fuel_not_restored"]
+        mism = [r for r in srv.store.audit.read_all()
+                if r.get("kind") == "fuel_restore_airframe_mismatch"]
+        assert len(mism) == 1 and mism[0]["row_airframe"] == other
+        assert mism[0]["airframe"] == DEFAULT_AIRFRAME_ID
 
 
 def _repath_mission(srv, track_id, **kw):

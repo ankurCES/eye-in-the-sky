@@ -111,6 +111,12 @@ godseye_uav = ["data/*.tif", "analyst_prompt.md"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["mcp"]
+# The egress guard in tests/conftest.py blocks every non-local connect; a test
+# that really needs the internet is marked live_net and runs only when
+# GODSEYE_LIVE_NET=1 (never in CI).
+markers = [
+    "live_net: touches the real network; skipped unless GODSEYE_LIVE_NET=1, which lifts the egress guard for that test",
+]
 
 [tool.ruff]
 line-length = 100

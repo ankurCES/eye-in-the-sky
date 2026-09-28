@@ -10,10 +10,14 @@ import {
   detectionsFeed,
   emptyHeading,
   flyingNow,
+  mapLineText,
+  resolveMapArea,
   shouldAutoTrack,
+  shouldShowMap,
   suggestedPrompts,
 } from './view.js';
 import { ARM_MS, DBLCLICK_MS } from './slip.js';
+import { createChip } from './chips.js';
 
 // ---- stub DOM -------------------------------------------------------------------------
 
@@ -333,6 +337,7 @@ async function mountView({
   modeState = 'orb',
   modeVehicle = null,
   liveMotion = false,
+  raf = null,
 } = {}) {
   const doc = stubDoc();
   globalThis.document = doc;
@@ -368,8 +373,8 @@ async function mountView({
       announce: (text, politeness) => announced.push([text, politeness]),
     },
     liveMotion
-      ? { doc, now: clock.now, clock, raf: null }
-      : { doc, now: clock.now, clock, raf: null, reducedMotion: false },
+      ? { doc, now: clock.now, clock, raf }
+      : { doc, now: clock.now, clock, raf, reducedMotion: false },
   );
   await flush();
   return {
@@ -722,6 +727,46 @@ test('auto-track: an approved launch that ran asks to track when the console is 
     ],
   );
   assert.ok(textOf(host).includes('Asked to watch Drone1: mission launched.'));
+});
+
+test('auto-track: a slip resolved in the same batch as the launch publishes count 0 before the track request', async () => {
+  // E2E A1 step 5 (A14): the approval, the tool result and `ui track` can
+  // land before the next render. mode.js gates on the bus count, so the view
+  // must publish the pending count before it asks to track.
+  const frames = [];
+  const runFrames = () => {
+    while (frames.length) frames.shift()();
+  };
+  const { chat, emitted } = await mountView({ raf: (cb) => frames.push(cb) });
+  launch(chat, { approve: false });
+  runFrames(); // the slip is on screen: count 1 was published
+  assert.equal(
+    emitted.filter(([e]) => e === 'approval:pending').at(-1)[1].count,
+    1,
+  );
+  chat.event(
+    'approval_resolved',
+    { approval_id: 'a1', call_id: 'c1', decision: 'approved' },
+    next(),
+  );
+  chat.event(
+    'tool_result',
+    { call_id: 'c1', ok: true, summary: 'Mission MSN-1 started' },
+    next(),
+  );
+  chat.event(
+    'ui',
+    { action: 'track', vehicle: 'Drone1', reason: 'mission launched' },
+    next(),
+  );
+  const order = emitted
+    .map(([e, p], i) => [e, p, i])
+    .filter(([e]) => e === 'approval:pending' || e === 'track:request');
+  const trackAt = order.findIndex(([e]) => e === 'track:request');
+  assert.ok(trackAt > 0, 'the launch asks to track (no frame has run yet)');
+  assert.deepEqual(order[trackAt - 1][0], 'approval:pending');
+  assert.equal(order[trackAt - 1][1].count, 0);
+  runFrames();
 });
 
 test('auto-track never fires on busy or a refused launch', async () => {
@@ -2398,4 +2443,378 @@ test('an unreliable cost basis hides dollars and says why', async () => {
     textOf(find(host, cls('ic-msg__usage'))),
     /Cost isn't shown: MiniMax bills you directly\./,
   );
+});
+
+// ---- WG Phase A: theater and map directives, theater slips, chips ----------------------
+
+const XSS = '<img src=x onerror=alert(1)>';
+const THEATER_BBOX = [46.60898, 32.57838, 46.66186, 32.65536];
+
+function theaterGraph(extra = {}) {
+  const g = graphFixture();
+  g.theater = {
+    id: 'dyn-kherson',
+    label: 'Kherson',
+    epoch: 1,
+    bbox: THEATER_BBOX,
+    ...(extra.theater || {}),
+  };
+  g.nodes.push({
+    id: 'thr:dyn-kherson',
+    type: 'theater',
+    label: extra.label ?? 'Kherson',
+    status: 'ok',
+    attrs: { bbox: THEATER_BBOX },
+  });
+  g.nodes.push({
+    id: 'sit:dyn-kherson:way/1',
+    type: 'site',
+    label: 'Kherson airfield',
+    status: 'ok',
+    lat: 46.67,
+    lon: 32.5,
+    attrs: { category: 'airfield' },
+  });
+  return g;
+}
+
+test('ui theater writes one line with a chip and Show on map, and never moves the view', async () => {
+  const { chat, host, emitted } = await mountView({ graph: theaterGraph() });
+  turn(chat, 'Set the theater to Kherson');
+  chat.event('ui', { action: 'theater', id: 'thr:dyn-kherson' }, next());
+  chat.event('ui', { action: 'theater', id: 'thr:dyn-kherson' }, next());
+  assert.deepEqual(
+    emitted.filter(([e]) => e === 'map:request'),
+    [],
+    'the directive alone never opens the map',
+  );
+  const lines = findAll(host, cls('ic-directive'));
+  assert.equal(lines.length, 2);
+  assert.equal(textOf(lines[0]), textOf(lines[1]), 'idempotent');
+  assert.ok(textOf(lines[0]).startsWith('Theater set to Kherson.'));
+  const chip = find(lines[0], cls('ic-chip'));
+  assert.equal(chip.attrs['data-id'], 'thr:dyn-kherson');
+  assert.equal(chip.attrs.tabindex, '0');
+  buttonNamed(lines[0], 'Show on map').fire('click');
+  assert.deepEqual(
+    emitted.filter(([e]) => e === 'map:request'),
+    [
+      [
+        'map:request',
+        {
+          ids: ['thr:dyn-kherson'],
+          bbox: THEATER_BBOX,
+          label: 'Kherson',
+          source: 'operator',
+          countdown: false,
+        },
+      ],
+    ],
+  );
+});
+
+test('ui map: the gate decides between the 3 s notice and a static offer', async () => {
+  const { chat, host, emitted, view } = await mountView({
+    graph: theaterGraph(),
+  });
+  turn(chat, 'Show me');
+  chat.event(
+    'ui',
+    { action: 'map', ids: ['thr:dyn-kherson'], reason: 'Watch the recce' },
+    next(),
+  );
+  const first = emitted.filter(([e]) => e === 'map:request').at(-1)[1];
+  assert.deepEqual(first, {
+    ids: ['thr:dyn-kherson'],
+    bbox: THEATER_BBOX,
+    label: 'Kherson',
+    reason: 'Watch the recce',
+    source: 'analyst',
+    countdown: true,
+    gate: null,
+  });
+  let lines = findAll(host, cls('ic-directive'));
+  assert.ok(
+    textOf(lines.at(-1)).startsWith(
+      'Asked to show Kherson on the map: Watch the recce.',
+    ),
+  );
+  assert.ok(buttonNamed(lines.at(-1), 'Show on map'));
+  // Composer text: no countdown, a static offer, and the "suggests" line.
+  view.insert('half-typed');
+  chat.event(
+    'ui',
+    { action: 'map', ids: ['sit:dyn-kherson:way/1'], reason: 'Airfield' },
+    next(),
+  );
+  const second = emitted.filter(([e]) => e === 'map:request').at(-1)[1];
+  assert.equal(second.countdown, false);
+  assert.equal(second.gate, 'composer');
+  assert.equal(second.label, 'Kherson airfield');
+  lines = findAll(host, cls('ic-directive'));
+  assert.ok(
+    textOf(lines.at(-1)).startsWith(
+      'The analyst suggests showing Kherson airfield on the map: “Airfield”.',
+    ),
+  );
+  // Ids without a position: no request, the fixed line, no button.
+  const before = emitted.filter(([e]) => e === 'map:request').length;
+  chat.event('ui', { action: 'map', ids: ['trk:T-1'] }, next());
+  assert.equal(emitted.filter(([e]) => e === 'map:request').length, before);
+  lines = findAll(host, cls('ic-directive'));
+  assert.equal(
+    textOf(lines.at(-1)),
+    'The analyst asked to show something without a location on the map.',
+  );
+  assert.equal(buttonNamed(lines.at(-1), 'Show on map'), null);
+});
+
+test('ui map never runs from replayed history', async () => {
+  const { chat, emitted } = await mountView({ graph: theaterGraph() });
+  seq = 0;
+  chat.event('session', { session_id: 's1', last_seq: 2 }, 0);
+  chat.event('turn_start', { turn_id: 't0', text: 'old' }, 1, { replay: true });
+  chat.event('ui', { action: 'map', ids: ['thr:dyn-kherson'] }, 2, {
+    replay: true,
+  });
+  assert.deepEqual(
+    emitted.filter(([e]) => e === 'map:request'),
+    [],
+  );
+});
+
+function theaterRequest(chat, extra = {}) {
+  chat.event(
+    'approval_request',
+    {
+      approval_id: 'th1',
+      call_id: 'cth1',
+      tool: 'sim_set_theater',
+      class: 'sim',
+      title: 'Set the theater',
+      summary: 'Kherson',
+      consequences: ['Moves the simulation to Kherson.'],
+      args: { label: 'Kherson' },
+      expires_at_ms: T0 + 600_000,
+      theater_preview: {
+        place: 'Kherson, Ukraine',
+        center: [46.63542, 32.61687],
+        bbox: THEATER_BBOX,
+        home: { lat: 46.638, lon: 32.619 },
+        airframe: { label: 'Quad, small electric', reach_m: 7350 },
+        ground_msl_m: 925,
+        checks: [{ text: 'Drone1 on the ground', ok: true }],
+      },
+      ...extra,
+    },
+    next(),
+  );
+}
+
+const approveIn = (root) =>
+  find(root, (el) => /^approve/.test(el.attrs?.['data-action'] || ''));
+
+test('a theater slip goes Deny-only when a drone takes off or the epoch moves on', async () => {
+  const graph = theaterGraph();
+  const { chat, host, store, announced } = await mountView({ graph });
+  turn(chat, 'Move to Kherson');
+  theaterRequest(chat);
+  let slip = find(host, cls('ic-slip'));
+  assert.ok(approveIn(slip), 'approvable while everything is landed');
+  assert.ok(textOf(slip).includes('Right now Drone1 is on the ground'));
+  assert.deepEqual(announced.at(-1), [
+    'Approval needed: Set the theater. Changes the simulation.',
+    'assertive',
+  ]);
+  // Drone1 takes off: the store change re-renders the slip as blocked.
+  graph.nodes[0].attrs.landed = false;
+  store.change();
+  await flush();
+  slip = find(host, cls('ic-slip'));
+  assert.equal(approveIn(slip), null);
+  assert.equal(
+    textOf(find(slip, cls('ic-slip__denyonly'))),
+    "This can't be approved now: Drone1 is airborne. Land Drone1 first, then ask again.",
+  );
+  // Landed again, but the theater epoch changed since the request.
+  graph.nodes[0].attrs.landed = true;
+  graph.theater = { ...graph.theater, epoch: 2 };
+  store.change();
+  await flush();
+  slip = find(host, cls('ic-slip'));
+  assert.equal(approveIn(slip), null);
+  assert.equal(
+    textOf(find(slip, cls('ic-slip__denyonly'))),
+    "This can't be approved now: the theater changed after this request.",
+  );
+});
+
+test('an injected class "zzz" and a theater slip without a preview are Deny-only in the view', async () => {
+  const { chat, host, view } = await mountView({ graph: theaterGraph() });
+  turn(chat, 'x');
+  chat.event(
+    'approval_request',
+    {
+      approval_id: 'z1',
+      call_id: 'cz1',
+      tool: 'zzz_tool',
+      class: 'zzz',
+      title: 'Something new',
+      consequences: [],
+      args: {},
+      expires_at_ms: T0 + 600_000,
+    },
+    next(),
+  );
+  theaterRequest(chat, {
+    approval_id: 'th2',
+    call_id: 'cth2',
+    theater_preview: undefined,
+  });
+  const slips = findAll(host, cls('ic-slip'));
+  assert.equal(slips.length, 2);
+  for (const slip of slips) assert.equal(approveIn(slip), null);
+  assert.equal(slips[0].attrs['data-class'], 'unknown');
+  assert.ok(textOf(slips[0]).includes('Unrecognised action'));
+  assert.equal(
+    textOf(find(slips[1], cls('ic-slip__denyonly'))),
+    "The console couldn't build this preview, so it can't be approved.",
+  );
+  // The call's row carries the unknown class too (a stale band, never command).
+  assert.equal(view.state.rows.cz1.klass, 'unknown');
+});
+
+test('directive lines render untrusted labels and reasons as text (§3.11)', async () => {
+  const { chat, host } = await mountView({
+    graph: theaterGraph({ label: `${XSS}‮evil‬` }),
+  });
+  turn(chat, 'x');
+  chat.event('ui', { action: 'theater', id: 'thr:dyn-kherson' }, next());
+  chat.event(
+    'ui',
+    { action: 'map', ids: ['thr:dyn-kherson'], reason: `${XSS}‮` },
+    next(),
+  );
+  const lines = findAll(host, cls('ic-directive'));
+  assert.equal(lines.length, 2);
+  for (const line of lines) {
+    assert.equal(
+      find(line, (el) => el.tag === 'img'),
+      null,
+    );
+    assert.equal(
+      find(line, (el) => el.attrs && Object.hasOwn(el.attrs, 'onerror')),
+      null,
+    );
+    assert.ok(textOf(line).includes('<img src=x onerror=alert(1)>'));
+    assert.ok(!BIDI.test(textOf(line)));
+  }
+});
+
+test('resolveMapArea: theater bbox, vector, padded points, 1 km minimum, missing', () => {
+  const graph = theaterGraph();
+  const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+  const lookup = (id) => byId.get(id) ?? null;
+  assert.deepEqual(resolveMapArea(['thr:dyn-kherson'], lookup, graph), {
+    bbox: THEATER_BBOX,
+    label: 'Kherson',
+    missing: [],
+  });
+  // The active theater's block when its node has no bbox.
+  const bare = { ...graph, nodes: [] };
+  assert.deepEqual(
+    resolveMapArea(['thr:dyn-kherson'], () => null, bare).bbox,
+    THEATER_BBOX,
+  );
+  // One point: at least 1 km each way, about the point.
+  const one = resolveMapArea(['sit:dyn-kherson:way/1'], lookup, graph);
+  const [s, w, n, e] = one.bbox;
+  const hM = (n - s) * 111195;
+  const wM = (e - w) * 111195 * Math.cos((46.67 * Math.PI) / 180);
+  assert.ok(Math.abs(hM - 1000) < 1 && Math.abs(wM - 1000) < 1, `${hM} ${wM}`);
+  assert.ok(Math.abs((s + n) / 2 - 46.67) < 1e-9);
+  // Two far points: 15 % padding on each side of the span.
+  const pts = new Map([
+    ['veh:A', { id: 'veh:A', lat: 46.0, lon: 32.0 }],
+    ['veh:B', { id: 'veh:B', lat: 46.2, lon: 32.4 }],
+  ]);
+  const two = resolveMapArea(['veh:A', 'veh:B'], (id) => pts.get(id), null);
+  assert.deepEqual(
+    two.bbox.map((v) => Number(v.toFixed(6))),
+    [45.97, 31.94, 46.23, 32.46],
+  );
+  assert.equal(two.label, '2 items');
+  // A vector: centre ± half-length × 1.15.
+  const vec = {
+    id: 'vec:cor-1',
+    lat: 46.5,
+    lon: 32.5,
+    attrs: { length_m: 4000 },
+  };
+  const v = resolveMapArea(['vec:cor-1'], () => vec, null).bbox;
+  assert.ok(Math.abs((v[2] - v[0]) * 111195 - 4600) < 1);
+  // Nothing with a position.
+  assert.deepEqual(resolveMapArea(['trk:T-1'], lookup, graph), {
+    bbox: null,
+    label: 'SA-6 battery',
+    missing: ['trk:T-1'],
+  });
+  assert.equal(
+    mapLineText({ reason: null }, { bbox: null }, null),
+    'The analyst asked to show something without a location on the map.',
+  );
+});
+
+test('shouldShowMap: the UX §6.9 gate', () => {
+  const base = {
+    composerText: '',
+    composerFocused: false,
+    lastStageInputAt: T0 - 10_000,
+    now: T0,
+    pendingCount: 0,
+    mode: 'orb',
+  };
+  assert.deepEqual(shouldShowMap(base), { allowed: true, reason: null });
+  assert.equal(shouldShowMap({ ...base, mode: 'map' }).allowed, true);
+  assert.equal(shouldShowMap({ ...base, mode: 'tracking' }).reason, 'tracking');
+  assert.equal(
+    shouldShowMap({ ...base, composerText: 'x' }).reason,
+    'composer',
+  );
+  assert.equal(
+    shouldShowMap({ ...base, composerFocused: true }).reason,
+    'composer',
+  );
+  assert.equal(
+    shouldShowMap({ ...base, lastStageInputAt: T0 - 2999 }).reason,
+    'stage_input',
+  );
+  assert.equal(
+    shouldShowMap({ ...base, pendingCount: 1 }).reason,
+    'slip_pending',
+  );
+});
+
+test('chips: sites are known; an unrecognised type is never status-coloured', () => {
+  globalThis.document = stubDoc();
+  const store = fakeStore(theaterGraph());
+  const site = createChip({ id: 'sit:dyn-kherson:way/1' }, { store });
+  assert.equal(site.attrs['data-type'], 'site');
+  assert.equal(textOf(site).includes('Kherson airfield'), true);
+  store.graph.nodes.push({
+    id: 'frc:red-sam-1',
+    type: 'force',
+    label: `${XSS}‮`,
+    status: 'ok',
+    attrs: {},
+  });
+  const odd = createChip({ id: 'frc:red-sam-1' }, { store });
+  assert.equal(odd.attrs['data-status'], 'unknown', 'never ok/green');
+  assert.equal(odd.attrs['data-type'], 'unrecognised');
+  assert.equal(
+    find(odd, (el) => el.tag === 'img'),
+    null,
+  );
+  assert.ok(textOf(odd).includes('<img src=x onerror=alert(1)>'));
+  assert.ok(!BIDI.test(textOf(odd)));
 });

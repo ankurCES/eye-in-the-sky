@@ -1,0 +1,8 @@
+{
+  "version": 0.6, "generator": "Overpass API 0.7.62.1 084b4234",
+  "elements": [
+    {"type": "way", "id": 24591212,
+     "bounds": {"minlat": 46.6601, "minlon": 32.4889, "maxlat": 46.6789, "maxlon": 32.5198}}
+  ],
+  "remark": "runtime error: Query timed out in \"query\" at line 3 after 61 seconds."
+}

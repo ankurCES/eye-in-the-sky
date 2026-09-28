@@ -6,7 +6,18 @@
  * node radius is 9 units. `glyphSvg()` builds markup ONLY from the constants
  * below — every caller-supplied value is looked up or clamped — so its output
  * is safe to assign to innerHTML. Icon fonts are never used for these.
+ *
+ * Fail-safe (WG spec §4.2.1): a node type the console does not know draws
+ * as the lilac `unrecognised` glyph, whatever its status, and is never
+ * green. Sites draw their category glyph stroked in Pencil (§4.2.6).
  */
+
+import {
+  SITE_CATEGORIES,
+  SITE_GLYPHS,
+  UNRECOGNISED_GLYPH,
+  siteCategoryKey,
+} from './glyphPaths.js';
 
 export const COLORS = Object.freeze({
   slate: '#1B2630',
@@ -41,7 +52,7 @@ const STATUS_SET = new Set(STATUSES);
 /** Contacts and units: never green; an assessed-low contact is film white. */
 const CONTACT_TYPES = new Set(['track', 'unit']);
 /** Reference data and places: always Pencil, never status-coloured. */
-const NEUTRAL_TYPES = new Set(['equipment', 'poi']);
+const NEUTRAL_TYPES = new Set(['equipment', 'poi', 'site']);
 
 /** Normalise a status string to one of STATUSES (unknown otherwise). */
 export function statusKey(status) {
@@ -54,6 +65,7 @@ export function statusKey(status) {
  * sam") is Pencil, so it and its `about` edges never read as "fine".
  */
 export function statusColor(type, status) {
+  if (!isKnownType(type)) return COLORS.unknown;
   if (NEUTRAL_TYPES.has(type)) return COLORS.pencil;
   const key = statusKey(status);
   if (key === 'ok') {
@@ -107,9 +119,41 @@ export const GLYPHS = Object.freeze({
 /** The slash over a feed that is down ("No reading"). */
 export const GLYPH_SLASH = 'M3 21.5L21 2.5';
 
-/** Glyph spec for a type, falling back to the contact circle. */
-export function glyphFor(type) {
-  return Object.hasOwn(GLYPHS, type) ? GLYPHS[type] : GLYPHS.track;
+/** Every node type the console knows (the contract's ten plus `site`). */
+export const NODE_TYPES = Object.freeze([...Object.keys(GLYPHS), 'site']);
+const KNOWN_TYPES = new Set(NODE_TYPES);
+
+/** Whether the console knows how to draw and word a node type. */
+export function isKnownType(type) {
+  return typeof type === 'string' && KNOWN_TYPES.has(type);
+}
+
+/** The fail-safe glyph for a type the console does not know (§4.2.1). */
+export const GLYPH_UNRECOGNISED = Object.freeze({
+  path: UNRECOGNISED_GLYPH,
+  filled: false,
+});
+
+/** {[category]: {path, filled}} for site nodes: outlines only. */
+export const SITE_GLYPH_SPECS = Object.freeze(
+  Object.fromEntries(
+    SITE_CATEGORIES.map((key) => [
+      key,
+      Object.freeze({ path: SITE_GLYPHS[key], filled: false }),
+    ]),
+  ),
+);
+
+/**
+ * Glyph spec for a type. Sites take their category's glyph (`other` when the
+ * category is unknown); a type the console does not know takes the
+ * `unrecognised` glyph, never another type's.
+ * @param {string} type node type
+ * @param {{category?: string}} [options] a site's `attrs.category`
+ */
+export function glyphFor(type, { category } = {}) {
+  if (type === 'site') return SITE_GLYPH_SPECS[siteCategoryKey(category)];
+  return isKnownType(type) ? GLYPHS[type] : GLYPH_UNRECOGNISED;
 }
 
 /** Mission phase → how the diamond is painted. */
@@ -136,8 +180,14 @@ export function glyphStyle(type, status, { phase } = {}) {
     outerRing: null,
     color,
   };
+  // Fail-safe: status is ignored for a type the console does not know.
+  if (!isKnownType(type)) {
+    style.stroke = COLORS.unknown;
+    return style;
+  }
   if (NEUTRAL_TYPES.has(type)) {
-    style.fill = COLORS.pencil;
+    if (glyphFor(type).filled) style.fill = COLORS.pencil;
+    else style.stroke = COLORS.pencil;
     return style;
   }
   if (type === 'mission') {
@@ -193,22 +243,20 @@ const PHASES = new Set([
 
 /**
  * Inline SVG markup for a node glyph (chips, search rows, the inspector).
- * Built from constants only: `type`, `status` and `phase` are looked up and
- * `size` is clamped, so the result is safe for innerHTML.
+ * Built from constants only: `type`, `status`, `phase` and `category` are
+ * looked up and `size` is clamped, so the result is safe for innerHTML. An
+ * unknown type draws the lilac `unrecognised` glyph (§4.2.1).
  * @param {string} type node type
- * @param {{status?: string, size?: number, phase?: string}} [options]
+ * @param {{status?: string, size?: number, phase?: string, category?: string}} [options]
  * @returns {string}
  */
-export function glyphSvg(type, { status, size = 16, phase } = {}) {
-  const glyph = glyphFor(type);
+export function glyphSvg(type, { status, size = 16, phase, category } = {}) {
+  const safeType = isKnownType(type) ? type : '';
+  const glyph = glyphFor(safeType, { category });
   const px = Math.round(Math.min(64, Math.max(8, Number(size) || 16)));
-  const style = glyphStyle(
-    Object.hasOwn(GLYPHS, type) ? type : 'track',
-    statusKey(status),
-    {
-      phase: PHASES.has(phase) ? phase : undefined,
-    },
-  );
+  const style = glyphStyle(safeType, statusKey(status), {
+    phase: PHASES.has(phase) ? phase : undefined,
+  });
   const attrs = [];
   attrs.push(`fill="${style.fill || 'none'}"`);
   if (style.fill && style.fillAlpha < 1)

@@ -19,7 +19,21 @@
 import { h, replaceKids, setHidden } from '../ui/uavDom.js';
 import { renderDom } from './chat/markdown.js';
 import { lostLinkLine } from './chat/slip.js';
+import { isKnownType } from './orb/glyphs.js';
+import { safeText } from './orb/placeText.js';
 import { cleanSubtitle } from './orb/text.js';
+import {
+  SITE_PROTECTED_TEXT,
+  isPlaceType,
+  placeMapRequest,
+  recceText,
+  siteBody,
+  siteHeader,
+  siteOffGraphLine,
+  theaterBody,
+  unknownBody,
+  unknownTitle,
+} from './inspectorPlaces.js';
 import {
   ICON,
   NOT_IN_PICTURE,
@@ -58,7 +72,9 @@ import {
   registerTag,
   restoreFocus,
   segments,
+  simTimeSuffix,
   statusWord,
+  timeScaleOf,
   toneOf,
   vehicleStateWord,
   zulu,
@@ -295,13 +311,19 @@ const PREFIX_TYPE = Object.freeze({
   poi: 'poi',
   alarm: 'alarm',
   feed: 'feed',
+  sit: 'site',
 });
 
-/** Node type from an id prefix ("veh:Drone1" -> "vehicle"); contacts by default. */
+/**
+ * Node type from an id prefix ("veh:Drone1" -> "vehicle", "sit:…" ->
+ * "site"). A bare id is a contact; a prefix the console doesn't know is
+ * `'unknown'` (WG §4.2.1), never another type.
+ */
 export function typeFromId(id) {
   const s = String(id ?? '');
   const i = s.indexOf(':');
-  return (i > 0 && PREFIX_TYPE[s.slice(0, i)]) || 'track';
+  if (i <= 0) return 'track';
+  return PREFIX_TYPE[s.slice(0, i)] || 'unknown';
 }
 
 /** The vehicle a Track/Abort/Open mission action acts on, or null. */
@@ -313,7 +335,8 @@ export function actionVehicle(type, id, attrs = {}, fields = {}) {
 
 /** `[[type:id|label]]` markup for "Ask about this", with markup-breaking characters removed. */
 export function entityMarkup(id, label) {
-  const clean = String(label ?? '')
+  // Bidi controls never reach the composer (§3.11).
+  const clean = safeText(label, 160)
     .replace(/[[\]|]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -387,6 +410,8 @@ export function createInspector(host, ctx, opts = {}) {
   const state = () => store?.get?.() || {};
   const emit = (event, payload) => bus?.emit?.(event, payload);
   const nodeFor = (id) => nodeOf(state(), id);
+  /** The sim speed when it isn't ×1: durations then say "in sim time". */
+  const simScale = () => timeScaleOf(state().graph?.theater);
 
   // ---- small builders -------------------------------------------------------
 
@@ -456,7 +481,9 @@ export function createInspector(host, ctx, opts = {}) {
         title: known ? undefined : NOT_IN_PICTURE,
         'aria-label': `Inspect ${shown || id}`,
       },
-      glyph(node?.type || type, node?.status || 'unknown', 10),
+      glyph(node?.type || type, node?.status || 'unknown', 10, undefined, {
+        category: node?.attrs?.category,
+      }),
       h(
         'span',
         {
@@ -718,7 +745,7 @@ export function createInspector(host, ctx, opts = {}) {
       rows.push(
         field(
           'To BINGO',
-          `≈ ${duration(eta)} to BINGO`,
+          `≈ ${duration(eta)} to BINGO${simTimeSuffix(eta, simScale())}`,
           registerTag('estimated'),
         ),
       );
@@ -851,7 +878,13 @@ export function createInspector(host, ctx, opts = {}) {
     else if (wpOf != null) rows.push(field('Waypoints', `${wpOf} waypoints`));
     const eta = num(f.eta_s ?? a.eta_s);
     if (eta != null)
-      rows.push(field('ETA', `≈ ${duration(eta)}`, registerTag('estimated')));
+      rows.push(
+        field(
+          'ETA',
+          `≈ ${duration(eta)}${simTimeSuffix(eta, simScale())}`,
+          registerTag('estimated'),
+        ),
+      );
     const reason = f.incomplete_reason ?? a.incomplete_reason;
     if (reason)
       rows.push(
@@ -1167,6 +1200,27 @@ export function createInspector(host, ctx, opts = {}) {
     ];
   }
 
+  /** The builders inspectorPlaces.js draws with (theater, site, unknown). */
+  const kit = {
+    field,
+    fields,
+    mono,
+    caption,
+    chip,
+    chips,
+    section,
+    now,
+    /** A disclosure inside the body ("Show all 9 tags"), per entity. */
+    isOpen: (key) => Boolean(cur?.open?.has(key)),
+    toggle(key) {
+      if (!cur) return;
+      cur.open ||= new Set();
+      if (cur.open.has(key)) cur.open.delete(key);
+      else cur.open.add(key);
+      renderBody();
+    },
+  };
+
   const BODY = {
     track: trackBody,
     vehicle: vehicleBody,
@@ -1174,10 +1228,11 @@ export function createInspector(host, ctx, opts = {}) {
     report: reportBody,
     equipment: equipmentBody,
     unit: unitBody,
-    theater: placeBody,
+    theater: (node, entity) => theaterBody(kit, node, entity, state().graph),
     poi: placeBody,
     alarm: alarmBody,
     feed: feedBody,
+    site: (node, entity) => siteBody(kit, node, entity),
   };
 
   function provenanceSection(entity) {
@@ -1193,6 +1248,12 @@ export function createInspector(host, ctx, opts = {}) {
     for (const [key, value] of Object.entries(prov)) {
       if (value == null || value === '') continue;
       const labelText = provenanceLabel(key);
+      // `*_at_ms` / `*_since_ms` are epoch timestamps (e.g. link_lost_since_ms);
+      // formatting them as durations printed "497391 h". Ages stay durations.
+      if (/_(at|since)_ms$/.test(key) && typeof value === 'number') {
+        rows.push(field(labelText, zulu(value, { seconds: true })));
+        continue;
+      }
       if (/_ms$/.test(key) && typeof value === 'number') {
         rows.push(field(labelText, duration(value / 1000) || '0 s'));
         continue;
@@ -1289,6 +1350,8 @@ export function createInspector(host, ctx, opts = {}) {
     const entity = cur.entity;
     const type = node?.type || entity?.type || typeFromId(cur.id);
     const stat = node?.status || entity?.status || 'unknown';
+    const known = isKnownType(type);
+    const site = type === 'site' ? siteHeader(node, entity) : null;
     const labelText =
       (node ? displayLabel(node) : '') ||
       (type === 'feed' ? displayLabel({ type, id: cur.id }) : '') ||
@@ -1356,17 +1419,32 @@ export function createInspector(host, ctx, opts = {}) {
       h(
         'div',
         { class: 'ic-inspector__titlebar' },
-        glyph(type, stat, 20),
+        glyph(type, stat, 20, undefined, { category: site?.category }),
         h(
           'h2',
           { class: 'ic-inspector__title', id: titleId, tabindex: '-1' },
-          labelText,
+          // Labels may be OSM names or geocoder text: bidi-safe (§3.11).
+          safeText(labelText, 160) || cur.id,
         ),
         h(
           'span',
-          { class: 'ic-inspector__type' },
-          TYPE_WORD[type] || humanize(type),
+          {
+            class: known
+              ? 'ic-inspector__type'
+              : 'ic-inspector__type ic-inspector__type--unrecognised',
+          },
+          known ? TYPE_WORD[type] || humanize(type) : unknownTitle(type),
         ),
+        site
+          ? h(
+              'span',
+              {
+                class: 'ic-inspector__category',
+                'data-category': site.category,
+              },
+              site.categoryWord,
+            )
+          : null,
         word
           ? h(
               'span',
@@ -1381,11 +1459,19 @@ export function createInspector(host, ctx, opts = {}) {
               word,
             )
           : null,
+        site?.protected
+          ? h(
+              'span',
+              { class: 'ic-inspector__protected', 'data-status': 'protected' },
+              SITE_PROTECTED_TEXT,
+            )
+          : null,
         h('code', { class: 'ic-inspector__id ic-kit-mono' }, cur.id),
         copy,
       ),
     );
-    const sub = feedNode ? '' : cleanSubtitle(node?.subtitle);
+    // A site's subtitle repeats its category and status words, shown above.
+    const sub = feedNode || site ? '' : cleanSubtitle(node?.subtitle);
     if (sub) kids.push(segments(sub, 'ic-inspector__subtitle-line'));
     replaceKids(head, kids);
   }
@@ -1453,7 +1539,12 @@ export function createInspector(host, ctx, opts = {}) {
       );
     }
     if (hasGraph && !node && !cur.seenInGraph && cur.status === 'ready') {
-      kids.push(h('p', { class: 'ic-inspector__line' }, NOT_IN_PICTURE));
+      // A site the map draws but the graph's cap left out is in this
+      // theater: say so, not "outside this theater or aged out".
+      const offGraph = siteOffGraphLine(cur.entity, state().graph);
+      kids.push(
+        h('p', { class: 'ic-inspector__line' }, offGraph || NOT_IN_PICTURE),
+      );
     }
     const requested = cur.entity?.requested_id;
     if (requested && requested !== cur.id) {
@@ -1490,13 +1581,18 @@ export function createInspector(host, ctx, opts = {}) {
     const node = nodeFor(cur.id);
     const entity = cur.entity;
     const type = node?.type || entity?.type;
-    const build = BODY[type];
+    // Own keys only: a type named "constructor" is unknown, not Object.
+    const build =
+      typeof type === 'string' && Object.hasOwn(BODY, type) ? BODY[type] : null;
     const kids = [];
     if (build && (node || entity)) kids.push(...build(node, entity).flat());
+    else if ((node || entity) && !isKnownType(type))
+      kids.push(...unknownBody(kit, node, entity)); // WG §4.2.1
     else if (!node && !entity && cur.status !== 'loading')
       kids.push(noReading('No details for this entity.'));
     if (entity) {
-      kids.push(provenanceSection(entity));
+      // A site states its source and caveat in its own rows (WG §4.2.6).
+      if (type !== 'site') kids.push(provenanceSection(entity));
       kids.push(relatedSection(entity));
       kids.push(rawSection(entity));
     }
@@ -1530,6 +1626,31 @@ export function createInspector(host, ctx, opts = {}) {
         onClick: () => focusEntity(id, entity),
       }),
     ];
+    // Places (WG §4.2.5, §4.2.6): Show on map and a drafted recce. A site is
+    // context only, so it never gets any other action.
+    if (isPlaceType(type)) {
+      const req = placeMapRequest(id, node, entity, state().graph);
+      if (req)
+        kids.push(
+          button('Show on map', {
+            icon: ICON.map,
+            key: 'act:map',
+            onClick: () => emit('map:request', req),
+          }),
+        );
+      kids.push(
+        button('Plan recce over this', {
+          icon: ICON.recce,
+          key: 'act:recce',
+          onClick: () =>
+            emit('ask', {
+              text: recceText(id, labelText),
+              focused_ids: [id],
+              draft: true,
+            }),
+        }),
+      );
+    }
     if (vehicle && (type === 'vehicle' || type === 'mission')) {
       kids.push(
         button('Track', {

@@ -2,14 +2,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  ATTR_REASON,
   TIER,
+  TYPE_FILTERS,
   applyTypeFilter,
+  attrReason,
   createSearch,
   filterCounts,
+  filterKeyOf,
   isQuestion,
   matchNode,
   outsideWords,
   rankNodes,
+  siteCategoryCounts,
+  typeWordOf,
 } from './search.js';
 
 // ---- stub DOM (the GEV convention: no jsdom) ---------------------------------
@@ -907,4 +913,206 @@ test('an alarm result reads by its kind label, as the orb and the rail do', () =
   type(input, 'alarm:7');
   const row = options(search).find((o) => o.attrs['data-id'] === 'alarm:7');
   assert.match(text(byCls(row, 'ic-search__label')[0]), /^BINGO fuel$/);
+});
+
+// ---- WG §4.2.6: sites in search; §4.2.1: unrecognised types ---------------------------------
+
+const XSS = '<img src=x onerror=alert(1)>';
+
+function siteNode(id, label, category, extra = {}) {
+  return node(`sit:dyn-k:${id}`, 'site', label, {
+    subtitle: 'Mapped, not verified',
+    salience: 0.4,
+    attrs: { category, source: 'osm', register: 'mapped', tags: {} },
+    ...extra,
+  });
+}
+
+function placesGraph() {
+  const g = graph();
+  g.nodes.push(
+    siteNode('way/1', 'Kherson International Airport', 'airfield', {
+      attrs: {
+        category: 'airfield',
+        subtype: 'aeroway=aerodrome',
+        tags: { icao: 'UKOH', aeroway: 'aerodrome' },
+        tags_total: 14,
+        fetched_at_ms: 1727500000123,
+        source: 'osm',
+      },
+    }),
+    siteNode('way/2', 'Chornobaivka airfield', 'airfield'),
+    siteNode('node/3', 'City hospital', 'medical', {
+      attrs: { category: 'medical', protected: true, tags: {} },
+    }),
+    siteNode('way/4', 'Kherson port', 'port'),
+    node('thr:dyn-k', 'theater', 'Kherson', {
+      attrs: { place: 'Kherson, Ukraine', active: true },
+    }),
+    node('frc:red-sam-1', 'force', 'Kherson red SAM', { status: 'ok' }),
+  );
+  return g;
+}
+
+test('Places covers theaters, POIs and sites; an unknown type is under All only', () => {
+  const places = TYPE_FILTERS.find((f) => f.key === 'places');
+  assert.deepEqual(places.types, ['theater', 'poi', 'site']);
+  assert.equal(filterKeyOf('site'), 'places');
+  assert.equal(filterKeyOf('force'), null);
+  const matches = rankNodes(placesGraph(), 'kherson');
+  const counts = filterCounts(matches);
+  assert.equal(counts.places, 3, 'two sites and the theater');
+  assert.equal(counts.all, 4, 'the unknown force counts under All');
+  assert.equal(typeWordOf('site'), 'Site');
+  assert.equal(typeWordOf('force'), 'Unrecognised (force)');
+});
+
+test('site matches: category words and tags, with type-keyed reasons', () => {
+  const g = placesGraph();
+  const byId = (id) => g.nodes.find((n) => n.id === id);
+  const airport = byId('sit:dyn-k:way/1');
+  assert.deepEqual(matchNode(airport, 'ukoh'), {
+    tier: TIER.attribute,
+    reason: 'Tags',
+    ranges: [],
+  });
+  assert.equal(matchNode(airport, 'airfield').reason, 'Category');
+  assert.equal(
+    matchNode(byId('sit:dyn-k:node/3'), 'medical').reason,
+    'Category',
+  );
+  assert.equal(matchNode(airport, 'aerodrome').reason, 'Category');
+  // Plumbing never matches: source "osm", the fetch time, the tag count.
+  assert.equal(matchNode(airport, 'osm'), null);
+  // Its theater's id inside the site id is not a partial-id match.
+  assert.equal(matchNode(byId('sit:dyn-k:way/2'), 'dyn-k'), null);
+  assert.equal(
+    matchNode(byId('sit:dyn-k:way/2'), 'way/2').reason,
+    'Partial ID',
+  );
+  assert.equal(matchNode(airport, '1727500000'), null);
+  // A unit's category still reads "Equipment".
+  assert.equal(attrReason('unit', 'category'), 'Equipment');
+  assert.equal(attrReason('site', 'category'), 'Category');
+  assert.equal(attrReason('site', 'kind'), 'Kind', 'shared reasons apply');
+  assert.equal(attrReason('constructor', 'toString'), 'Details');
+  assert.ok(Object.isFrozen(ATTR_REASON.site));
+});
+
+test('new question words read as taskings: set, go, recce, move, change', () => {
+  for (const q of [
+    'set the theater to Kherson',
+    'go to Odesa',
+    'recce the port',
+    'move the AO north',
+    'change sim speed',
+  ])
+    assert.equal(isQuestion(q), true, q);
+  assert.equal(isQuestion('settlement'), false, 'whole first word only');
+});
+
+test('siteCategoryCounts and the category filter within Places', () => {
+  const matches = rankNodes(placesGraph(), 'k');
+  const all = rankNodes(placesGraph(), 'kherson');
+  assert.deepEqual(siteCategoryCounts(all), [
+    ['airfield', 1],
+    ['port', 1],
+  ]);
+  assert.deepEqual(siteCategoryCounts(matches.slice(0, 0)), []);
+  const onlyPorts = applyTypeFilter(all, 'places', 'port');
+  assert.deepEqual(
+    onlyPorts.map((m) => m.id),
+    ['sit:dyn-k:way/4'],
+  );
+  assert.equal(
+    applyTypeFilter(all, 'contacts', 'port').length,
+    0,
+    'the category applies only under Places',
+  );
+});
+
+test('a site row reads "Site  Airfield  Mapped, not verified  ICAO UKOH"', () => {
+  const { search, input } = mount({ state: { graph: placesGraph() } });
+  input.fire('focus');
+  type(input, 'kherson international');
+  const row = options(search).find(
+    (o) => o.attrs['data-id'] === 'sit:dyn-k:way/1',
+  );
+  assert.ok(row);
+  assert.equal(row.attrs['data-type'], 'site');
+  assert.equal(row.attrs['data-tone'], 'neutral');
+  const meta = byCls(row, 'ic-search__meta')[0];
+  assert.equal(
+    meta.children.filter(Boolean).map(text).join('  '),
+    'Site  Airfield  Mapped, not verified  ICAO UKOH',
+  );
+  const g = findAll(row, (e) => hasCls(e, 'ic-kit-glyph'))[0];
+  assert.equal(g.attrs['data-type'], 'site');
+});
+
+test('Places shows category chips when sites match; a chip narrows to that category', () => {
+  const { search, input, bus } = mount({ state: { graph: placesGraph() } });
+  input.fire('focus');
+  type(input, 'kherson');
+  const siteChips = () =>
+    byCls(search.element, 'ic-search__chip--site').map((c) => text(c));
+  assert.deepEqual(siteChips(), [], 'not under All');
+  byCls(search.element, 'ic-search__chip')
+    .find((c) => text(c).startsWith('Places'))
+    .fire('click');
+  assert.deepEqual(siteChips(), ['Airfields 1', 'Ports 1']);
+  byCls(search.element, 'ic-search__chip--site')
+    .find((c) => text(c) === 'Ports 1')
+    .fire('click');
+  assert.deepEqual(bus.last('search:filter').ids, ['sit:dyn-k:way/4']);
+  const pressed = byCls(search.element, 'ic-search__chip--site').find(
+    (c) => c.attrs['aria-pressed'] === 'true',
+  );
+  assert.equal(text(pressed), 'Ports 1');
+  // Clicking it again lets go.
+  pressed.fire('click');
+  assert.equal(bus.last('search:filter').ids.length, 3);
+});
+
+test('an unrecognised type lists under All as "Unrecognised (force)", lilac, never green', () => {
+  const { search, input } = mount({ state: { graph: placesGraph() } });
+  input.fire('focus');
+  type(input, 'red sam');
+  const row = options(search).find(
+    (o) => o.attrs['data-id'] === 'frc:red-sam-1',
+  );
+  assert.ok(row);
+  assert.equal(row.attrs['data-type'], 'unknown');
+  assert.equal(row.attrs['data-tone'], 'unknown');
+  assert.equal(text(byCls(row, 'ic-search__type')[0]), 'Unrecognised (force)');
+  assert.match(text(row), /Not assessed/);
+  const g = findAll(row, (e) => hasCls(e, 'ic-kit-glyph'))[0];
+  assert.doesNotMatch(String(g.innerHTML), /#5DD39B/i);
+});
+
+test('XSS and bidi fixtures in a site name and tags render as text in search results (§3.11)', () => {
+  const g = placesGraph();
+  g.nodes.push(
+    siteNode('way/9', `‮${XSS}‬`, 'airfield', {
+      attrs: { category: 'airfield', tags: { icao: XSS } },
+    }),
+  );
+  const { search, input } = mount({ state: { graph: g } });
+  input.fire('focus');
+  type(input, 'img');
+  const row = options(search).find(
+    (o) => o.attrs['data-id'] === 'sit:dyn-k:way/9',
+  );
+  assert.ok(row, 'the hostile site is listed');
+  assert.equal(findAll(search.element, (e) => e.tag === 'img').length, 0);
+  assert.equal(
+    findAll(search.element, (e) =>
+      Object.keys(e.attrs || {}).some((k) => /^on/i.test(k)),
+    ).length,
+    0,
+  );
+  const label = text(byCls(row, 'ic-search__label')[0]);
+  assert.ok(label.includes(XSS));
+  assert.doesNotMatch(label, /[‪-‮⁦-⁩]/);
+  assert.match(text(row), /ICAO <img src=x…/);
 });

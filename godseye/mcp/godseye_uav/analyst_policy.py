@@ -14,6 +14,18 @@ arguments, into one of six classes:
 Session grants follow contract v1.1 §10.2: per tool, sensor class only.  (v1
 also let ``sim`` be granted for a session; v1.1 withdrew that.)
 
+``Decision.acknowledge`` marks the classes whose approval card also asks the
+operator to acknowledge what they are overriding (``ACKNOWLEDGE_CLASSES``:
+``safety_override``; WG spec §3.6).  The chat service sends it to the console
+as ``acknowledge_required``.
+
+Runtime theaters (WG spec §3.7, A8): ``geo_lookup`` and ``geo_sites`` are
+``read``, ``theater_propose`` is ``plan`` (it changes nothing; the server
+drops undeclared arguments, so neither ``dry_run`` nor a ``lost_link_plan``
+changes that), and ``sim_set_theater`` and ``sim_set_time_scale`` are ``sim``:
+every call asks and none is session-grantable.  Their consequences are built
+from the call's arguments only.
+
 The policy FAILS CLOSED: a tool it does not know is a ``command`` (approval
 required, no "allow for session").  Two argument rules need care because the
 server silently ignores arguments a tool does not declare:
@@ -40,7 +52,9 @@ auto-allowed there when ``classify(...).auto`` is true.
 from __future__ import annotations
 
 import json
+import math
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,6 +69,8 @@ CLASSES = (READ, PLAN, SENSOR, COMMAND, SIM, SAFETY_OVERRIDE)
 AUTO_CLASSES = frozenset({READ, PLAN})
 #: Classes whose calls an operator may allow for the rest of the session (per tool).
 SESSION_CLASSES = frozenset({SENSOR})
+#: Classes whose approval needs an explicit acknowledgement (WG spec §3.6).
+ACKNOWLEDGE_CLASSES = frozenset({SAFETY_OVERRIDE})
 
 #: The in-process SDK server's name; the CLI exposes its tools as
 #: ``mcp__godseye__<tool>``.
@@ -70,6 +86,8 @@ class Decision:
     title: str
     summary: str
     consequences: tuple[str, ...]
+    #: True when approving also needs an acknowledgement (``ACKNOWLEDGE_CLASSES``).
+    acknowledge: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -85,15 +103,21 @@ SERVER_READ_TOOLS = frozenset({
     # Excluded from the toolbelt (the intel tools replace it), classified anyway
     # so the table covers every server tool.
     "uav_list_tracks",
+    # Runtime theaters (WG spec §3.7): a place lookup and the mapped sites.
+    "geo_lookup", "geo_sites",
 })
 
 #: The toolbelt's curated in-process tools (analyst_toolbelt.py).
 CURATED_TOOLS = frozenset({
     "intel_overview", "intel_search", "intel_entity", "read_intel_resource",
-    "ui_focus", "ui_track", "ui_show_orb", "ui_inspect",
+    "ui_focus", "ui_track", "ui_show_orb", "ui_inspect", "ui_show_map",
 })
 
-PLAN_TOOLS = frozenset({"mission_dry_run"})
+#: Plan tools: they change nothing, so they run at once.
+PLAN_TOOLS = frozenset({"mission_dry_run", "theater_propose"})
+#: The plan tools that read a mission ``params`` -- and so a ``lost_link_plan``,
+#: which the server applies to the LIVE plan even on a dry run.
+_MISSION_PLAN_TOOLS = frozenset({"mission_dry_run"})
 
 SENSOR_TOOLS = frozenset({
     "uav_get_detections", "uav_scan_targets", "uav_capture_image",
@@ -113,6 +137,8 @@ SIM_TOOLS = frozenset({
     "sim_set_gps_degradation", "sim_hydrate_real_data", "sim_spawn_order_of_battle",
     # Legacy and excluded from the toolbelt (it zeroes the wind), classified anyway.
     "sim_set_environment",
+    # Runtime theaters (WG spec §3.7, D2): never session-grantable.
+    "sim_set_theater", "sim_set_time_scale",
 })
 
 SAFETY_OVERRIDE_TOOLS = frozenset({"sim_set_fuel", "sim_set_link_state", "sim_reset"})
@@ -127,6 +153,11 @@ DRY_RUN_TOOLS = frozenset({
 })
 
 READ_TOOLS = SERVER_READ_TOOLS | CURATED_TOOLS
+
+#: The runtime-theater tools (`theater_tools.TOOL_NAMES`).  None of them declares
+#: a ``lost_link_plan``, so one passed to them changes nothing.
+THEATER_TOOLS = frozenset({"geo_lookup", "geo_sites", "theater_propose",
+                           "sim_set_theater", "sim_set_time_scale"})
 
 KNOWN_TOOLS = (READ_TOOLS | PLAN_TOOLS | SENSOR_TOOLS | COMMAND_TOOLS | SIM_TOOLS
                | SAFETY_OVERRIDE_TOOLS)
@@ -220,6 +251,13 @@ _TITLES = {
     "sim_set_fuel": "Refuel",
     "sim_set_link_state": "Set link state",
     "sim_reset": "Reset simulation",
+    # WG spec §3.7; theater_tools.TITLES and format.js TOOL_TITLES match.
+    "geo_lookup": "Look up a place",
+    "geo_sites": "List mapped sites",
+    "theater_propose": "Propose a theater",
+    "sim_set_theater": "Set the theater",
+    "sim_set_time_scale": "Set sim speed",
+    "ui_show_map": "Show on the map",
 }
 
 TAKEOFF_NOTE = "Takes off first if the aircraft is on the ground."
@@ -227,6 +265,19 @@ GATE_NOTE = ("The server's fuel, BINGO and geofence gate runs first and may "
              "reject it.")
 SAFETY_TRANSITION_NOTE = "Refused while a BINGO or lost-link return is flying."
 PLAN_NOTE = "Plan only: nothing is queued and the aircraft does not move."
+
+#: `sim_set_theater` consequences that do not depend on the call (WG spec §4.3 A8).
+THEATER_FUEL_NOTE = ("Fuel level and the BINGO latch are kept unless the airframe changes, "
+                     "which gives a full tank.")
+THEATER_REFUSAL_NOTE = ("Refused if any drone is airborne, busy, BINGO-latched or has lost "
+                        "its link, and under real AirSim.")
+THEATER_KEEPS_NOTE = ("Contacts, reports and the audit trail are kept; alarms in progress and "
+                      "the old area's real data are cleared.")
+#: `sim_set_time_scale` consequences (WG spec §4.3 A8).
+TIME_SCALE_CLOCK_NOTE = ("Safety checks and camera captures stay on a real-time clock, so they "
+                         "happen less often per simulated second.")
+TIME_SCALE_NORMAL_NOTE = ("Safety checks and camera captures run at their normal rate per "
+                          "simulated second.")
 
 
 def bare_name(tool: str) -> str:
@@ -360,7 +411,118 @@ def _count(value: Any, noun: str, plural: str | None = None) -> str | None:
     return None
 
 
+# ----------------------------------------------------------------- theaters --
+
+#: Metres per degree of latitude; the same constant `theaters.py` builds a
+#: dynamic AO with, so a {W} x {H} read back from the AO bounds is exact.
+_M_PER_DEG = 111_320.0
+#: Longest theater label an approval sentence quotes (WG spec §3.7: <= 60).
+_LABEL_MAX = 60
+
+
+def _finite(value: Any) -> float | None:
+    """``value`` as a finite float, or None (bools are not numbers here)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    f = float(value)
+    return f if math.isfinite(f) else None
+
+
+def _clean_label(value: Any, limit: int = _LABEL_MAX) -> str | None:
+    """A model-written theater label as one short line of plain text, or None.
+
+    Control and format characters (bidi controls included) are dropped and
+    whitespace is collapsed; the console renders the result as text only.
+    """
+    if not isinstance(value, str):
+        return None
+    kept = "".join(" " if ch.isspace() else ch for ch in value
+                   if ch.isspace() or not unicodedata.category(ch).startswith("C"))
+    text = " ".join(kept.split())
+    if len(text) > limit:
+        text = text[:limit - 1].rstrip() + "…"
+    return text or None
+
+
+def _theater_name(args: dict) -> str | None:
+    """The label a theater call names: ``label``, else ``theater_id``."""
+    return _clean_label(args.get("label")) or _clean_label(args.get("theater_id"))
+
+
+def _ao_bounds(ao: Any) -> tuple[float, float, float, float] | None:
+    """``(s, w, n, e)`` of an ``ao`` list of ``[lat, lon]`` vertices, or None."""
+    if not isinstance(ao, (list, tuple)) or len(ao) < 3:
+        return None
+    lats: list[float] = []
+    lons: list[float] = []
+    for vertex in ao:
+        if not isinstance(vertex, (list, tuple)) or len(vertex) != 2:
+            return None
+        lat, lon = _finite(vertex[0]), _finite(vertex[1])
+        if lat is None or lon is None or abs(lat) > 90.0 or abs(lon) > 180.0:
+            return None
+        lats.append(lat)
+        lons.append(lon)
+    return min(lats), min(lons), max(lats), max(lons)
+
+
+def _ao_size(bounds: tuple[float, float, float, float]) -> tuple[str, str, str, str]:
+    """``(W km, H km, centre lat, centre lon)`` of AO bounds, as display text."""
+    s, w, n, e = bounds
+    mid = (s + n) / 2.0
+    width_km = (e - w) * _M_PER_DEG * math.cos(math.radians(mid)) / 1000.0
+    height_km = (n - s) * _M_PER_DEG / 1000.0
+    return (f"{width_km:.1f}", f"{height_km:.1f}", f"{mid:.5f}", f"{(w + e) / 2.0:.5f}")
+
+
+def _coords(lat: Any, lon: Any, digits: int = 5) -> str | None:
+    la, lo = _finite(lat), _finite(lon)
+    if la is None or lo is None:
+        return None
+    return f"{la:.{digits}f}, {lo:.{digits}f}"
+
+
+def _scale_text(value: Any) -> str | None:
+    """A sim speed as short text (``10``, ``2.5``), or None when not a number."""
+    s = _finite(value)
+    return None if s is None else f"{s:g}"
+
+
+def _theater_summary(name: str, args: dict) -> str | None:
+    """The one-line digest for a theater tool, or None to use the generic one."""
+    parts: list[str | None] = []
+    if name == "sim_set_theater":
+        parts.append(_theater_name(args))
+        bounds = _ao_bounds(args.get("ao"))
+        if bounds is not None:
+            w_km, h_km, _, _ = _ao_size(bounds)
+            parts.append(f"{w_km} × {h_km} km")
+    elif name == "sim_set_time_scale":
+        scale = _scale_text(args.get("scale"))
+        parts.append(f"×{scale}" if scale is not None else None)
+    elif name == "theater_propose":
+        parts.append(_theater_name(args) or _clean_label(args.get("place")))
+        parts.append(_coords(args.get("lat"), args.get("lon"), 4))
+        query = _clean_label(args.get("query"))
+        parts.append(f"“{query}”" if query else None)
+        half = _num(_finite(args.get("half_extent_m")))
+        parts.append(f"{half} m half-extent" if half is not None else None)
+        parts.append(_clean_label(args.get("airframe"), 40))
+    elif name == "geo_sites":
+        parts.append(_clean_label(args.get("category"), 40))
+        near = _coords(args.get("near_lat"), args.get("near_lon"), 4)
+        parts.append(f"near {near}" if near else None)
+        parts.append("refresh" if args.get("refresh") is True else None)
+    else:
+        return None
+    text = " · ".join(p for p in parts if p)
+    return text[:200] or None
+
+
 def _summary(name: str, args: dict, *, dry: bool) -> str:
+    theater = _theater_summary(name, args)
+    if theater:
+        return theater
     merged = {**_params(args), **args}
     parts: list[str] = []
     if name in ("mission_handoff_track", "uav_handoff_target"):
@@ -418,7 +580,7 @@ def _summary(name: str, args: dict, *, dry: bool) -> str:
             parts.append(merged[key][:80])
     if isinstance(merged.get("ids"), list):
         parts.append(_count(merged["ids"], "entity", "entities") or "")
-    if _has_lost_link_plan(args):
+    if _has_lost_link_plan(args) and name not in THEATER_TOOLS:
         parts.append("replaces lost-link plan")
     if dry:
         parts.append("dry run")
@@ -448,6 +610,38 @@ def _alt(args: dict, default: str) -> str:
     if alt is None:
         alt = _num(args.get("alt_m"))
     return alt if alt is not None else default
+
+
+def _set_theater_consequences(args: dict) -> list[str]:
+    """WG spec §4.3 A8: from the arguments only; {W} x {H} from the AO bounds."""
+    label = _theater_name(args)
+    bounds = _ao_bounds(args.get("ao"))
+    if bounds is not None:
+        w_km, h_km, lat, lon = _ao_size(bounds)
+        area = f"a {w_km} × {h_km} km area around {lat}, {lon}"
+        first = (f"Moves the simulation to {label}: {area}." if label
+                 else f"Moves the simulation to {area}.")
+    else:
+        first = (f"Moves the simulation to {label}." if label
+                 else "Moves the simulation to a new theater.")
+    home = _coords(args.get("home_lat"), args.get("home_lon"))
+    where = f"the new home ({home})" if home else "the new home"
+    return [first,
+            f"Every drone is parked, landed, at {where}; the old area's geofence stops applying.",
+            THEATER_FUEL_NOTE, THEATER_REFUSAL_NOTE, THEATER_KEEPS_NOTE]
+
+
+def _time_scale_consequences(args: dict) -> list[str]:
+    """WG spec §4.3 A8.  At x1 the "faster" sentences would be false, so the
+    card says the simulator returns to normal speed instead."""
+    scale = _scale_text(args.get("scale"))
+    if _finite(args.get("scale")) == 1.0:
+        return ["Runs the fake simulator at normal speed (physics, fuel, sun).",
+                TIME_SCALE_NORMAL_NOTE]
+    speed = f"{scale}× faster" if scale is not None else "at a new speed"
+    return [(f"Runs the fake simulator {speed} (physics, fuel, sun). "
+             "Link-loss timers stay in wall-clock seconds."),
+            TIME_SCALE_CLOCK_NOTE]
 
 
 def _mission_consequences(name: str, args: dict) -> list[str]:
@@ -552,6 +746,10 @@ def _consequences(name: str, args: dict, klass: str, dry: bool) -> list[str]:
         out = ["Spawns sim targets at mapped real-world sites; they are not authoritative."]
     elif name == "sim_set_environment":
         out = ["Legacy tool: it always overwrites the sim wind, which defaults to zero."]
+    elif name == "sim_set_theater":
+        out = _set_theater_consequences(a)
+    elif name == "sim_set_time_scale":
+        out = _time_scale_consequences(a)
     elif name == "sim_set_fuel":
         pct = _num(a.get("fuel_pct"))
         out = [(f"Sets {_who(a)}'s fuel to {pct if pct is not None else '100'}% and clears "
@@ -574,7 +772,7 @@ def _consequences(name: str, args: dict, klass: str, dry: bool) -> list[str]:
         out = ["Unknown tool: its effect is not known, so it is treated as a command."]
     else:
         out = []
-    if _has_lost_link_plan(a):
+    if _has_lost_link_plan(a) and name not in THEATER_TOOLS:
         out.append(f"Replaces {_who(a)}'s live lost-link plan.")
     return out
 
@@ -611,8 +809,12 @@ def _klass(name: str, args: dict) -> tuple[str, bool]:
     dry = args.get("dry_run") is True and name in DRY_RUN_TOOLS
     if name in READ_TOOLS:
         return READ, False
-    if name in PLAN_TOOLS:
+    if name in _MISSION_PLAN_TOOLS:
         return (COMMAND if _has_lost_link_plan(args) else PLAN), True
+    if name in PLAN_TOOLS:
+        # Not a mission dry run: it declares no lost_link_plan or dry_run, and
+        # the server drops undeclared arguments.
+        return PLAN, False
     if dry:
         return (COMMAND if _has_lost_link_plan(args) else PLAN), True
     if name in SENSOR_TOOLS:
@@ -645,6 +847,7 @@ def classify(tool: str, args: dict | None) -> Decision:
             title=_nobidi(title),
             summary=_nobidi(_summary(name, a, dry=dry)),
             consequences=tuple(_nobidi(c) for c in _consequences(name, a, klass, dry)),
+            acknowledge=klass in ACKNOWLEDGE_CLASSES,
         )
     except Exception:  # noqa: BLE001 -- a policy bug must never auto-approve
         return Decision(klass=COMMAND, auto=False, allow_session=False,

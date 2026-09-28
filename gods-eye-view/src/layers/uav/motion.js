@@ -28,6 +28,15 @@ import {
 } from './policy.js';
 
 /**
+ * @constant {number} A fix farther than this (m) from the previous one is a
+ * jump, not motion (WG v2 §4.2.8): a theater switch parks every drone at a new
+ * home, possibly 13,000 km away. Interpolating across it would sweep the drone
+ * over the globe for one poll interval, so the vehicle's samples restart.
+ * Matches the bridge's FLOWN_JUMP_M.
+ */
+export const JUMP_GUARD_M = 2000;
+
+/**
  * Create the motion owner for one layer.
  * @param {{state: object}} context Layer composition context.
  * @returns {object} Motion methods used by rendering, tracking and lifecycle.
@@ -97,6 +106,13 @@ export function createMotion({ state }) {
    */
   function addSample(reference, position, atMs) {
     let slot = slots.get(reference);
+    if (
+      slot?.lastPosition &&
+      Cesium.Cartesian3.distance(slot.lastPosition, position) > JUMP_GUARD_M
+    ) {
+      // A jump: never interpolate across it (see JUMP_GUARD_M).
+      slot = null;
+    }
     if (!slot) {
       slot = createSlot();
       slots.set(reference, slot);

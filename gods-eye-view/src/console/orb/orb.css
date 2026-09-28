@@ -293,6 +293,16 @@
   font-style: italic;
 }
 
+/* Sites are context: their status word is Pencil, never a state colour. */
+:where(.ic-root) .ic-orb-list__status[data-status='mapped'] {
+  color: var(--ic-pencil, #a3b0ba);
+}
+
+/* A type the console does not know (WG §4.2.1): lilac, never green. */
+:where(.ic-root) .ic-orb-list__type--unrecognised {
+  color: #bba7e0;
+}
+
 :where(.ic-root) .ic-orb-list__empty {
   margin: 0;
   padding: 16px 12px;

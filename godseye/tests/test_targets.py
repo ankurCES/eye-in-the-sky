@@ -709,3 +709,71 @@ class TestIntrepSize:
             intrep_report(tracks, detail="brief")
         with pytest.raises(ValueError, match="top_n"):
             intrep_report(tracks, top_n=-1)
+
+
+# ---------------------------------------------------------------------------
+# D7 #6 (WG §4.1.9): an auto-labelled spawn is named `{ob_class}_{seq}`
+# (server.py sim_spawn_target), and that name is the only thing that carries
+# the class through the sensor path. 5 of 34 classes used to come back as a
+# keyword neighbour with a different envelope (sam_short_range ->
+# sam_medium_range: a 12 km envelope reported as 24 km).
+# ---------------------------------------------------------------------------
+
+SEQ_RULE = "explicit ob_class key (sequence suffix)"
+
+
+class TestAutoLabelKeepsObClass:
+    def test_every_ob_key_with_a_sequence_suffix_keeps_its_class(self):
+        assert len(OB_LIBRARY) == 34
+        for k in OB_LIBRARY:
+            assert match_ob(f"{k}_7")[0].key == k, k
+
+    def test_a_sixteen_digit_suffix_keeps_its_class(self):
+        for k in OB_LIBRARY:
+            assert match_ob(f"{k}_{10 ** 15 + 7}")[0].key == k, k
+
+    def test_the_formerly_misclassified_rows_cite_the_sequence_rule(self):
+        for k in ("sam_long_range", "sam_short_range", "spaag_missile",
+                  "aaa_self_propelled", "depot_fuel"):
+            entry, ev = match_ob(f"{k}_1")
+            assert entry.key == k
+            assert ev == {"matched": k, "rule": SEQ_RULE, "specificity": 1.0}
+
+    def test_an_agreeing_keyword_match_keeps_its_evidence(self):
+        """comms_relay_1 (the shipped demo laydown) already matched on the
+        keyword 'relay'; its evidence must not change."""
+        entry, ev = match_ob("comms_relay_1")
+        assert entry.key == "comms_relay"
+        assert ev == {"matched": "relay", "rule": "order-of-battle keyword match",
+                      "specificity": 0.6, "tokens": ["comms", "relay", "1"]}
+
+    def test_the_exact_key_rule_is_unchanged(self):
+        assert match_ob("sam_short_range")[1] == {
+            "matched": "sam_short_range", "rule": "explicit ob_class key",
+            "specificity": 1.0}
+
+    def test_only_a_digit_suffix_on_a_real_key_triggers_the_rule(self):
+        # not an OB key before the suffix -> the keyword rules decide
+        assert match_ob("sam_short_7")[1]["rule"] != SEQ_RULE
+        assert match_ob("zzz_widget_42")[0] is UNCLASSIFIED
+        # a non-digit suffix is not a sequence number
+        assert match_ob("sam_short_range_x")[1]["rule"] != SEQ_RULE
+        assert match_ob("sam_short_range_")[1]["rule"] != SEQ_RULE
+        # normalisation is the same as the exact-key rule's
+        assert match_ob("SAM-short-range 3")[0].key == "sam_short_range"
+
+    def test_designator_names_still_classify_by_keyword(self):
+        assert match_ob("SA-6_site_1")[0].key == "sam_medium_range"
+        assert match_ob("T72_Tank_01")[0].category == "armor"
+
+    def test_an_auto_labelled_detection_becomes_a_track_of_that_class(self):
+        """What server.sim_spawn_target without a name produces: the track's
+        perceived class is the spawned class, not a neighbour's."""
+        tm = TrackManager()
+        track = tm.ingest([_det("sam_short_range_1", 47.6400, -122.1400)],
+                          now=1000.0, sensor=_good_sensor(),
+                          observer={"lat": 47.6405, "lon": -122.1405,
+                                    "alt_m": 300.0, "vehicle": "Drone1"})[0]
+        assert track.ob_class == "sam_short_range"
+        assert track.ob.weapon_range_m == OB_LIBRARY["sam_short_range"].weapon_range_m
+        assert track.match_evidence["rule"] == SEQ_RULE

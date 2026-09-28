@@ -24,10 +24,11 @@ import { createBus } from './bus.js';
 import { resolveBridge } from './config.js';
 import { createApi, formatZulu } from './api.js';
 import { createIntelStore } from './intelStore.js';
-import { createModeController } from './mode.js';
+import { MAP_COPY, createModeController, theaterGroundFor } from './mode.js';
+import { createMapDock, mapDockModel } from './mapDock.js';
 import { createOrb, createOrbListView } from './orb/orb.js';
 import { createChatClient } from './chat/client.js';
-import { createAnalyst } from './chat/view.js';
+import { createAnalyst, resolveMapArea } from './chat/view.js';
 import { createSearch } from './search.js';
 import { createInspector } from './inspector.js';
 import { createSettingsSheet } from './settings/view.js';
@@ -83,6 +84,7 @@ export const ICON = Object.freeze({
   keyboard: 'keyboard',
   linkOff: 'link_off',
   list: 'view_list',
+  map: 'map',
   offline: 'cloud_off',
   orb: 'bubble_chart',
   retry: 'refresh',
@@ -101,6 +103,9 @@ export const COPY = Object.freeze({
   analyst: 'Analyst',
   orb: 'Orb',
   list: 'List',
+  map: 'Map',
+  showOnMap: MAP_COPY.showOnMap,
+  mapUnsupported: MAP_COPY.unsupported,
   views: 'Picture view',
   tabs: 'Console sections',
   connecting: 'Connecting to Eye in the Sky…',
@@ -415,31 +420,61 @@ export function serviceLine(
   }
 }
 
+/** Port methods the map overview needs (WG spec §4.2.7). */
+const MAP_PORT_METHODS = Object.freeze([
+  'showArea',
+  'enterOverview',
+  'exitOverview',
+  'setOverlayVisibility',
+  'onPick',
+]);
+
 /**
  * Wrap GEV's tracking port, which may arrive late: an object, a Promise of
  * one, or a function returning either. Calls made before it arrives are
- * safe: `enter` waits for it, the rest are no-ops.
+ * safe: `enter` and `showArea` wait for it, the rest are no-ops. A port
+ * without the map methods (an older GEV) degrades: `supports()` says no,
+ * `showArea` resolves false, the overview and overlay calls do nothing and
+ * `onPick` never fires.
  */
 export function createPortProxy(source) {
   let real = null;
   let offReal = null;
+  let offPick = null;
   const changeCbs = new Set();
+  const pickCbs = new Set();
+  function fanOut(cbs, args) {
+    for (const cb of [...cbs]) {
+      try {
+        cb(...args);
+      } catch (err) {
+        globalThis.console?.error?.(err);
+      }
+    }
+  }
   function adopt(p) {
     if (!p || typeof p !== 'object' || real) return p ?? null;
     real = p;
     if (typeof p.onChange === 'function') {
-      const off = p.onChange((...args) => {
-        for (const cb of [...changeCbs]) {
-          try {
-            cb(...args);
-          } catch (err) {
-            globalThis.console?.error?.(err);
-          }
-        }
-      });
+      const off = p.onChange((...args) => fanOut(changeCbs, args));
       offReal = typeof off === 'function' ? off : null;
     }
+    if (typeof p.onPick === 'function') {
+      const off = p.onPick((...args) => fanOut(pickCbs, args));
+      offPick = typeof off === 'function' ? off : null;
+    }
     return p;
+  }
+  /** Call an optional method of the real port; a throw is reported, not raised. */
+  function optional(name, ...args) {
+    const fn = real?.[name];
+    if (typeof fn !== 'function') return undefined;
+    try {
+      return fn.apply(real, args);
+    } catch (err) {
+      globalThis.console?.error?.(err);
+      return undefined;
+    }
   }
   let ready;
   if (typeof source === 'function') {
@@ -477,9 +512,50 @@ export function createPortProxy(source) {
     setViewportInset: (inset) => real?.setViewportInset?.(inset),
     supportsInset: () => typeof real?.setViewportInset === 'function',
     keyhole: () => real?.keyhole?.() ?? null,
+    /** Whether the port offers `name` (its own answer when it has one). */
+    supports(name) {
+      if (!real) return false;
+      if (typeof real.supports === 'function') {
+        try {
+          return Boolean(real.supports(name));
+        } catch {
+          return false;
+        }
+      }
+      return (
+        MAP_PORT_METHODS.includes(name) && typeof real[name] === 'function'
+      );
+    },
+    /** Resolves false when there is no port, no showArea, or it failed. */
+    async showArea(target, opts = {}) {
+      const p = await ready;
+      if (!p || typeof p.showArea !== 'function') return false;
+      try {
+        return (await p.showArea(target, opts)) !== false;
+      } catch (err) {
+        globalThis.console?.error?.(err);
+        return false;
+      }
+    },
+    enterOverview: () => optional('enterOverview'),
+    exitOverview: () => optional('exitOverview'),
+    setOverlayVisibility: (v) => optional('setOverlayVisibility', v),
+    /**
+     * The overlay's own counts, when the port reports them. GEV's port names
+     * it `overlayStatus()` (A18); `overlayStats()` is the older spelling.
+     */
+    overlayStats: () =>
+      optional('overlayStatus') ?? optional('overlayStats') ?? null,
+    onPick(cb) {
+      if (typeof cb !== 'function') return () => {};
+      pickCbs.add(cb);
+      return () => pickCbs.delete(cb);
+    },
     destroy() {
       offReal?.();
+      offPick?.();
       changeCbs.clear();
+      pickCbs.clear();
     },
   };
 }
@@ -538,6 +614,29 @@ function contains(a, b) {
     }
   }
   for (const kid of a.children || []) if (contains(kid, b)) return true;
+  return false;
+}
+
+/**
+ * Whether focus is somewhere the operator can't use: nowhere, the page
+ * itself, a node gone from the page, or inside a hidden or inert subtree
+ * (a real one, or a stub tree's `parent` chain).
+ */
+function focusStranded(active, doc) {
+  if (!active || active === doc?.body || active === doc?.documentElement)
+    return true;
+  if (active.isConnected === false) return true;
+  for (let n = active; n && n !== doc?.body;) {
+    if (n.getAttribute?.('hidden') != null || n.getAttribute?.('inert') != null)
+      return true;
+    n = n.parentElement ?? n.parent ?? null;
+  }
+  try {
+    if (typeof active.getClientRects === 'function')
+      return active.getClientRects().length === 0;
+  } catch {
+    /* no layout to ask */
+  }
   return false;
 }
 
@@ -729,7 +828,8 @@ export function mountIntelConsole({
 
   // ---- shell DOM -------------------------------------------------------------
 
-  const el = buildShell(mac);
+  const dockHooks = {};
+  const el = buildShell(mac, dockHooks);
   (root || doc?.body)?.append?.(el.root);
 
   // ---- ctx -------------------------------------------------------------------
@@ -802,6 +902,11 @@ export function mountIntelConsole({
   let analystReached = false;
   let modeNotices = [];
   let mapNotice = null;
+  // The orb's theater-change caption (WG spec §4.2.4), held for its holdMs;
+  // a toast while the console is not on the orb.
+  let theaterNotice = null;
+  let theaterTimer = null;
+  let plateInSheet = false;
 
   function announce(text, politeness = 'polite') {
     const region =
@@ -892,6 +997,12 @@ export function mountIntelConsole({
     clock: time,
     doc,
   });
+  dockHooks.onBack = () => mode.backToConsole();
+  dockHooks.onTrack = (v) => mode.requestTrack(v, { source: 'operator' });
+  dockHooks.onSites = (on) => {
+    mode.setOverlays({ sites: on });
+    renderMapDock();
+  };
 
   const ctx = {
     api,
@@ -1087,7 +1198,114 @@ export function mountIntelConsole({
     }
   }
 
+  // ---- map overview (WG spec §4.2.3, §4.2.7) ----------------------------------
+
+  /** The `[s,w,n,e]` area for graph ids, resolved as `ui map` does. */
+  function areaFor(ids) {
+    const list = Array.isArray(ids) ? ids.filter(Boolean) : [];
+    const area = list.length
+      ? resolveMapArea(list, (id) => nodeById(id), store.get?.().graph)
+      : { bbox: null, label: null };
+    return { ids: list, bbox: area.bbox, label: area.label };
+  }
+
+  /** The operator's Show on map: at once, no notice. */
+  function showOnMap(ids) {
+    return mode.requestMap(areaFor(ids), { source: 'operator' });
+  }
+
+  /** The Map toggle and `M`: the active theater, else the aircraft. */
+  function openTheaterMap() {
+    const g = store.get?.().graph;
+    const tid = g?.theater?.id;
+    const active = nodesOf(g, 'theater').find((n) => n.attrs?.active === true);
+    const ids =
+      tid != null && tid !== ''
+        ? [`thr:${String(tid).replace(/^thr:/, '')}`]
+        : active
+          ? [active.id]
+          : [];
+    let target = areaFor(ids);
+    if (!target.bbox) {
+      const fleet = areaFor(nodesOf(g, 'vehicle').map((n) => n.id));
+      if (fleet.bbox) target = fleet;
+    }
+    return mode.requestMap(target, { source: 'operator' });
+  }
+
+  function mapSupported() {
+    try {
+      return Boolean(port.supports('showArea'));
+    } catch {
+      return false;
+    }
+  }
+
+  function clearTheaterNotice() {
+    cancel(theaterTimer);
+    theaterTimer = null;
+    theaterNotice = null;
+    renderCaption();
+    renderNotices();
+  }
+
+  /** Show on map for the theater caption, when the port and the area allow. */
+  function theaterMapAction() {
+    const id = theaterNotice?.id;
+    if (!id || !mapSupported() || !areaFor([id]).bbox) return null;
+    return {
+      id: 'map',
+      label: COPY.showOnMap,
+      run: () => {
+        clearTheaterNotice();
+        showOnMap([id]);
+      },
+    };
+  }
+
+  /**
+   * The orb's theater change (WG spec §4.2.4): its caption, with Show on map,
+   * for holdMs (20 s), announced politely; the hidden map is pre-positioned
+   * on the new theater (§4.2.2 step 8).
+   */
+  function onTheaterNotice(notice) {
+    const raw = notice.ids?.[0] || notice.to?.id || null;
+    const id = raw ? `thr:${String(raw).replace(/^thr:/, '')}` : null;
+    theaterNotice = { text: String(notice.text ?? ''), id };
+    cancel(theaterTimer);
+    const hold = Number(notice.holdMs);
+    theaterTimer = later(
+      () => {
+        theaterTimer = null;
+        theaterNotice = null;
+        renderCaption();
+        renderNotices();
+      },
+      Number.isFinite(hold) && hold > 0 ? hold : 20000,
+    );
+    renderCaption();
+    renderNotices();
+    if (theaterNotice.text)
+      announce(
+        theaterNotice.text,
+        notice.announce === 'assertive' ? 'assertive' : 'polite',
+      );
+    if (id && mode.state === 'orb' && mapSupported()) {
+      const area = areaFor([id]);
+      if (area.bbox) {
+        const target = { bbox: area.bbox };
+        const ground = theaterGroundFor(area.bbox, store.get?.().graph);
+        if (ground != null) target.groundM = ground;
+        port.showArea(target, { animate: false }).catch(() => {});
+      }
+    }
+  }
+
   function onOrbNotice(notice) {
+    if (notice?.kind === 'theater') {
+      onTheaterNotice(notice);
+      return;
+    }
     if (!notice || !Array.isArray(notice.ids) || !notice.ids.length) return;
     arrivalNotice = notice;
     cancel(arrivalTimer);
@@ -1181,6 +1399,11 @@ export function mountIntelConsole({
         }),
       );
       el.caption.setAttribute('data-kind', 'analyst');
+    } else if (theaterNotice && mode.state === 'orb') {
+      kids.push(h('span', { class: 'ic-caption__text' }, theaterNotice.text));
+      const act = theaterMapAction();
+      if (act) kids.push(btn(act.label, { variant: 'link', onClick: act.run }));
+      el.caption.setAttribute('data-kind', 'theater');
     } else if (arrivalNotice) {
       const n = arrivalNotice;
       kids.push(
@@ -1288,6 +1511,18 @@ export function mountIntelConsole({
     renderCaption();
     const toastList = modeNotices.filter((n) => n.kind !== 'progress');
     if (mapNotice) toastList.push(mapNotice);
+    // Off the orb the caption is hidden: the theater change is a toast.
+    if (theaterNotice && mode.state !== 'orb') {
+      const act = theaterMapAction();
+      toastList.push({
+        id: 'theater',
+        kind: 'static',
+        source: 'orb',
+        text: theaterNotice.text,
+        actions: act ? [act] : [],
+        theater: true,
+      });
+    }
     const kids = toastList.map((n) => {
       const toast = h(
         'div',
@@ -1304,7 +1539,10 @@ export function mountIntelConsole({
         actions.append(
           btn(a.label, {
             variant:
-              a.id === 'track' || a.id === 'retry' || a.id === 'back'
+              a.id === 'track' ||
+              a.id === 'retry' ||
+              a.id === 'back' ||
+              a.id === 'map'
                 ? 'primary'
                 : 'quiet',
             onClick: () => a.run(),
@@ -1322,7 +1560,8 @@ export function mountIntelConsole({
               if (n === mapNotice) {
                 mapNotice = null;
                 renderNotices();
-              } else mode.dismissNotice(n.id);
+              } else if (n.theater) clearTheaterNotice();
+              else mode.dismissNotice(n.id);
             },
           }),
         );
@@ -1378,7 +1617,8 @@ export function mountIntelConsole({
       vehicle: tracking ? trackedVehicle() : null,
     });
     const show = Boolean(model.text);
-    const target = tracking ? 'map' : layout === 'narrow' ? 'narrow' : 'stage';
+    const overMap = tracking || mode.state === 'map';
+    const target = overMap ? 'map' : layout === 'narrow' ? 'narrow' : 'stage';
     for (const [where, host] of [
       ['stage', el.stageBanner],
       ['narrow', el.narrowBanner],
@@ -1392,6 +1632,8 @@ export function mountIntelConsole({
     const n = model.count;
     setText(el.dockBadge, n ? String(n) : '');
     setHidden(el.dockBadge, !n);
+    setText(el.mapDock.badge, n ? String(n) : '');
+    setHidden(el.mapDock.badge, !n);
   }
 
   // ---- rendering: dock, narrow bar, tabs -----------------------------------------
@@ -1446,16 +1688,76 @@ export function mountIntelConsole({
     ]);
   }
 
-  function refreshMini() {
+  function refreshMini(host = el.dockMini) {
     let snap = null;
     try {
       snap = orb.snapshot?.(64) || null;
     } catch {
       snap = null;
     }
-    replaceKids(el.dockMini, [
+    replaceKids(host, [
       snap && typeof snap === 'object' ? snap : iconEl(ICON.orb),
     ]);
+  }
+
+  /** The map overview dock (mapDock.js), shown in the map and leaving it. */
+  function renderMapDock() {
+    const m = mode.state;
+    const target = mode.target;
+    const on = Boolean(target) && (m === 'map' || m === 'exiting');
+    setHidden(el.mapDock.element, !on);
+    if (!on) return;
+    let overlay = null;
+    try {
+      overlay = port.overlayStats?.() ?? null;
+    } catch {
+      overlay = null;
+    }
+    el.mapDock.update(
+      mapDockModel({
+        target,
+        graph: store.get?.().graph,
+        overlay,
+        sitesOn: mode.overlays?.sites !== false,
+      }),
+    );
+  }
+
+  /** Orb | List | Map: Map says why when the port can't show areas. */
+  function renderMapToggle() {
+    el.viewMap.setAttribute(
+      'aria-pressed',
+      mode.state === 'map' ? 'true' : 'false',
+    );
+    if (mapSupported()) {
+      el.viewMap.removeAttribute?.('aria-disabled');
+      el.viewMap.removeAttribute?.('title');
+    } else {
+      el.viewMap.setAttribute('aria-disabled', 'true');
+      el.viewMap.setAttribute('title', COPY.mapUnsupported);
+    }
+  }
+
+  /** The inspector's layout: a sheet over the dock while in the map. */
+  function inspectorLayout() {
+    return plateInSheet && layout !== 'narrow' ? 'compact' : layout;
+  }
+
+  /**
+   * In the map a pick opens the inspector as a sheet over the dock (WG spec
+   * §4.2.7): its host moves into the analyst column, since `.ic-main` is
+   * hidden and inert; it moves back to the stage when the map closes.
+   */
+  function placePlate(inMap) {
+    if (inMap === plateInSheet) return;
+    plateInSheet = inMap;
+    if (inMap) {
+      // The map opens on the dock, not on an inspector left open on the orb.
+      inspector?.hide?.();
+      el.mapSheet.append(el.plate);
+    } else replaceKids(el.stageBottom, [el.caption, el.plate, el.footer]);
+    setHidden(el.mapSheet, !inMap);
+    inspector?.setLayout?.(inspectorLayout());
   }
 
   function renderNarrowBar() {
@@ -1526,10 +1828,7 @@ export function mountIntelConsole({
       orbTabBadge ? `, ${COPY.pointedOut(orbTabBadge)}` : '',
     );
     const showApproval =
-      n > 0 &&
-      layout === 'narrow' &&
-      tab !== 'analyst' &&
-      mode.state !== 'tracking';
+      n > 0 && layout === 'narrow' && tab !== 'analyst' && !overMap();
     if (showApproval) {
       const oldest = pending.oldest;
       const title = oldest?.title
@@ -1585,9 +1884,14 @@ export function mountIntelConsole({
 
   // ---- regions -----------------------------------------------------------------------
 
+  /** Tracking and the map overview: the map shows and the column is a dock. */
+  function overMap() {
+    return mode.state === 'tracking' || mode.state === 'map';
+  }
+
   function applyRegions() {
-    const m = mode.state;
-    const tracking = m === 'tracking';
+    // The map overview lays the regions out as tracking does (WG §4.2.7).
+    const tracking = overMap();
     const narrow = layout === 'narrow';
     el.root.setAttribute('data-layout', layout);
     el.root.setAttribute('data-analyst', analystOn ? 'on' : 'off');
@@ -1665,12 +1969,14 @@ export function mountIntelConsole({
     }
     situation?.setLayout?.(layout);
     analyst?.setLayout?.(layout);
-    inspector?.setLayout?.(layout);
+    inspector?.setLayout?.(inspectorLayout());
     settingsSheet?.setLayout?.(layout);
     bus.emit('layout', { layout });
+    // The inspector also hears 'layout': in the map it stays a sheet.
+    if (plateInSheet) inspector?.setLayout?.(inspectorLayout());
     applyViewport();
     renderBadges();
-    if (mode.state === 'tracking') port.setViewportInset(viewportInset());
+    if (overMap()) port.setViewportInset(viewportInset());
   }
 
   function setDockCollapsed(collapsed) {
@@ -1861,8 +2167,18 @@ export function mountIntelConsole({
       return true;
     }
     if (mode.cancelNotice()) return true;
-    if (mode.state === 'entering_tracking') {
+    if (mode.state === 'entering_tracking' || mode.state === 'entering_map') {
       mode.cancel();
+      return true;
+    }
+    if (mode.state === 'map') {
+      // A pick's inspector sheet first, then the map itself.
+      if (plateInSheet && inspector?.current?.()) {
+        inspector.hide?.();
+        el.mapDock.back.focus?.();
+        return true;
+      }
+      mode.exit();
       return true;
     }
     if (mode.state === 'tracking') {
@@ -1890,6 +2206,16 @@ export function mountIntelConsole({
   // ---- regions (F6) ------------------------------------------------------------------------
 
   function regionList() {
+    if (mode.state === 'map') {
+      const list = [{ key: 'dock', el: el.mapDock.back }];
+      if (plateInSheet && inspector?.current?.())
+        list.push({ key: 'inspector', el: inspector?.element || el.plate });
+      list.push(
+        { key: 'transcript', el: el.analystBody },
+        { key: 'composer', el: el.analystBody, composer: true },
+      );
+      return list;
+    }
     if (mode.state === 'tracking') {
       return [
         { key: 'dock', el: el.dockBack },
@@ -1911,7 +2237,7 @@ export function mountIntelConsole({
   }
 
   function cycleRegion(dir) {
-    if (layout === 'narrow' && mode.state !== 'tracking') {
+    if (layout === 'narrow' && !overMap()) {
       const order = ['orb', 'analyst', 'situation'];
       setTab(order[(order.indexOf(tab) + (dir < 0 ? 2 : 1)) % 3]);
       el.tabs[tab].focus?.();
@@ -1962,7 +2288,7 @@ export function mountIntelConsole({
   }
 
   function focusComposer() {
-    if (layout === 'narrow' && mode.state !== 'tracking') setTab('analyst');
+    if (layout === 'narrow' && !overMap()) setTab('analyst');
     if (mode.state === 'tracking' && dockCollapsed) setDockCollapsed(false);
     analyst?.focusComposer?.();
   }
@@ -2040,8 +2366,23 @@ export function mountIntelConsole({
       return;
     }
 
+    if (
+      !mod &&
+      !event.altKey &&
+      lower === 'm' &&
+      !text &&
+      m === 'orb' &&
+      inOrbScope(target)
+    ) {
+      // M in the orb scope opens the map of the theater (WG spec §4.2.7).
+      consume(event);
+      openTheaterMap();
+      return;
+    }
+
     if (m !== 'tracking') {
-      // The map is hidden: nothing outside the console may react to a key.
+      // The map is hidden (or in overview, where GEV's own shortcuts would
+      // fight the console): nothing outside the console may react to a key.
       if (!inside) {
         event.stopPropagation?.();
         if (key === 'Escape' && !mod) {
@@ -2055,6 +2396,18 @@ export function mountIntelConsole({
     // Tracking: GEV's cockpit keys keep working, but an Esc pressed inside the
     // console belongs to the console (never GEV's own cockpit exit first).
     if (key === 'Escape' && inside) shieldFromDocumentCapture(event, doc);
+  }
+
+  /** The orb scope: the stage (not the inspector or search), or nothing focused. */
+  function inOrbScope(target) {
+    if (!target || target === doc?.body || target === doc?.documentElement)
+      return true;
+    if (target === el.root) return true;
+    return (
+      contains(el.stage, target) &&
+      !contains(el.plate, target) &&
+      !contains(el.searchHost, target)
+    );
   }
 
   function onRootKey(event) {
@@ -2097,12 +2450,13 @@ export function mountIntelConsole({
   el.skipAnalyst.addEventListener('click', () => focusComposer());
   el.viewOrb.addEventListener('click', () => setView('orb'));
   el.viewList.addEventListener('click', () => setView('list'));
+  el.viewMap.addEventListener('click', () => openTheaterMap());
   el.spine.addEventListener('click', () =>
     spineOpen ? closeSpine() : openSpine(),
   );
   el.sheetClose.addEventListener('click', () => closeSheet());
-  el.dockBack.addEventListener('click', () => mode.exit());
-  el.backFloat.addEventListener('click', () => mode.exit());
+  el.dockBack.addEventListener('click', () => mode.backToConsole());
+  el.backFloat.addEventListener('click', () => mode.backToConsole());
   el.dockCollapse.addEventListener('click', () => setDockCollapsed(true));
   el.dockTab.addEventListener('click', () => setDockCollapsed(false));
   el.dockAbort.addEventListener('click', () => {
@@ -2187,8 +2541,7 @@ export function mountIntelConsole({
       }
       suggestion = null;
       selectedId = p.id;
-      if (layout === 'narrow' && tab !== 'orb' && mode.state !== 'tracking')
-        setTab('orb');
+      if (layout === 'narrow' && tab !== 'orb' && !overMap()) setTab('orb');
       setPlate(true);
     }),
     bus.on('inspector:state', (p) => {
@@ -2250,6 +2603,7 @@ export function mountIntelConsole({
     bus.on('gev:status', (p) => {
       // GEV (the map under the console) reports its start-up. Only a failure
       // is the operator's business: tracking cannot work without the map.
+      renderMapToggle();
       if (p?.state !== 'failed') {
         if (mapNotice && p?.state === 'ready') {
           mapNotice = null;
@@ -2331,6 +2685,8 @@ export function mountIntelConsole({
         renderBanners();
         renderNarrowBar();
         if (mode.state === 'tracking' || mode.state === 'exiting') renderDock();
+        renderMapDock();
+        renderMapToggle();
       }),
     );
   }
@@ -2344,17 +2700,45 @@ export function mountIntelConsole({
         analyst?.setDocked?.(!dockCollapsed);
         renderDock();
       }
+      if (m === 'map' && prev !== 'map') {
+        // The map dock is never collapsed; the analyst sits under it.
+        dockCollapsed = false;
+        refreshMini(el.mapDock.mini);
+        analyst?.setDocked?.(true);
+        renderDock();
+      }
       if (m === 'orb') {
         if (prev === 'exiting' || prev === 'tracking')
           analyst?.setDocked?.(false);
         dockCollapsed = false;
         renderDock();
       }
+      placePlate(m === 'map');
+      renderMapDock();
+      renderMapToggle();
       applyRegions();
       renderBadges();
+      renderCaption();
+      renderNotices();
       // The column may have changed width with the mode (the spine is never
       // a dock): hand GEV the width the dock really has.
-      if (m === 'tracking') port.setViewportInset(viewportInset());
+      if (m === 'tracking' || m === 'map')
+        port.setViewportInset(viewportInset());
+      // Entering the map hides or inerts whatever held focus (the Map toggle,
+      // `M` on the orb, a rail button, the tracking dock): put it in the map
+      // dock, as tracking does its dock (UX §947), never on <body>.
+      if (
+        m === 'map' &&
+        prev !== 'map' &&
+        focusStranded(doc?.activeElement, doc)
+      )
+        el.mapDock.back.focus?.();
+    }),
+    // A click on the map in overview opens the inspector sheet (§4.2.7).
+    port.onPick((p) => {
+      const id = typeof p?.id === 'string' ? p.id : '';
+      if (!id || mode.state !== 'map') return;
+      bus.emit('inspect', { id });
     }),
   );
 
@@ -2450,6 +2834,7 @@ export function mountIntelConsole({
   measureLayout();
   setTab('orb');
   setView('orb');
+  renderMapToggle();
   applyRegions();
   applyViewport();
   renderService();
@@ -2468,7 +2853,8 @@ export function mountIntelConsole({
   checkAnalyst();
 
   function setMode(next, opts = {}) {
-    if (next === 'orb') mode.exit();
+    if (next === 'orb') mode.backToConsole();
+    else if (next === 'map') openTheaterMap();
     else if (
       (next === 'tracking' || next === 'entering_tracking') &&
       opts?.vehicle
@@ -2517,9 +2903,11 @@ export function mountIntelConsole({
     chat?.close?.();
     if (mode.state !== 'orb') {
       port.exit();
+      port.exitOverview();
       port.setMapVisible(false);
       port.setViewportInset({ right: 0 });
     }
+    el.mapDock.destroy();
     port.destroy();
     el.root.remove?.();
   }
@@ -2531,7 +2919,7 @@ export function mountIntelConsole({
 // Shell markup
 // ---------------------------------------------------------------------------
 
-function buildShell(mac) {
+function buildShell(mac, dockHooks = {}) {
   const livePolite = h('div', {
     class: 'ic-live',
     role: 'status',
@@ -2638,11 +3026,25 @@ function buildShell(mac) {
     iconEl(ICON.list),
     h('span', { class: 'ic-viewtoggle__label' }, COPY.list),
   );
+  // Map is a mode, not a view: it opens the map overview (WG spec §4.2.7).
+  const viewMap = h(
+    'button',
+    {
+      type: 'button',
+      class: 'ic-viewtoggle__btn',
+      'aria-pressed': 'false',
+      'aria-keyshortcuts': 'M',
+      'data-view': 'map',
+    },
+    iconEl(ICON.map),
+    h('span', { class: 'ic-viewtoggle__label' }, COPY.map),
+  );
   const viewToggle = h(
     'div',
     { class: 'ic-viewtoggle', role: 'group', 'aria-label': COPY.views },
     viewOrb,
     viewList,
+    viewMap,
   );
   const searchBand = h(
     'div',
@@ -2666,6 +3068,13 @@ function buildShell(mac) {
   });
   const plate = h('div', { class: 'ic-plate', tabindex: '-1' });
   const footer = h('div', { class: 'ic-footer' });
+  const stageBottom = h(
+    'div',
+    { class: 'ic-stage__bottom' },
+    caption,
+    plate,
+    footer,
+  );
   const stage = h(
     'main',
     {
@@ -2679,7 +3088,7 @@ function buildShell(mac) {
     status,
     orbWrap,
     listHost,
-    h('div', { class: 'ic-stage__bottom' }, caption, plate, footer),
+    stageBottom,
   );
   const main = h('div', { class: 'ic-main' }, rail, stage);
 
@@ -2723,6 +3132,14 @@ function buildShell(mac) {
     dockFuel,
     h('div', { class: 'ic-dock__actions' }, dockAbort, dockCollapse),
   );
+  // The map overview's dock (mapDock.js) and the sheet a map pick opens the
+  // inspector in; the shell fills in what the dock's buttons do.
+  const mapDock = createMapDock({
+    onBack: () => dockHooks.onBack?.(),
+    onTrack: (v) => dockHooks.onTrack?.(v),
+    onSites: (on) => dockHooks.onSites?.(on),
+  });
+  const mapSheet = h('div', { class: 'ic-mapsheet', hidden: true });
   const analystBody = h('div', { class: 'ic-analyst__body', tabindex: '-1' });
   const spine = h(
     'button',
@@ -2750,9 +3167,11 @@ function buildShell(mac) {
       'aria-label': COPY.analyst,
     },
     dock,
+    mapDock.element,
     analystBody,
     spine,
     spinePop,
+    mapSheet,
   );
 
   // Tracking-only chrome over the map region.
@@ -2809,6 +3228,7 @@ function buildShell(mac) {
     ['+ −', 'Zoom the orb'],
     ['Enter', 'Inspect the entity'],
     ['L', 'List view'],
+    ['M', 'Map view'],
     ['Space', 'Pause or resume rotation'],
   ];
   const sheet = h(
@@ -2887,6 +3307,7 @@ function buildShell(mac) {
     searchHost,
     viewOrb,
     viewList,
+    viewMap,
     status,
     canvas,
     orbA11y,
@@ -2895,9 +3316,12 @@ function buildShell(mac) {
     caption,
     plate,
     footer,
+    stageBottom,
     analyst,
     analystBody,
     dock,
+    mapDock,
+    mapSheet,
     dockBack,
     dockMini,
     dockBadge,

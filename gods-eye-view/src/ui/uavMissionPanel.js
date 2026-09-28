@@ -37,6 +37,7 @@ import { createUavMissionHud } from './uavHud.js';
 import { createUavAlarmSurface } from './uavAlarms.js';
 import { createUavContactRoster } from './uavContactRoster.js';
 import { createUavMissionViews } from './uavMissionViews.js';
+import { createTheaterWatcher } from '../layers/uav/contextPolicy.js';
 
 export { THEATERS, SEED_POIS, OFFLINE_THEATERS } from './uavTheaters.js';
 
@@ -1236,8 +1237,8 @@ export function createUavMissionPanel({
    *
    * Two deliberate limits. Adoption moves the SELECTION only, never the
    * camera: where the operator is looking is theirs. And once a running
-   * theater has been learned the panel stops asking, so a bridge restarted
-   * onto a different theater is not picked up until the page reloads.
+   * theater has been learned the panel stops polling for it; a later switch
+   * reaches it through `/snapshot.theater` instead (`noteTheater`, §4.2.8).
    */
   async function adoptRunningTheater() {
     adoptTries += 1;
@@ -1262,6 +1263,30 @@ export function createUavMissionPanel({
         : `running theater "${running.id}" is not in this table`;
     setStatus(`${head}${note}`, moved && !running.inTable);
     return running;
+  }
+
+  // Runtime theaters (WG v2 §4.2.8): the bridge can move to another theater
+  // while the page is open, so a learned running theater is no longer final.
+  const theaterWatch = createTheaterWatcher();
+
+  /**
+   * Note the bridge's running theater (`/snapshot.theater`, `{id, epoch}`).
+   * When it CHANGED (an id change, or a new epoch; a transient null epoch is
+   * not a change), adopt it again at once: the table is re-read (a theater set
+   * from chat is a new row) and the selection follows. The switch was approved
+   * by the operator, so a hand-picked selection made against the old theater
+   * no longer holds it back; the retry budget restarts too. The camera still
+   * never moves on its own.
+   * @param {{id?: string, epoch?: number}|null} ref running theater
+   * @returns {Promise<object|null>} the change, or null
+   */
+  async function noteTheater(ref) {
+    const change = theaterWatch.observe(ref);
+    if (!change) return null;
+    operatorChose = false;
+    adoptTries = 0;
+    await adoptRunningTheater();
+    return change;
   }
 
   /**
@@ -1351,6 +1376,13 @@ export function createUavMissionPanel({
       teleEl.textContent = 'telemetry: offline';
       hud.reset();
       return null;
+    }
+    if (snap?.theater) {
+      try {
+        await noteTheater(snap.theater);
+      } catch {
+        /* adoption degrades to the running line; telemetry still renders */
+      }
     }
     const records = snap.records || [];
     refreshVehicleOptions(records);
@@ -1481,6 +1513,8 @@ export function createUavMissionPanel({
     tick,
     /** Force one theater-adoption pass — used by tests and by manual refresh. */
     adoptRunningTheater,
+    /** Note the running theater; re-adopts when it changed (§4.2.8). */
+    noteTheater,
     /** Open the panel. Clears the operator's manual-collapse latch. */
     expand() {
       operatorCollapsed = false;

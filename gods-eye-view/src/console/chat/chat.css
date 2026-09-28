@@ -1185,6 +1185,91 @@
   background-repeat: no-repeat;
 }
 
+/* Unknown approval class (WG spec §4.2.1): a dashed stale band, 6 on and 4
+   off, on the slip and on its rows; the slip is Deny-only. */
+:where(.ic-root) .ic-row[data-class='unknown'],
+:where(.ic-root) .ic-swatch[data-class='unknown'] {
+  --ic-row-ink: var(--ic-stale, #8a98a2);
+}
+
+:where(.ic-root) .ic-slip[data-class='unknown'] {
+  --ic-slip-band: var(--ic-stale-slip, #414f58);
+}
+
+:where(.ic-root) .ic-slip[data-class='unknown'] .ic-slip__band {
+  background: repeating-linear-gradient(
+    to bottom,
+    var(--ic-slip-band) 0 6px,
+    transparent 6px 10px
+  );
+}
+
+:where(.ic-root) .ic-slip[data-class='unknown'][data-state='filed'] {
+  --ic-slip-band: var(--ic-stale, #8a98a2);
+}
+
+/* Theater slip (WG spec §4.2.2): the numbers-only footprint, checks. */
+:where(.ic-root) .ic-slip__figure {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--ic-s-3, 8px);
+}
+
+:where(.ic-root) .ic-slip__footprint {
+  flex: none;
+  width: 72px;
+  height: 72px;
+  color: var(--ic-ink, #12202a);
+}
+
+:where(.ic-root) .ic-slip__footprint svg {
+  display: block;
+}
+
+:where(.ic-root) .ic-slip__footprint .ic-fp-area {
+  fill: rgba(18, 32, 42, 0.08);
+  stroke: currentColor;
+  stroke-width: 1.5;
+}
+
+:where(.ic-root) .ic-slip__footprint .ic-fp-reach {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1;
+}
+
+:where(.ic-root) .ic-slip__footprint[data-warn='true'] .ic-fp-reach {
+  stroke: var(--ic-warn-slip, #6b4400);
+  stroke-width: 1.5;
+}
+
+:where(.ic-root) .ic-slip__footprint .ic-fp-home {
+  fill: currentColor;
+}
+
+:where(.ic-root) .ic-slip__warnline {
+  color: var(--ic-warn-slip, #6b4400);
+  font: var(--ic-type-small);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-slip__checks {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-slip__checks [data-ok='false'] {
+  color: var(--ic-critical-slip, #8f1a14);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-slip__mark {
+  display: inline-block;
+  width: 1.4em;
+}
+
 :where(.ic-root) .ic-slip[data-urgent='true'] {
   --ic-expiry-ink: var(--ic-warn-slip, #6b4400);
   --ic-expiry-weight: 700;
@@ -1349,6 +1434,14 @@
   :where(.ic-root) .ic-swatch__band {
     background: CanvasText;
     forced-color-adjust: none;
+  }
+
+  :where(.ic-root) .ic-slip[data-class='unknown'] .ic-slip__band {
+    background: repeating-linear-gradient(
+      to bottom,
+      CanvasText 0 6px,
+      transparent 6px 10px
+    );
   }
 
   :where(.ic-root) .ic-slip__btn[type='button'],

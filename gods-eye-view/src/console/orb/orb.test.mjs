@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import { meanLatLon, orientationFacing, pullWithin } from './camera.js';
 import { computeLayout, toVector } from './layout.js';
 import { COLORS } from './glyphs.js';
+import { SITE_GLYPHS, UNRECOGNISED_GLYPH } from './glyphPaths.js';
 import { RING } from './renderer.js';
+import { createOrbListView } from './a11y.js';
 import {
   CAP_GLYPH_GAP_PX,
   CAP_NUDGE_MAX_PX,
@@ -19,6 +21,9 @@ import {
   nodeRadius,
   pictureNotLive,
   separateCap,
+  siteBandState,
+  theaterChangeOf,
+  theaterNodeId,
 } from './orb.js';
 import {
   fakeCanvas,
@@ -1008,4 +1013,435 @@ test('feeds read as plain words on labels, the twin and the list; errors stay ou
   orb.setGraph(back);
   fe.flush();
   assert.equal(shown()['Contacts feed'], 'Up');
+});
+
+/** Sprite canvases that stroked glyph path `d`. */
+const spritesWith = (fe, d) =>
+  fe.sprites.filter((c) =>
+    c.ctx.calls.some((k) => k[0] === 'stroke' && k[1]?.d === d),
+  );
+
+/** Whether anything still animates after running every queued frame. */
+const animating = (fe) => {
+  fe.flush(60);
+  return fe.pendingFrames > 0;
+};
+
+test('fail-safe: an injected force node draws a lilac "?" in Other, never green, its status ignored (WG §4.2.1)', () => {
+  const graph = sparse();
+  graph.nodes.push({
+    id: 'frc:red-sam-1',
+    type: 'force',
+    label: 'Red SAM 1',
+    status: 'ok',
+    salience: 0.6,
+    attrs: { side: 'red' },
+  });
+  const { orb, fe } = mount({ graph });
+  const i = orb.layout.index.get('frc:red-sam-1');
+  assert.equal(orb.layout.band[i], 'other');
+  const v = orb.visual('frc:red-sam-1');
+  assert.equal(v.status, 'unknown', 'status is not read');
+  face(orb, 'frc:red-sam-1');
+  orb.renderNow();
+  const sprites = spritesWith(fe, UNRECOGNISED_GLYPH);
+  assert.ok(sprites.length > 0, 'the unrecognised glyph is drawn');
+  for (const sprite of sprites) {
+    assert.ok(
+      sprite.ctx.sets.some(
+        ([k, value]) => k === 'strokeStyle' && value === COLORS.unknown,
+      ),
+    );
+    assert.ok(!sprite.ctx.sets.some(([, value]) => value === COLORS.ok));
+  }
+  // A status flip on it rings nothing; the same flip on a vehicle does.
+  assert.equal(animating(fe), false);
+  const flipped = structuredClone(graph);
+  flipped.nodes.find((n) => n.id === 'frc:red-sam-1').status = 'critical';
+  orb.setGraph(flipped);
+  assert.equal(animating(fe), false, 'no ripple, no halo for an unknown type');
+  assert.equal(orb.visual('frc:red-sam-1').status, 'unknown');
+  const vehicle = structuredClone(flipped);
+  vehicle.nodes.find((n) => n.id === 'veh:Drone1').status = 'warn';
+  orb.setGraph(vehicle);
+  assert.equal(animating(fe), true, 'a known type still rings');
+});
+
+const withSites = (graph, count, { group = 'infrastructure', meta } = {}) => {
+  const next = structuredClone(graph);
+  for (let k = 0; k < count; k += 1) {
+    next.nodes.push({
+      id: `sit:default:node/${k}`,
+      type: 'site',
+      label: `Substation ${k}`,
+      group,
+      salience: 0.2 + k / 100,
+      status: 'critical',
+      attrs: { category: 'power' },
+    });
+  }
+  next.meta = { ...(next.meta || {}), sites: meta };
+  return next;
+};
+
+test('sites: Pencil outlines at +42°, overflow hidden until picked, the caption counts both (WG §4.2.6)', () => {
+  const graph = withSites(sparse(), 14, {
+    meta: { total: 30, in_graph: 14, omitted: 16, degraded: false },
+  });
+  const { orb, fe, canvas } = mount({ graph });
+  const layout = orb.layout;
+  assert.equal(layout.overflow.site, 2);
+  assert.deepEqual(siteBandState(graph, layout), {
+    count: 12,
+    omitted: 18,
+    degraded: false,
+  });
+  const hidden = 'sit:default:node/0';
+  assert.equal(layout.hidden[layout.index.get(hidden)], 1);
+  assert.equal(orb.visual(hidden).alpha, 0, 'overflow is not drawn');
+  assert.equal(orb.visual('sit:default:node/13').alpha, 1);
+  assert.equal(
+    orb.visual('sit:default:node/13').status,
+    'ok',
+    'never critical',
+  );
+  orb.select(hidden);
+  assert.equal(orb.visual(hidden).alpha, 1, 'a pick shows it in place');
+  orb.select(null);
+  face(orb, 'sit:default:node/13');
+  canvas.ctx.reset();
+  orb.renderNow();
+  const sprites = spritesWith(fe, SITE_GLYPHS.power);
+  assert.ok(sprites.length > 0);
+  for (const sprite of sprites)
+    assert.ok(
+      sprite.ctx.sets.some(
+        ([k, value]) => k === 'strokeStyle' && value === COLORS.pencil,
+      ),
+    );
+  const texts = canvas.ctx.calls
+    .filter((c) => c[0] === 'fillText')
+    .map((c) => c[1]);
+  assert.ok(texts.includes('Sites 12 (18 more on the map)'), texts.join(' | '));
+  // A degraded map data feed says so instead.
+  const down = structuredClone(graph);
+  down.meta.sites.degraded = true;
+  orb.setGraph(down);
+  canvas.ctx.reset();
+  orb.renderNow();
+  const downTexts = canvas.ctx.calls
+    .filter((c) => c[0] === 'fillText')
+    .map((c) => c[1]);
+  assert.ok(
+    downTexts.includes('Map data feed down. Sites may be missing, not absent.'),
+  );
+});
+
+/** The theater-scope picture after a switch to Kherson: new theater, sites. */
+const switched = (graph, { epoch = 1, sites = 6 } = {}) => {
+  const next = withSites(
+    {
+      ...graph,
+      nodes: graph.nodes.filter(
+        (n) => n.type !== 'theater' && n.type !== 'poi',
+      ),
+      edges: [],
+    },
+    sites,
+    { group: 'air' },
+  );
+  next.nodes.push({
+    id: 'thr:dyn-kherson',
+    type: 'theater',
+    label: 'Kherson, Ukraine',
+    status: 'ok',
+    salience: 0.95,
+    attrs: { active: true },
+  });
+  next.theater = { id: 'dyn-kherson', label: 'Kherson, Ukraine', epoch };
+  return next;
+};
+
+const diffOf = (prev, next, extra = {}) => {
+  const before = new Set(prev.nodes.map((n) => n.id));
+  const after = new Set(next.nodes.map((n) => n.id));
+  return {
+    added: [...after].filter((id) => !before.has(id)),
+    removed: [...before].filter((id) => !after.has(id)),
+    updated: [],
+    ...extra,
+  };
+};
+
+const turnAway = (canvas) => {
+  canvas.fire('pointerdown', { offsetX: 500, offsetY: 300, pointerId: 1 });
+  canvas.fire('pointermove', { offsetX: 640, offsetY: 380, pointerId: 1 });
+  canvas.fire('pointerup', { offsetX: 640, offsetY: 380, pointerId: 1 });
+};
+
+const sameQ = (a, b) => a.every((v, k) => Math.abs(v - b[k]) < 1e-6);
+
+test('theater transition: one caption instead of arrival notices, a ripple, the pole and a re-frame (WG §4.2.4)', () => {
+  const graph = sparse();
+  graph.theater = {
+    id: 'default',
+    label: 'Redmond (AirSim default)',
+    epoch: 0,
+  };
+  const { orb, fe, events, canvas } = mount({ graph });
+  turnAway(canvas);
+  fe.advance(ORB_TIMING.reframeQuiet + 10);
+  const q0 = orb.camera.q;
+  const next = switched(graph);
+  const diff = diffOf(graph, next, {
+    theaterChanged: {
+      from: { id: 'default', epoch: 0 },
+      to: { id: 'dyn-kherson', epoch: 1 },
+    },
+  });
+  assert.ok(
+    diff.added.length > 3,
+    'enough arrivals that a batch notice would fire',
+  );
+  const before = events.notice.length;
+  orb.setGraph(next, diff);
+  const notices = events.notice.slice(before);
+  assert.deepEqual(
+    notices.map((n) => n.kind),
+    ['theater'],
+    'no batch or behind notices for that diff',
+  );
+  const [notice] = notices;
+  assert.equal(
+    notice.text,
+    'Theater changed to Kherson, Ukraine. 6 items arrived.',
+  );
+  assert.deepEqual(notice.ids, ['thr:dyn-kherson']);
+  assert.equal(notice.count, 6);
+  assert.equal(notice.holdMs, 20_000);
+  assert.equal(notice.announce, 'polite');
+  assert.equal(notice.reframed, true);
+  assert.equal(notice.to.id, 'dyn-kherson');
+  const pole = orb.layout.index.get('thr:dyn-kherson');
+  assert.equal(orb.layout.lat[pole], 90, 'the new theater takes the pole');
+  assert.equal(fe.pendingFrames > 0, true, 'the ripple and the camera ease');
+  fe.advance(ORB_TIMING.travel + 20);
+  const home = framingOrientation(orb.layout, orb.camera.rest());
+  assert.ok(sameQ(orb.camera.q, home), 're-framed');
+  assert.ok(!sameQ(orb.camera.q, q0));
+  fe.advance(ORB_TIMING.ripple + 500);
+  assert.equal(animating(fe), false, 'one ripple, then still');
+  // The next ordinary arrival is not batched with the switch's items.
+  const later = structuredClone(next);
+  later.nodes.push({
+    id: 'trk:LATE',
+    type: 'track',
+    label: 'Late',
+    group: 'air',
+    salience: 0.4,
+    status: 'warn',
+    attrs: {},
+  });
+  orb.setGraph(later, diffOf(next, later, { theaterChanged: null }));
+  assert.ok(!events.notice.slice(before + 1).some((n) => n.kind === 'batch'));
+});
+
+test('theater transition: no camera move after recent stage input or with a selection', () => {
+  const graph = sparse();
+  graph.theater = {
+    id: 'default',
+    label: 'Redmond (AirSim default)',
+    epoch: 0,
+  };
+  const { orb, fe, events, canvas } = mount({ graph });
+  turnAway(canvas);
+  fe.advance(1000); // input 1 s ago
+  const q0 = orb.camera.q;
+  const next = switched(graph);
+  orb.setGraph(
+    next,
+    diffOf(graph, next, {
+      theaterChanged: { from: 'default', to: 'dyn-kherson' },
+    }),
+  );
+  assert.equal(events.notice.at(-1).kind, 'theater');
+  assert.equal(events.notice.at(-1).reframed, false);
+  fe.advance(ORB_TIMING.travel + 50);
+  assert.ok(
+    sameQ(orb.camera.q, q0),
+    'the camera stays where the operator put it',
+  );
+  assert.equal(orb.reframe(), false, 'still inside the 3 s quiet window');
+  // Quiet, but something is selected: still no move.
+  fe.advance(ORB_TIMING.reframeQuiet);
+  orb.select('veh:Drone1');
+  const q1 = orb.camera.q;
+  const again = switched(next, { epoch: 2 });
+  orb.setGraph(
+    again,
+    diffOf(next, again, {
+      theaterChanged: { from: 'dyn-kherson', to: 'dyn-kherson' },
+    }),
+  );
+  assert.equal(events.notice.at(-1).reframed, false);
+  fe.advance(ORB_TIMING.travel + 50);
+  assert.ok(sameQ(orb.camera.q, q1));
+  orb.select(null);
+  orb.filter((n) => n.type === 'site');
+  assert.equal(orb.reframe(), false, 'nor with a filter');
+  orb.filter(null);
+  assert.equal(orb.reframe(), true);
+  assert.equal(orb.reframe({ force: true }), true);
+});
+
+test('theater transition: reduced motion swaps instantly with a static ring; a change is derived without a diff', () => {
+  const graph = sparse();
+  graph.theater = {
+    id: 'default',
+    label: 'Redmond (AirSim default)',
+    epoch: 0,
+  };
+  const { orb, fe, events, canvas } = mount({ graph });
+  orb.setOptions({ reducedMotion: true });
+  turnAway(canvas);
+  fe.advance(ORB_TIMING.reframeQuiet + 10);
+  const next = switched(graph);
+  orb.setGraph(next); // no diff: the orb compares graph.theater itself
+  assert.equal(events.notice.at(-1).kind, 'theater');
+  const home = framingOrientation(orb.layout, orb.camera.rest());
+  assert.ok(sameQ(orb.camera.q, home), 'instant swap');
+  assert.equal(animating(fe), false, 'nothing animates under reduced motion');
+  // Same id, same epoch: no transition.
+  const count = events.notice.length;
+  orb.setGraph(structuredClone(next));
+  assert.equal(events.notice.length, count);
+});
+
+test('theaterChangeOf and theaterNodeId', () => {
+  const a = { theater: { id: 'default', epoch: 0 } };
+  const b = { theater: { id: 'default', epoch: 1 } };
+  assert.equal(theaterChangeOf(undefined, a, a), null);
+  assert.deepEqual(theaterChangeOf(undefined, a, b).to, {
+    id: 'default',
+    epoch: 1,
+  });
+  assert.equal(
+    theaterChangeOf({ theaterChanged: null }, a, b),
+    null,
+    'the store wins',
+  );
+  assert.equal(
+    theaterChangeOf(undefined, { nodes: [] }, b),
+    null,
+    'first picture',
+  );
+  assert.deepEqual(
+    theaterChangeOf({ theaterChanged: { from: 'x', to: 'y' } }, a, b),
+    { from: { id: 'x' }, to: { id: 'y' } },
+  );
+  const nodes = [
+    { id: 'thr:default', type: 'theater', attrs: { active: false } },
+    { id: 'thr:dyn-1', type: 'theater', attrs: { active: true } },
+  ];
+  assert.equal(theaterNodeId({ to: { id: 'default' } }, nodes), 'thr:default');
+  assert.equal(
+    theaterNodeId({ to: { id: 'thr:default' } }, nodes),
+    'thr:default',
+  );
+  assert.equal(theaterNodeId({ to: { id: 'gone' } }, nodes), 'thr:dyn-1');
+  assert.equal(theaterNodeId(null, []), null);
+});
+
+test('untrusted labels render as text on the orb: margin, inline, twin and list; no bidi control is drawn (§3.11)', () => {
+  const XSS = '<img src=x onerror=alert(1)>';
+  const BIDI = '‮evil‬';
+  const BIDI_CHARS = /[‪-‮⁦-⁩]/;
+  const tags = [];
+  const make = dom.doc.createElement;
+  dom.doc.createElement = (tag) => {
+    tags.push(String(tag).toLowerCase());
+    return make(tag);
+  };
+  const graph = sparse();
+  graph.nodes.push(
+    {
+      id: 'trk:xss',
+      type: 'track',
+      label: XSS,
+      subtitle: `${BIDI} · probable`,
+      group: 'air',
+      salience: 0.9,
+      status: 'warn',
+      attrs: {},
+    },
+    {
+      id: 'sit:default:node/9',
+      type: 'site',
+      label: `${BIDI} ${XSS}`,
+      group: 'air',
+      salience: 0.5,
+      status: 'ok',
+      attrs: { category: 'airfield' },
+    },
+    {
+      id: 'frc:x',
+      type: 'force',
+      label: `${XSS}${BIDI}`,
+      salience: 0.5,
+      status: 'ok',
+      attrs: {},
+    },
+  );
+  const { orb, fe, canvas, host } = mount({ graph });
+  const collect = (el, out = []) => {
+    if (!el || typeof el !== 'object') return out;
+    if (el.textContent) out.push(el.textContent);
+    for (const kid of el.children || [])
+      if (typeof kid === 'string') out.push(kid);
+      else collect(kid, out);
+    return out;
+  };
+  for (const id of ['trk:xss', 'sit:default:node/9', 'frc:x']) {
+    face(orb, id);
+    orb.setOptions({ labelMode: 'margin' });
+    fe.flush();
+    orb.renderNow();
+    const margin = collect(orb.labelLayer).join('\n');
+    assert.ok(
+      margin.includes(XSS),
+      `${id}: literal angle brackets in the margin label`,
+    );
+    assert.ok(
+      !BIDI_CHARS.test(margin),
+      `${id}: no bidi control in the margin label`,
+    );
+    orb.setOptions({ labelMode: 'inline' });
+    canvas.ctx.reset();
+    orb.renderNow();
+    const drawn = canvas.ctx.calls
+      .filter((c) => c[0] === 'fillText')
+      .map((c) => String(c[1]));
+    assert.ok(
+      drawn.some((t) => t.includes('<img')),
+      `${id}: drawn as text`,
+    );
+    assert.ok(
+      !drawn.some((t) => BIDI_CHARS.test(t)),
+      `${id}: canvas text is bidi-safe`,
+    );
+  }
+  const twin = collect(listbox(host)).join('\n');
+  assert.ok(twin.includes(XSS) && !BIDI_CHARS.test(twin));
+  const list = stubElement('div');
+  createOrbListView(list).setGraph(graph);
+  const listText = collect(list).join('\n');
+  assert.ok(listText.includes(XSS) && !BIDI_CHARS.test(listText));
+  assert.ok(!tags.includes('img'), 'no img element is ever created');
+  const all = [orb.labelLayer, listbox(host), list];
+  assert.equal(
+    all.some((root) => findNode(root, (el) => 'innerHTML' in el)),
+    false,
+    'nothing is set as markup',
+  );
+  dom.doc.createElement = make;
 });

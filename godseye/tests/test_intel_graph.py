@@ -28,7 +28,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.testclient import TestClient
 from godseye_uav import intel_graph as ig
-from godseye_uav import theaters
+from godseye_uav import theater_tools, theaters
 from godseye_uav.bridge import (
     AirSimAdapter,
     Alarm,
@@ -754,6 +754,81 @@ class TestBudgets:
         size = ig.json_size(g)
         assert size <= ig.GRAPH_TARGET_BYTES, f"{size} B for 100 tracks"
 
+    @staticmethod
+    def _max_sites(n=60, *, worst=True):
+        """`n` sites in the default AO; worst = 160-char names, every
+        whitelisted tag at 160 characters, 13-digit relation ids."""
+        from godseye_uav import sites
+
+        s, w, n_, e = DEFAULT.bbox()
+        rows = []
+        for k in range(n):
+            lat = s + (n_ - s) * ((k % 9) + 0.5) / 9
+            lon = w + (e - w) * ((k // 9 % 9) + 0.5) / 9
+            tags = ({t: "X" * 160 for t in sites.TAG_WHITELIST} if worst
+                    else {"name": f"Site {k}", "operator": "Regional authority"})
+            rows.append(sites.Site(
+                "relation" if worst else "way", 10**12 + k,
+                "military_base" if worst else sites.CATEGORIES[k % 12],
+                "military=training_area", ("N" * 160) if worst else f"Site {k}", lat, lon,
+                (lat - 1e-3, lon - 1e-3, lat + 1e-3, lon + 1e-3), tags=tags,
+                tags_total=len(tags)))
+        return sites.SiteSet(tuple(rows), True, None, NOW_MS, {}, DEFAULT.bbox(), 0)
+
+    @staticmethod
+    def _picture(runs):
+        rows, contacts = [], []
+        south, west = DEFAULT.bounds()[0], DEFAULT.bounds()[1]
+        classes = list(OB_LIBRARY)
+        for k in range(100):
+            ob = classes[k % len(classes)]
+            lat = south + 0.002 + 0.0035 * (k // 10)
+            lon = west + 0.002 + 0.0055 * (k % 10)
+            for r, run in enumerate(RUNS[:runs]):
+                row = salute(f"TRK-{run}-{k:04d}", f"{ob}_{k}", ob, lat, lon,
+                             first_seen=NOW_S - 5000 + r, last_seen=NOW_S - 4000 + r,
+                             members=[f"TRK-{x}-{k:04d}" for x in RUNS[:runs]])
+                rows.append(row)
+                contacts.append(contact(row, ["critical", "high", None, "low"][k % 4]))
+        return {"tracks": rows, "contacts": contacts,
+                "vehicles": [vehicle_row(name=f"Drone{i}") for i in range(1, 4)],
+                "missions": [{**MISSION_ROW, "mission_id": f"MSN-0000000{i}"}
+                             for i in range(5)],
+                "alarms": [{"kind": "detection", "severity": "info", "message": "new contact",
+                            "atMs": NOW_MS, "seq": i + 1} for i in range(10)]}
+
+    @pytest.mark.parametrize("scope", ig.SCOPES)
+    def test_maximum_load_with_sixty_sites_fits_in_150_kb(self, scope):
+        """WG v2 §3.2 budget, Phase A share: 100 tracks (each re-tracked in 10
+        runs), 60 worst-case sites. Sites give way first: tags, then the
+        least salient nodes, all counted. (Forces, engagements and vectors
+        arrive in Phase B and are budgeted there.)"""
+        from types import SimpleNamespace
+
+        ss = self._max_sites()
+        state = theater_tools.theater_state(SimpleNamespace(
+            theater=DEFAULT, theater_epoch=1, sites=ss, airframe_id="group3_fixed_wing"))
+        g = ig.build_graph(live_inputs(**self._picture(10), theater_state=state, sites=ss),
+                           scope=scope)
+        assert_well_formed(g)
+        assert sum(1 for n in g["nodes"] if n["type"] == "track") == 100
+        size = ig.json_size(g)
+        assert size <= ig.GRAPH_TARGET_BYTES, f"{size} B at maximum load ({scope})"
+        m = g["meta"]["sites"]
+        assert m["tags_trimmed"] is True and m["total"] == 60
+        assert m["in_graph"] + m["omitted"] == 60 and m["in_graph"] >= 12
+        assert m["in_graph"] == sum(1 for n in g["nodes"] if n["type"] == "site")
+
+    def test_a_typical_picture_keeps_all_sixty_sites_and_their_tags(self):
+        from types import SimpleNamespace
+
+        ss = self._max_sites(worst=False)
+        state = theater_tools.theater_state(SimpleNamespace(theater=DEFAULT, sites=ss))
+        g = ig.build_graph(live_inputs(**self._picture(1), theater_state=state, sites=ss))
+        assert ig.json_size(g) <= ig.GRAPH_TARGET_BYTES
+        assert g["meta"]["sites"]["in_graph"] == 60
+        assert "tags_trimmed" not in g["meta"]["sites"]
+
     def test_track_nodes_are_capped_and_counted(self):
         rows = [salute(f"TRK-CAPCAPCAPCAP-{k:04d}", f"truck_{k}", "supply_truck",
                        DEFAULT.home_lat + 0.0003 * (k % 60),
@@ -1298,8 +1373,13 @@ class TestInProcessTheater:
 
         srv = SimpleNamespace(theater=DEFAULT, theater_mismatch=None)
         g = ig.IntelService(self.Ctx(), srv).graph()
-        assert g["theater"] == {"id": "default", "label": DEFAULT.label,
-                                "place": DEFAULT.place, "known": True}
+        block = g["theater"]
+        assert {k: block[k] for k in ("id", "label", "place", "known")} == {
+            "id": "default", "label": DEFAULT.label, "place": DEFAULT.place, "known": True}
+        # WG v2 §3.2: the rest of the block is theater_tools.theater_state(srv)
+        assert set(block) == set(theater_tools.STATE_KEYS)
+        assert block["epoch"] == 0 and block["dynamic"] is False
+        assert block["source"] == "preset" and block["state"] == "active"
         assert g["meta"]["scoped_to_theater"] is True
         assert not any("Active theater unknown" in c for c in g["meta"]["caveats"])
         o = ig.IntelService(self.Ctx(), srv).overview()
@@ -1312,11 +1392,13 @@ class TestInProcessTheater:
         assert g["theater"]["known"] is False and g["theater"]["id"] is None
         assert any("Active theater unknown" in c for c in g["meta"]["caveats"])
 
-    def test_a_known_bridge_block_wins(self):
+    def test_the_in_process_server_wins_over_a_known_bridge_block(self):
+        """WG v2 R22: the bridge's copy lags a runtime switch by up to one
+        re-read of uav://safety/geofence; the server it reports is the truth."""
         from types import SimpleNamespace
 
         other = theaters.get("iran-isfahan")
-        srv = SimpleNamespace(theater=other, theater_mismatch=None)
+        srv = SimpleNamespace(theater=other, theater_mismatch=None, theater_epoch=4)
 
         class Known(self.Ctx):
             def theaters(self):
@@ -1324,7 +1406,12 @@ class TestInProcessTheater:
                         "active": active_block()}
 
         g = ig.IntelService(Known(), srv).graph()
-        assert g["theater"]["id"] == "default"
+        assert g["theater"]["id"] == "iran-isfahan" and g["theater"]["epoch"] == 4
+        assert g["meta"]["theater_epoch"] == 4
+        feed = ig.IntelService(Known(), srv).entity("feed:theater")
+        assert feed["fields"]["active_block"]["source"] == ig.SERVER_THEATER_SOURCE
+        # without a server the bridge block stands
+        assert ig.IntelService(Known()).graph()["theater"]["id"] == "default"
 
     def test_block_matches_the_servers_geofence_resource(self):
         block = ig._server_active_theater(
@@ -1505,6 +1592,13 @@ def test_real_server_shapes_flow_through_to_the_graph(real_server):
     assert veh["attrs"]["link"] and veh["attrs"]["bingo_latched"] is False
     assert veh["attrs"]["lost_link"]["behaviour"] == "rtb"
     assert veh["attrs"]["lost_link"]["source"] == "vehicle"
+    # WG v2 (A11): the real server's theater block, airframe, sites and overlay
+    assert set(g["theater"]) == set(theater_tools.STATE_KEYS)
+    assert g["theater"]["epoch"] == srv.theater_epoch == 0
+    assert veh["attrs"]["airframe"]["id"] == srv.airframe_id
+    assert g["meta"]["sites"]["reason"] == "map data is off"      # geodata defaults off
+    assert g["meta"]["overlay_rev"] == svc.overlay()["rev"] == "0:0:0:0"
+    assert svc.overlay(rev="0:0:0:0") == {"rev": "0:0:0:0", "unchanged": True}
 
     e = svc.entity(tracks[0]["id"])
     assert ig.json_size(e) <= ig.ENTITY_MAX_BYTES

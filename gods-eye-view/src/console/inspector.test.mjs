@@ -1137,6 +1137,26 @@ test('entity caveats appear under How we know with the Assumed tag; provenance k
   assert.equal(provenanceLabel('agl_is_measured'), 'AGL measured');
 });
 
+test('timestamp provenance keys read as Zulu times, never as huge durations', async () => {
+  // link_lost_since_ms is an epoch timestamp; formatting it as a duration
+  // printed "497391 h". Ages such as stale_ms stay durations.
+  const since = Date.UTC(2026, 8, 28, 14, 3, 12);
+  const m = mount({
+    entity: () =>
+      Promise.resolve({
+        id: 'veh:Drone1',
+        type: 'vehicle',
+        fields: { fuel: { fuel_pct: 64, bingo_fuel_pct: 22 }, agl: {} },
+        provenance: { stale_ms: 42000, link_lost_since_ms: since },
+      }),
+  });
+  const el = await showLoaded(m, 'veh:Drone1');
+  assert.equal(text(fieldValue(el, 'Telemetry age')), '42 s');
+  const lost = text(fieldValue(el, provenanceLabel('link_lost_since_ms')));
+  assert.match(lost, /14:03:12Z/);
+  assert.doesNotMatch(lost, /\d{4,} h/);
+});
+
 test('pattern of life is one honest line, never a dump of the baseline', () => {
   assert.equal(
     patternOfLifeLine({
@@ -1295,4 +1315,684 @@ test('a BINGO latched after the return has landed says Landed, not returning hom
 test('the inspector region takes focus (F6 lands on it)', () => {
   const m = mount();
   assert.equal(m.el.attrs.tabindex, '-1');
+});
+
+// ---- WG §4.2.5, §4.2.6, §4.2.1: theaters, sites, unrecognised items -------------------------
+
+const XSS = '<img src=x onerror=alert(1)>';
+const BIDI = '‮evil‬';
+const BIDI_RE = /[‪-‮⁦-⁩]/;
+const FETCHED = Date.UTC(2026, 8, 27, 14, 1, 12);
+
+const THEATER_BLOCK = {
+  id: 'dyn-kherson-4f2a',
+  label: 'Kherson',
+  place: 'Kherson, Ukraine',
+  known: false,
+  epoch: 3,
+  dynamic: true,
+  source: 'chat',
+  state: 'active',
+  bbox: [46.6089, 32.5783, 46.6629, 32.6563],
+  center: [46.6359, 32.6173],
+  half_extent_m: 2940,
+  area_km2: 34.6,
+  home: {
+    lat: 46.6371,
+    lon: 32.6189,
+    alt_msl_m: 45,
+    name: 'Grass strip',
+    source: 'overpass-open-ground',
+  },
+  ground_msl_m: 45.4,
+  ground_source:
+    'Re:Earth terrain (ellipsoidal height), converted to sea level (EGM96) once.',
+  airframe: {
+    id: 'quad_suas_electric',
+    label: 'Quad, small electric',
+    reach_m: 7350,
+  },
+  time_scale: 1,
+  geocoder: 'Photon (OpenStreetMap)',
+  query: 'Kherson',
+  set_at_ms: Date.UTC(2026, 8, 27, 14, 1, 40),
+  set_via: 'console',
+  previous: { id: 'default', label: 'Redmond (AirSim default)' },
+  integrity_error: null,
+};
+
+function placeNodes() {
+  return [
+    {
+      id: 'thr:dyn-kherson-4f2a',
+      type: 'theater',
+      label: 'Kherson',
+      subtitle: 'Kherson, Ukraine · active',
+      status: 'ok',
+      lat: 46.6359,
+      lon: 32.6173,
+      attrs: { ...THEATER_BLOCK, active: true },
+    },
+    {
+      id: 'thr:default',
+      type: 'theater',
+      label: 'Redmond (AirSim default)',
+      status: 'ok',
+      lat: 47.641468,
+      lon: -122.140165,
+      attrs: { active: false, place: 'Redmond, Washington, USA' },
+    },
+    {
+      id: 'sit:dyn-kherson-4f2a:way/1',
+      type: 'site',
+      label: 'Kherson International Airport',
+      subtitle: 'Airfield  Mapped, not verified',
+      status: 'ok',
+      salience: 0.4,
+      lat: 46.6758,
+      lon: 32.5064,
+      attrs: {
+        category: 'airfield',
+        subtype: 'aeroway=aerodrome',
+        osm: { type: 'way', id: 1 },
+        bounds: [46.67, 32.49, 46.68, 32.52],
+        tags: { icao: 'UKOH', aeroway: 'aerodrome' },
+        tags_total: 14,
+        source: 'osm',
+        register: 'mapped',
+        fetched_at_ms: FETCHED,
+      },
+    },
+    {
+      id: 'sit:dyn-kherson-4f2a:node/2',
+      type: 'site',
+      label: 'City hospital',
+      status: 'ok',
+      lat: 46.64,
+      lon: 32.61,
+      attrs: {
+        category: 'medical',
+        protected: true,
+        bounds: null,
+        tags: {},
+      },
+    },
+    {
+      id: 'frc:red-sam-1',
+      type: 'force',
+      label: 'Red SAM 1',
+      subtitle: 'Scenario unit',
+      status: 'ok',
+      lat: 46.62,
+      lon: 32.6,
+      attrs: { side: 'red', wg_class: 'sam', note: XSS },
+    },
+  ];
+}
+
+const PLACE_ENTITIES = {
+  'sit:dyn-kherson-4f2a:way/1': {
+    id: 'sit:dyn-kherson-4f2a:way/1',
+    type: 'site',
+    label: 'Kherson International Airport',
+    status: 'ok',
+    fields: {
+      category: 'airfield',
+      category_word: 'Airfield',
+      subtype: 'aeroway=aerodrome',
+      name: 'Kherson International Airport',
+      name_en: 'Kherson Airport',
+      lat: 46.6758,
+      lon: 32.5064,
+      bounds: [46.67, 32.49, 46.68, 32.52],
+      tags: {
+        name: 'Kherson International Airport',
+        'name:en': 'Kherson Airport',
+        operator: 'City',
+        aeroway: 'aerodrome',
+        icao: 'UKOH',
+        iata: 'KHE',
+        landuse: 'military',
+        barrier: 'fence',
+        man_made: 'tower',
+      },
+      tags_total: 14,
+      protected: false,
+      register: 'mapped',
+      near: {
+        radius_m: 1000,
+        contacts: [
+          { id: 'trk:T-3fa9c1', label: 'SA-6 battery', distance_m: 420 },
+        ],
+        pois: [],
+      },
+      fetched_at_ms: FETCHED,
+    },
+    provenance: {
+      source: 'OpenStreetMap contributors, ODbL. Fetched via Overpass.',
+      how_we_know: 'Mapped, not verified.',
+      fetched_at_ms: FETCHED,
+      degraded: false,
+    },
+    related: [
+      {
+        id: 'thr:dyn-kherson-4f2a',
+        type: 'theater',
+        label: 'Kherson',
+        kind: 'in_theater',
+        dir: 'out',
+      },
+    ],
+  },
+  'sit:dyn-kherson-4f2a:node/2': {
+    id: 'sit:dyn-kherson-4f2a:node/2',
+    type: 'site',
+    label: 'City hospital',
+    fields: {
+      category: 'medical',
+      name: 'City hospital',
+      lat: 46.64,
+      lon: 32.61,
+      tags: { amenity: 'hospital' },
+      protected: true,
+      near: { radius_m: 1000, contacts: [], pois: [] },
+    },
+    provenance: { degraded: true, reason: 'overpass timed out' },
+  },
+  'thr:dyn-kherson-4f2a': {
+    id: 'thr:dyn-kherson-4f2a',
+    type: 'theater',
+    label: 'Kherson',
+    fields: { id: 'dyn-kherson-4f2a', active: true },
+    provenance: {},
+  },
+  'thr:default': {
+    id: 'thr:default',
+    type: 'theater',
+    label: 'Redmond (AirSim default)',
+    fields: {
+      id: 'default',
+      place: 'Redmond, Washington, USA',
+      home: [47.641468, -122.140165, 122.0],
+      ao: [
+        [47.621468, -122.170165],
+        [47.621468, -122.110165],
+        [47.661468, -122.110165],
+        [47.661468, -122.170165],
+      ],
+      dynamic: false,
+      active: false,
+    },
+  },
+  'frc:red-sam-1': {
+    id: 'frc:red-sam-1',
+    type: 'force',
+    label: 'Red SAM 1',
+    fields: { side: 'red', designator: 'Red SAM 1', detail: { a: 1 } },
+  },
+};
+
+function mountPlaces(patch = {}) {
+  const m = mount({
+    entity: (id) =>
+      Promise.resolve(
+        PLACE_ENTITIES[id] ? structuredClone(PLACE_ENTITIES[id]) : null,
+      ),
+  });
+  m.store.change({
+    graph: {
+      nodes: [...nodes(), ...placeNodes()],
+      edges: [],
+      theater: THEATER_BLOCK,
+      ...patch,
+    },
+  });
+  return m;
+}
+
+/** The action buttons' words, in order. */
+const actionWords = (el) =>
+  byCls(el, 'ic-inspector__actions')[0]
+    .children.filter((c) => c?.tag === 'button')
+    .map((b) => text(b).replace(/^[a-z_]+(?=[A-Z])/, ''));
+
+test('typeFromId: sit is a site; an unknown prefix is unknown, a bare id a contact', () => {
+  assert.equal(typeFromId('sit:dyn-x:way/1'), 'site');
+  assert.equal(typeFromId('frc:red-sam-1'), 'unknown');
+  assert.equal(typeFromId('T-1'), 'track');
+});
+
+test('a site: header words, category with its tag, names, tags with Show all, source, caveat, near', async () => {
+  const m = mountPlaces();
+  const el = await showLoaded(m, 'sit:dyn-kherson-4f2a:way/1');
+  const head = byCls(el, 'ic-inspector__titlebar')[0];
+  assert.equal(
+    text(byCls(head, 'ic-inspector__title')[0]),
+    'Kherson International Airport',
+  );
+  assert.equal(text(byCls(head, 'ic-inspector__type')[0]), 'Site');
+  assert.equal(text(byCls(head, 'ic-inspector__category')[0]), 'Airfield');
+  assert.match(text(head), /Mapped, not verified/);
+  assert.doesNotMatch(text(head), /Protected/);
+  assert.match(text(head), /sit:dyn-kherson-4f2a:way\/1/);
+  assert.ok(byKey(el, 'copy'), 'Copy id');
+  const glyphEl = find(head, (e) => hasCls(e, 'ic-kit-glyph'));
+  assert.equal(glyphEl.attrs['data-type'], 'site');
+
+  const cat = fieldValue(el, 'Category');
+  assert.match(text(cat), /^Airfield \(aeroway=aerodrome\)Mapped$/);
+  assert.equal(
+    text(fieldValue(el, 'Name')),
+    'Kherson International Airport (Kherson Airport)',
+  );
+  assert.equal(text(fieldValue(el, 'Coordinates')), '46.67580, 32.50640');
+  // Eight whitelisted tags besides the name: six, then "Show all 8 tags".
+  let tags = fieldValue(el, 'Tags');
+  assert.equal(byCls(tags, 'ic-inspector__tag').length, 6);
+  assert.doesNotMatch(
+    text(tags),
+    /^name /m,
+    'the name is not repeated as a tag',
+  );
+  const more = byKey(el, 'site:tags');
+  assert.equal(text(more), 'Show all 8 tags');
+  more.fire('click');
+  tags = fieldValue(el, 'Tags');
+  assert.equal(byCls(tags, 'ic-inspector__tag').length, 8);
+  assert.equal(text(byKey(el, 'site:tags')), 'Show fewer tags');
+  assert.equal(
+    text(fieldValue(el, 'Source')),
+    'OpenStreetMap contributors, ODbL. Fetched 14:01Z via Overpass.',
+  );
+  assert.match(
+    text(fieldValue(el, 'How we know')),
+    /^Mapped, not verified\. Mapping may be incomplete, out of date or wrong; a missing site is not an absent one\.$/,
+  );
+  assert.match(text(el), /Contacts within 1 km/);
+  assert.ok(byKey(el, 'chip:trk:T-3fa9c1'), 'a nearby contact chip');
+  // Its source and caveat are its own rows: no second "How we know" dump.
+  assert.equal(
+    findAll(el, (e) => e.tag === 'h3' && text(e) === 'How we know').length,
+    0,
+  );
+});
+
+test('a site is context only: Ask, Focus, Show on map, Plan recce, Close; never an engagement', async () => {
+  const m = mountPlaces();
+  const el = await showLoaded(m, 'sit:dyn-kherson-4f2a:way/1');
+  assert.deepEqual(actionWords(el), [
+    'Ask about this',
+    'Focus',
+    'Show on map',
+    'Plan recce over this',
+    'Close',
+  ]);
+  assert.doesNotMatch(
+    text(byCls(el, 'ic-inspector__actions')[0]),
+    /strike|engage|attack|abort|track/i,
+  );
+  byKey(el, 'act:map').fire('click');
+  assert.deepEqual(m.bus.last('map:request'), {
+    ids: ['sit:dyn-kherson-4f2a:way/1'],
+    bbox: [46.67, 32.49, 46.68, 32.52],
+    label: 'Kherson International Airport',
+    source: 'operator',
+    countdown: false,
+  });
+  byKey(el, 'act:recce').fire('click');
+  assert.deepEqual(m.bus.last('ask'), {
+    text: 'Plan a route recon over [[sit:dyn-kherson-4f2a:way/1|Kherson International Airport]] and show me the dry run.',
+    focused_ids: ['sit:dyn-kherson-4f2a:way/1'],
+    draft: true,
+  });
+});
+
+test('a medical site shows "Protected" and the degraded map feed, still with no engagement', async () => {
+  const m = mountPlaces();
+  const el = await showLoaded(m, 'sit:dyn-kherson-4f2a:node/2');
+  const head = byCls(el, 'ic-inspector__titlebar')[0];
+  assert.equal(
+    text(byCls(head, 'ic-inspector__category')[0]),
+    'Medical, protected',
+  );
+  assert.equal(text(byCls(head, 'ic-inspector__protected')[0]), 'Protected');
+  const how = text(fieldValue(el, 'How we know'));
+  assert.match(how, /Map data feed down\. Sites may be missing, not absent\./);
+  assert.match(how, /overpass timed out/);
+  assert.match(text(el), /No contacts within 1 km\./);
+  assert.deepEqual(actionWords(el), [
+    'Ask about this',
+    'Focus',
+    'Show on map',
+    'Plan recce over this',
+    'Close',
+  ]);
+  // A point site's Show on map is a 1 km box on the point.
+  byKey(el, 'act:map').fire('click');
+  const req = m.bus.last('map:request');
+  assert.ok(req.bbox[0] < 46.64 && req.bbox[2] > 46.64);
+});
+
+test('a map-only site (outside the graph cap, this theater) never reads "outside this theater"', async () => {
+  // Review: the overlay serves 108 sites, the graph keeps 60; a hospital
+  // inside the AO opened with "Not in the current picture (outside this
+  // theater or aged out)."
+  const id = 'sit:dyn-kherson-4f2a:way/931781036';
+  const other = 'sit:dyn-odesa-1:way/5';
+  const hospital = (theater, sid) => ({
+    id: sid,
+    type: 'site',
+    label: 'Hospital',
+    fields: {
+      category: 'medical',
+      name: 'Hospital',
+      lat: 46.66287,
+      lon: 32.65037,
+      tags: { amenity: 'hospital' },
+      protected: true,
+      theater,
+      in_graph: false,
+    },
+    provenance: {},
+  });
+  const m = mount({
+    entity: (eid) =>
+      Promise.resolve(
+        eid === id
+          ? hospital('dyn-kherson-4f2a', id)
+          : eid === other
+            ? hospital('dyn-odesa-1', other)
+            : null,
+      ),
+  });
+  m.store.change({
+    graph: {
+      nodes: [...nodes(), ...placeNodes()],
+      edges: [],
+      theater: THEATER_BLOCK,
+      meta: { sites: { total: 108, in_graph: 60, omitted: 48 } },
+    },
+  });
+  let el = await showLoaded(m, id);
+  assert.doesNotMatch(text(el), /Not in the current picture/);
+  assert.match(
+    text(el),
+    /On the map only: not among the 60 sites the orb shows\./,
+  );
+  assert.match(text(el), /Protected/);
+  // A site of another theater still says it is not in the picture.
+  el = await showLoaded(m, other);
+  assert.match(text(el), /Not in the current picture/);
+  assert.doesNotMatch(text(el), /On the map only/);
+});
+
+test('a site says how many OSM tags the server did not keep (tags_total)', async () => {
+  // Review: "Бетонверф" has 14 OSM tags; the server keeps {name, operator,
+  // power} and the inspector showed two tags with no hint of the rest.
+  const id = 'sit:dyn-kherson-4f2a:way/203236227';
+  const only = 'sit:dyn-kherson-4f2a:node/7';
+  const site = (sid, tags, total) => ({
+    id: sid,
+    type: 'site',
+    label: 'Бетонверф',
+    fields: {
+      category: 'power',
+      name: 'Бетонверф',
+      lat: 46.65,
+      lon: 32.6,
+      tags,
+      tags_total: total,
+      theater: 'dyn-kherson-4f2a',
+      in_graph: true,
+    },
+    provenance: {},
+  });
+  const m = mount({
+    entity: (eid) =>
+      Promise.resolve(
+        eid === id
+          ? site(
+              id,
+              {
+                name: 'Бетонверф',
+                operator: 'Херсонобленерго',
+                power: 'substation',
+              },
+              14,
+            )
+          : eid === only
+            ? site(only, { name: 'Бетонверф' }, 5)
+            : PLACE_ENTITIES[eid]
+              ? structuredClone(PLACE_ENTITIES[eid])
+              : null,
+      ),
+  });
+  m.store.change({
+    graph: {
+      nodes: [...nodes(), ...placeNodes()],
+      edges: [],
+      theater: THEATER_BLOCK,
+    },
+  });
+  let el = await showLoaded(m, id);
+  let tags = fieldValue(el, 'Tags');
+  assert.equal(byCls(tags, 'ic-inspector__tag').length, 2);
+  assert.match(
+    text(tags),
+    /OpenStreetMap has 14 tags for this site; the console keeps 3\./,
+  );
+  // Only the name kept: the row still says what is missing.
+  el = await showLoaded(m, only);
+  tags = fieldValue(el, 'Tags');
+  assert.match(
+    text(tags),
+    /OpenStreetMap has 5 tags for this site; the console keeps 1\./,
+  );
+  // Everything kept: no line.
+  el = await showLoaded(m, 'sit:dyn-kherson-4f2a:node/2');
+  assert.doesNotMatch(text(el), /OpenStreetMap has/);
+});
+
+test('an unknown site category reads "Mapped site"', async () => {
+  const m = mountPlaces();
+  m.store.change({
+    graph: {
+      nodes: [
+        {
+          id: 'sit:x:node/9',
+          type: 'site',
+          label: 'Thing',
+          status: 'ok',
+          attrs: { category: 'volcano' },
+        },
+      ],
+      edges: [],
+    },
+  });
+  const el = await showLoaded(m, 'sit:x:node/9');
+  assert.equal(text(byCls(el, 'ic-inspector__category')[0]), 'Mapped site');
+  assert.match(text(fieldValue(el, 'Category')), /^Mapped site/);
+});
+
+test('the active theater: every §4.2.5 row with its register, Previous chip and the place actions', async () => {
+  const m = mountPlaces();
+  const el = await showLoaded(m, 'thr:dyn-kherson-4f2a');
+  assert.equal(text(fieldValue(el, 'Place')), 'Kherson, Ukraine');
+  assert.equal(text(fieldValue(el, 'Centre')), '46.63590, 32.61730Requested');
+  assert.equal(
+    text(fieldValue(el, 'Area')),
+    '6.0 × 6.0 km (34.6 km²)Requested',
+  );
+  assert.equal(
+    text(fieldValue(el, 'Bounds')),
+    '46.60890, 32.57830, 46.66290, 32.65630Requested',
+  );
+  const home = text(fieldValue(el, 'Home'));
+  assert.match(
+    home,
+    /^Grass strip 46\.63710, 32\.61890 0\.2 km from the centreMapped$/,
+  );
+  const ground = text(fieldValue(el, 'Ground'));
+  assert.match(ground, /^≈ 45 m above sea levelEstimatedRe:Earth terrain/);
+  assert.equal(
+    text(fieldValue(el, 'Airframe')),
+    'Quad, small electric, reach 7.4 km',
+  );
+  assert.equal(
+    text(fieldValue(el, 'Source')),
+    'Set from chat at 14:01Z, approved by you',
+  );
+  assert.equal(
+    text(fieldValue(el, 'Geocoder and query')),
+    'Photon (OpenStreetMap), query "Kherson"Mapped',
+  );
+  assert.ok(byKey(fieldValue(el, 'Previous'), 'chip:thr:default'));
+  assert.equal(text(fieldValue(el, 'Active')), 'Yes');
+  assert.deepEqual(actionWords(el), [
+    'Ask about this',
+    'Focus',
+    'Show on map',
+    'Plan recce over this',
+    'Close',
+  ]);
+  byKey(el, 'act:map').fire('click');
+  assert.deepEqual(m.bus.last('map:request').bbox, THEATER_BLOCK.bbox);
+  byKey(el, 'act:recce').fire('click');
+  assert.equal(
+    m.bus.last('ask').text,
+    'Plan a route recon over [[thr:dyn-kherson-4f2a|Kherson]] and show me the dry run.',
+  );
+  assert.equal(m.bus.last('ask').draft, true);
+});
+
+test('a theater placed from coordinates: the AO-centre home is Assumed and the geocoder row claims no lookup', async () => {
+  // Review: the slip tagged this home "Mapped", the inspector "Requested",
+  // and the inspector read "Geocoder and query: Coordinates [Mapped]".
+  const block = {
+    ...THEATER_BLOCK,
+    geocoder: 'Coordinates',
+    query: '12.9716, 77.5946',
+    home: {
+      lat: 46.6359,
+      lon: 32.6173,
+      alt_msl_m: 45,
+      name: null,
+      source: 'ao-centre',
+    },
+  };
+  const m = mount({
+    entity: (id) =>
+      Promise.resolve(
+        PLACE_ENTITIES[id] ? structuredClone(PLACE_ENTITIES[id]) : null,
+      ),
+  });
+  m.store.change({
+    graph: {
+      nodes: [
+        ...nodes(),
+        ...placeNodes().map((n) =>
+          n.id === 'thr:dyn-kherson-4f2a'
+            ? { ...n, attrs: { ...block, active: true } }
+            : n,
+        ),
+      ],
+      edges: [],
+      theater: block,
+    },
+  });
+  const el = await showLoaded(m, 'thr:dyn-kherson-4f2a');
+  assert.equal(
+    text(fieldValue(el, 'Home')),
+    'AO centre (no mapped open ground) 46.63590, 32.61730 0.0 km from the centreAssumed',
+  );
+  const geo = fieldValue(el, 'Geocoder and query');
+  assert.equal(text(geo), 'Placed from coordinates, not geocoded');
+  assert.equal(byCls(geo, 'ic-kit-reg').length, 0, 'no Mapped tag');
+});
+
+test('a preset theater that is not active reads from its table row: Measured centre, Active No', async () => {
+  const m = mountPlaces();
+  const el = await showLoaded(m, 'thr:default');
+  assert.equal(text(fieldValue(el, 'Place')), 'Redmond, Washington, USA');
+  assert.match(text(fieldValue(el, 'Centre')), /Measured$/);
+  assert.match(
+    text(fieldValue(el, 'Bounds')),
+    /^47\.62147, -122\.1701[67], 47\.66147/,
+  );
+  assert.match(text(fieldValue(el, 'Home')), /Measured$/);
+  assert.equal(text(fieldValue(el, 'Active')), 'No');
+  assert.equal(
+    findAll(el, (e) => e.tag === 'dt' && text(e) === 'Geocoder and query')
+      .length,
+    0,
+    'a preset has no geocoder row',
+  );
+});
+
+test('an unrecognised type: header says so, its fields are text, the fixed line, never green', async () => {
+  const m = mountPlaces();
+  const el = await showLoaded(m, 'frc:red-sam-1');
+  const head = byCls(el, 'ic-inspector__titlebar')[0];
+  assert.equal(
+    text(byCls(head, 'ic-inspector__type')[0]),
+    'Unrecognised item (force)',
+  );
+  assert.match(text(head), /Not assessed/);
+  const g = find(head, (e) => hasCls(e, 'ic-kit-glyph'));
+  assert.equal(g.attrs['data-type'], 'unknown');
+  assert.doesNotMatch(String(g.innerHTML), /#5DD39B/i);
+  assert.match(
+    text(el),
+    /The console doesn't recognise this kind of item, so it shows it as unknown\. That isn't a statement that it's safe\./,
+  );
+  assert.equal(text(fieldValue(el, 'side')), 'red');
+  assert.equal(text(fieldValue(el, 'detail')), '{"a":1}');
+  assert.equal(text(fieldValue(el, 'note')), XSS);
+  assert.equal(findAll(el, (e) => e.tag === 'img').length, 0);
+  assert.deepEqual(actionWords(el), ['Ask about this', 'Focus', 'Close']);
+});
+
+test('XSS and bidi fixtures in a site name and tags render as text (§3.11)', async () => {
+  const m = mountPlaces();
+  const hostile = structuredClone(PLACE_ENTITIES['sit:dyn-kherson-4f2a:way/1']);
+  hostile.label = `${BIDI}${XSS}`;
+  hostile.fields.name = `${BIDI}${XSS}`;
+  hostile.fields.name_en = XSS;
+  hostile.fields.tags = { operator: XSS, [XSS]: BIDI };
+  m.store.change({
+    graph: {
+      nodes: placeNodes().map((n) =>
+        n.id === hostile.id ? { ...n, label: `${BIDI}${XSS}` } : n,
+      ),
+      edges: [],
+      theater: THEATER_BLOCK,
+    },
+  });
+  m.store.entity = () => Promise.resolve(structuredClone(hostile));
+  const el = await showLoaded(m, hostile.id);
+  assert.equal(findAll(el, (e) => e.tag === 'img').length, 0);
+  assert.equal(
+    findAll(el, (e) => Object.keys(e.attrs || {}).some((k) => /^on/i.test(k)))
+      .length,
+    0,
+  );
+  const title = text(byCls(el, 'ic-inspector__title')[0]);
+  assert.equal(title, `evil${XSS}`);
+  assert.doesNotMatch(title, BIDI_RE);
+  assert.ok(text(fieldValue(el, 'Tags')).includes(XSS));
+  assert.doesNotMatch(text(fieldValue(el, 'Tags')), BIDI_RE);
+  assert.ok(text(fieldValue(el, 'Name')).includes(XSS));
+  byKey(el, 'act:ask').fire('click');
+  assert.doesNotMatch(m.bus.last('ask').text, BIDI_RE);
+  byKey(el, 'act:recce').fire('click');
+  assert.doesNotMatch(m.bus.last('ask').text, BIDI_RE);
+});
+
+test('with the sim sped up, time to BINGO and a mission ETA say "in sim time"', async () => {
+  const m = mountPlaces({ theater: { ...THEATER_BLOCK, time_scale: 4 } });
+  const el = await showLoaded(m, 'veh:Drone1');
+  assert.match(
+    text(fieldValue(el, 'To BINGO')),
+    /≈ 11 min to BINGO in sim time \(≈ 2 min 45 s real\)/,
+  );
 });

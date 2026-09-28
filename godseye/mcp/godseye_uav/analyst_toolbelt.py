@@ -14,7 +14,11 @@ Built per chat session (contract §5.1):
   definitions of one action).  Sim ground truth (``uav://targets``) and camera PNGs are unreachable because
   ``read_intel_resource`` only admits an allowlist of URIs.
 * Curated tools: ``intel_overview``, ``intel_search``, ``intel_entity``,
-  ``read_intel_resource`` and the ``ui_*`` directives, which call ``emit_ui``.
+  ``read_intel_resource`` and the ``ui_*`` directives, which call ``emit_ui``
+  (``ui_show_map`` frames an area on the map: WG v2 §3.6, §3.7).
+* Every proxied call runs with ``theater_tools.CALL_VIA`` set to ``"console"``,
+  so a theater switch the analyst makes is recorded as ``set_via: "console"``
+  (WG v2 §4.1.3 step 6); ``/mcp`` callers keep the default ``"mcp"``.
 
 Result shaping (every result, proxied or curated): compact JSON; tools that
 take ``detail`` / ``top_n`` get ``detail="summary"`` / ``top_n=10`` when the
@@ -36,6 +40,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from . import theater_tools
 from .analyst_policy import (
     DRY_RUN_TOOLS,
     SDK_SERVER_NAME,
@@ -72,8 +77,13 @@ RESOURCE_ALLOWLIST = (
 #: Results longer than this are parsed and shaped on a worker thread.
 _OFFLOAD_CHARS = 200_000
 
-_ENTITY_ID = re.compile(r"^(?:veh|msn|trk|unit|ob|rpt|thr|poi|alarm|feed):[^\r\n\[\]|]{1,160}$")
+#: An intel-graph id: one of the graph's type prefixes (``sit`` is a mapped
+#: site, WG v2 §3.1, R26), then the rest of the chip grammar ``[[prefix:id|label]]``.
+_ENTITY_ID = re.compile(
+    r"^(?:veh|msn|trk|unit|ob|rpt|thr|poi|sit|alarm|feed):[^\r\n\[\]|]{1,160}$")
 _MAX_ENTITIES = 20
+#: ``ui_show_map`` takes 1 to this many graph ids (WG v2 §3.7, R12).
+MAP_IDS_MAX = 50
 
 
 @dataclass
@@ -375,10 +385,15 @@ def _proxy_tool(sdk: Any, server: Any, info: Any) -> Any:
         call_args = dict(args or {})
         for key, value in forced.items():
             call_args.setdefault(key, value)
+        # The call source for the theater switch's `set_via` (WG v2 §4.1.3):
+        # set around the in-process call only, so nothing else inherits it.
+        token = theater_tools.CALL_VIA.set("console")
         try:
             result = await server.mcp.call_tool(name, call_args)
         except Exception as exc:  # noqa: BLE001 -- surfaced to the model, never raised
             return _err("tool_failed", _exc_message(exc), tool=name)
+        finally:
+            theater_tools.CALL_VIA.reset(token)
         text, is_error = _call_result_text(result)
         if len(text) > _OFFLOAD_CHARS:  # keep a multi-MB parse off the event loop
             shaped = await asyncio.to_thread(_parse_and_shape, text)
@@ -415,8 +430,10 @@ def _curated_tools(sdk: Any, server: Any, intel: Any, emit_ui: Callable[[dict], 
 
     @tool("intel_search",
           "Search the intel graph (vehicles, missions, contacts, units, equipment classes, "
-          "reports, theater, POIs, alarms, feeds). Returns ranked nodes: id, type, label, "
-          "subtitle, status. Use the ids with intel_entity and in [[type:id|label]] markup.",
+          "reports, theater, mapped sites, POIs, alarms, feeds). Returns ranked nodes: id, "
+          "type, label, subtitle, status. Use the ids with intel_entity and in "
+          "[[type:id|label]] markup. Sites are mapped OpenStreetMap data: context only, "
+          "not verified.",
           {"type": "object",
            "properties": {
                "query": {"type": "string", "minLength": 1, "maxLength": 200,
@@ -425,7 +442,7 @@ def _curated_tools(sdk: Any, server: Any, intel: Any, emit_ui: Callable[[dict], 
                          "items": {"type": "string", "maxLength": 32},
                          "description": "Optional node types: vehicle, mission, track "
                                         "(contact), unit, equipment (ob), report, theater, "
-                                        "poi, alarm, feed."},
+                                        "site (mapped strategic site), poi, alarm, feed."},
                "limit": {"type": "integer", "minimum": 1, "maximum": 25}},
            "required": ["query"], "additionalProperties": False})
     async def intel_search(args: dict) -> dict:
@@ -545,8 +562,39 @@ def _curated_tools(sdk: Any, server: Any, intel: Any, emit_ui: Callable[[dict], 
     async def ui_inspect(args: dict) -> dict:
         return _emit({"action": "inspect", "id": str(args.get("id") or "")[:200]})
 
+    @tool("ui_show_map",
+          "Show an area on the operator's map: the map frames every listed graph id "
+          "(thr:… for the theater, sit:…, veh:…, trk:…, poi:…). Use it when the operator "
+          "wants to see an area; ui_track follows one drone instead.",
+          {"type": "object",
+           "properties": {"ids": {"type": "array", "minItems": 1, "maxItems": MAP_IDS_MAX,
+                                  "items": {"type": "string", "maxLength": 200}},
+                          "reason": {"type": "string", "maxLength": 200}},
+           "required": ["ids", "reason"], "additionalProperties": False})
+    async def ui_show_map(args: dict) -> dict:
+        problem, ids = map_ids(args.get("ids"))
+        if problem:
+            return _err("invalid_ids", problem)
+        return _emit({"action": "map", "ids": ids,
+                      "reason": str(args.get("reason") or "")[:200]})
+
     return [intel_overview, intel_search, intel_entity, read_intel_resource,
-            ui_focus, ui_track, ui_show_orb, ui_inspect]
+            ui_focus, ui_track, ui_show_orb, ui_inspect, ui_show_map]
+
+
+def map_ids(value: Any) -> tuple[str | None, list[str]]:
+    """``(problem, ids)`` for ``ui_show_map``'s ``ids`` (WG v2 §3.7, R12): 1 to
+    ``MAP_IDS_MAX`` intel-graph ids in the chip grammar, de-duplicated in
+    order. ``problem`` is one sentence for the model, or None."""
+    if not isinstance(value, list) or not value:
+        return "ids must list 1 to 50 graph ids, e.g. thr:<theater id>.", []
+    if len(value) > MAP_IDS_MAX:
+        return f"ids lists {len(value)} ids; the map takes at most {MAP_IDS_MAX}.", []
+    bad = [x for x in value if not (isinstance(x, str) and _ENTITY_ID.match(x))]
+    if bad:
+        return (f"{len(bad)} of the ids are not graph ids (prefix:id, such as thr:…, sit:…, "
+                "veh:… or trk:…); take them from intel_search or intel_entity."), []
+    return None, list(dict.fromkeys(value))
 
 
 async def build_toolbelt(server: Any, intel: IntelService | None,
@@ -585,12 +633,14 @@ def schema_defaults(schema: Any) -> dict:
 __all__ = [
     "ENTITY_CHAR_LIMIT",
     "EXCLUDED_TOOLS",
+    "MAP_IDS_MAX",
     "RESOURCE_ALLOWLIST",
     "RESULT_CHAR_LIMIT",
     "Toolbelt",
     "build_toolbelt",
     "dumps_compact",
     "extract_entities",
+    "map_ids",
     "result_text",
     "schema_defaults",
     "shape_text",

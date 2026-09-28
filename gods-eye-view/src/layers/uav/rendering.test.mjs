@@ -71,8 +71,9 @@ test('the trail survives the move to interpolated positions', async () => {
   fixture.source.snapshot = {
     ...fixture.source.snapshot,
     observedAtMs: T0 + 200,
+    // ~75 m east: motion, well inside the 2 km jump guard (§4.2.8).
     records: [
-      uavRecord({ observedAtMs: T0 + 200, position: { longitude: -122.1 } }),
+      uavRecord({ observedAtMs: T0 + 200, position: { longitude: -122.1385 } }),
     ],
   };
   await fixture.layer.update(fixture.viewer);
@@ -230,7 +231,11 @@ test('a vehicle the bridge cannot place costs only itself', async () => {
         reference: 'Drone2',
         label: 'Drone2',
         observedAtMs: T0,
-        position: { latitude: 47.65, longitude: -122.13, ellipsoidAltitude: 90 },
+        position: {
+          latitude: 47.65,
+          longitude: -122.13,
+          ellipsoidAltitude: 90,
+        },
       }),
     ],
   });
@@ -241,4 +246,36 @@ test('a vehicle the bridge cannot place costs only itself', async () => {
   assert.ok(layer._collection.entities.getById('uav:Drone2'));
   assert.equal(layer._collection.entities.getById('uav:Ghost'), undefined);
   layer.destroy();
+});
+
+test('a 13,000 km jump starts a new trail; ordinary moves extend it (§4.2.8)', async () => {
+  const fixture = await harness();
+  const { state, motion } = fixture.layer.testing;
+  const trail = fixture.layer._collection.entities.getById('uav-trail:Drone1');
+  const step = async (atMs, position) => {
+    fixture.source.snapshot = {
+      ...fixture.source.snapshot,
+      observedAtMs: atMs,
+      records: [uavRecord({ observedAtMs: atMs, position })],
+    };
+    await fixture.layer.update(fixture.viewer);
+  };
+  await step(T0 + 200, { longitude: -122.1385 }); // ~75 m
+  await step(T0 + 400, { longitude: -122.12 }); // ~1.4 km: still motion
+  assert.equal(value(trail.polyline.positions).length, 3);
+  assert.equal(motion.sampleCount('Drone1'), 3);
+
+  // Redmond to Kherson: ~13,000 km. No line may join the two theaters.
+  await step(T0 + 600, { latitude: 46.64, longitude: 32.6 });
+  assert.equal(value(trail.polyline.positions).length, 1);
+  assert.equal(state.trails.get('Drone1').length, 1);
+  assert.equal(motion.sampleCount('Drone1'), 1, 'interpolation restarted');
+  const [only] = value(trail.polyline.positions);
+  const at = Cesium.Cartographic.fromCartesian(only);
+  assert.ok(Math.abs(Cesium.Math.toDegrees(at.longitude) - 32.6) < 1e-6);
+
+  // And motion carries on from the new home.
+  await step(T0 + 800, { latitude: 46.6405, longitude: 32.6 });
+  assert.equal(value(trail.polyline.positions).length, 2);
+  fixture.layer.destroy();
 });

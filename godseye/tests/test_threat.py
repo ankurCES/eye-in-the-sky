@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "mcp"))
 
 from godseye_uav.fake_airsim import FakeAirSim
+from godseye_uav.geo import canonical_altitude
 from godseye_uav.server import GodseyeUavServer as GodseyeServer
 from godseye_uav.threat import (
     ISR_AUTHORITY_NOTE,
@@ -583,3 +584,106 @@ class TestThreatrepSize:
             assess_area(tracks, obs, detail="verbose")
         with pytest.raises(ValueError, match="top_n"):
             assess_area(tracks, obs, top_n=-1)
+
+
+# ---------------------------------------------------------------------------
+# D7 #5 (WG §4.1.9): a weapon ceiling is height above the SHOOTER. Both
+# altitudes the server hands assess_capability are HAE (observer: telemetry
+# alt_hae_m; track: the detection's geo_point altitude), so comparing the
+# observer's absolute HAE with the ceiling put every drone in a high-elevation
+# theater "above the ceiling" of every gun it flew past.
+# ---------------------------------------------------------------------------
+
+#: A high-elevation site (~1550 m MSL plateau).
+SITE_LAT, SITE_LON, SITE_MSL = 32.6546, 51.6680, 1550.0
+#: 1 km due north of the site.
+OBS_LAT, OBS_LON = SITE_LAT + 1000.0 / 111_320.0, SITE_LON
+
+
+def _hae(alt_msl, lat, lon):
+    return canonical_altitude(alt_msl, lat, lon, datum="msl").alt_hae
+
+
+def _aaa_site(alt_hae):
+    return Track(track_id="TRK-AAA", name="aaa_towed_1", category="aaa",
+                 lat=SITE_LAT, lon=SITE_LON, alt_m=alt_hae, first_seen=0.0,
+                 last_seen=0.0, ob_class="aaa_towed")
+
+
+def _observer_above_site(height_m):
+    return {"lat": OBS_LAT, "lon": OBS_LON,
+            "alt_m": _hae(SITE_MSL + height_m, OBS_LAT, OBS_LON)}
+
+
+class TestCeilingIsHeightAboveTheShooter:
+    def test_the_row_under_test(self):
+        ob = OB_LIBRARY["aaa_towed"]
+        assert (ob.weapon_range_m, ob.weapon_ceiling_m) == (2000.0, 1500.0)
+
+    def test_100_m_above_a_high_site_at_1_km_is_inside_the_envelope(self):
+        site_hae = _hae(SITE_MSL, SITE_LAT, SITE_LON)
+        obs = _observer_above_site(100.0)
+        assert obs["alt_m"] > OB_LIBRARY["aaa_towed"].weapon_ceiling_m  # the old bug's trigger
+        cap = assess_capability(_aaa_site(site_hae), obs)
+        assert cap["above_weapon_ceiling"] is False
+        assert cap["in_envelope"] is True
+        assert cap["engagement_geometry"] == 1.0
+        assert 1000.0 <= cap["observer_range_m"] <= 1010.0
+        assert not [e for e in cap["evidence"] if e["element"] == "above_weapon_ceiling"]
+
+    def test_1600_m_above_the_site_is_above_the_ceiling(self):
+        site_hae = _hae(SITE_MSL, SITE_LAT, SITE_LON)
+        cap = assess_capability(_aaa_site(site_hae), _observer_above_site(1600.0))
+        assert cap["above_weapon_ceiling"] is True
+        assert cap["in_envelope"] is False
+        ev = [e for e in cap["evidence"] if e["element"] == "above_weapon_ceiling"]
+        assert len(ev) == 1
+        assert "observer 1600 m above the site" in ev[0]["source"]
+        assert "1500 m engagement ceiling" in ev[0]["source"]
+
+    def test_the_ceiling_boundary_is_measured_from_the_site(self):
+        site_hae = _hae(SITE_MSL, SITE_LAT, SITE_LON)
+        t = _aaa_site(site_hae)
+        just_under = assess_capability(t, _observer_above_site(1499.0))
+        just_over = assess_capability(t, _observer_above_site(1501.0))
+        assert just_under["above_weapon_ceiling"] is False
+        assert just_over["above_weapon_ceiling"] is True
+        assert just_over["value"] < just_under["value"]
+
+    def test_an_observer_below_a_ridge_top_site_is_never_above_its_ceiling(self):
+        site_hae = _hae(SITE_MSL, SITE_LAT, SITE_LON)
+        cap = assess_capability(_aaa_site(site_hae), _observer_above_site(-200.0))
+        assert cap["above_weapon_ceiling"] is False
+        assert cap["in_envelope"] is True
+
+    def test_the_same_geometry_at_sea_level_gives_the_same_answer(self):
+        """Only the height difference matters, not the theater's elevation."""
+        high = assess_capability(_aaa_site(_hae(SITE_MSL, SITE_LAT, SITE_LON)),
+                                 _observer_above_site(100.0))
+        low_site = _hae(0.0, SITE_LAT, SITE_LON)
+        low_obs = {"lat": OBS_LAT, "lon": OBS_LON,
+                   "alt_m": _hae(100.0, OBS_LAT, OBS_LON)}
+        low = assess_capability(_aaa_site(low_site), low_obs)
+        for k in ("in_envelope", "above_weapon_ceiling", "engagement_geometry",
+                  "value"):
+            assert high[k] == low[k], k
+
+    def test_a_track_ingested_from_an_hae_detection_is_assessed_relative(self):
+        """End to end through the sensor path: the track's alt_m is the
+        detection's geo_point altitude (HAE), the observer's is alt_hae_m."""
+        site_hae = _hae(SITE_MSL, SITE_LAT, SITE_LON)
+        obs = {**_observer_above_site(100.0), "vehicle": "Drone1"}
+        tm = TrackManager()
+        track = tm.ingest(
+            [{"name": "aaa_towed_1",
+              "geo_point": {"latitude": SITE_LAT, "longitude": SITE_LON,
+                            "altitude": site_hae}}],
+            now=1000.0, sensor={"sensor": "scene", "fov_deg": 20.0,
+                                "image_px": 640, "light": "day",
+                                "weather": "clear"},
+            observer=obs, frame_id="FRAME-000")[0]
+        assert track.ob_class == "aaa_towed"
+        assert track.alt_m == pytest.approx(site_hae)
+        out = assess_track(track, obs, now=1000.0)
+        assert out["in_envelope"] is True
+        assert out["assessment"]["capability"]["above_weapon_ceiling"] is False

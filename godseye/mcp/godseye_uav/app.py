@@ -22,7 +22,11 @@ fetched, writes a JSON verdict (``--selftest-out``, else stdout) and exits 0
 
 Defaults for the desktop app: port 8780, a random token per launch (or
 ``$GODSEYE_TOKEN``), and the store under the user's application-support
-directory (absolute; a Finder launch runs with cwd ``/``). For external
+directory (absolute; a Finder launch runs with cwd ``/``). The theater is
+``--theater``, else the one persisted in the store, else the default (WG
+§4.1.4). Map data (``--geodata``: geocoding and mapped sites for new
+theaters) is on; the safety loop's hydration (``--real-data``) stays off
+unless asked for. For external
 harnesses, the MCP URL and token are written to ``<store>/../mcp.json``
 (mode 0600). A frozen app launched from Finder has nowhere to print, so its
 output goes to ``<store>/../logs/eye-in-the-sky.log`` (mode 0600).
@@ -56,6 +60,10 @@ DEFAULT_PORT = 8780
 #: Mirrors chat.EFFORT_LEVELS (not imported: the parser must work even when the
 #: analyst module cannot load; the host then serves an honest 503 for it).
 ANALYST_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+#: ``--real-data`` -> ``HostConfig.real_data`` (WG §4.1.10). Without the flag
+#: it is None: ``$GODSEYE_REAL_DATA`` decides, unset = off. An explicit
+#: ``off`` is False, so the environment cannot turn it back on.
+REAL_DATA_MODES = {"off": False, "direct": "direct", "gev": True}
 READY_TIMEOUT_S = 60.0
 #: --selftest: the whole run (boot, page, checks, shutdown) fits in this.
 SELFTEST_TIMEOUT_S = 60.0
@@ -228,7 +236,7 @@ def default_mode(env: Mapping[str, str], *, has_webview: bool,
 
 
 def build_parser() -> argparse.ArgumentParser:
-    from . import theaters
+    from . import safety, theaters
 
     ap = argparse.ArgumentParser(
         prog="godseye-app",
@@ -242,7 +250,18 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--headless", dest="mode", action="store_const", const="headless",
                       help="serve only; open nothing")
     ap.add_argument("--theater", default=None, choices=theaters.ids(),
-                    help=f"AO preset (default: {theaters.DEFAULT_THEATER_ID})")
+                    help="AO preset (default: the theater persisted in the store, "
+                         f"else {theaters.DEFAULT_THEATER_ID})")
+    ap.add_argument("--geodata", default="on", choices=("on", "off"),
+                    help="on-demand map data over the network: geocoding, mapped sites "
+                         "and ground samples for new theaters (default on)")
+    ap.add_argument("--real-data", default=None, choices=tuple(REAL_DATA_MODES),
+                    help="real-world data for the safety loop: off, direct (Re:Earth and "
+                         "Open-Meteo) or gev (GEV's providers at $GODSEYE_GEV_ORIGIN) "
+                         "(default: $GODSEYE_REAL_DATA, else off)")
+    ap.add_argument("--airframe", default=None, choices=sorted(safety.AIRFRAMES),
+                    help="airframe profile (default: the restored theater's, else "
+                         f"$GODSEYE_AIRFRAME, else {safety.DEFAULT_AIRFRAME_ID})")
     ap.add_argument("--port", type=int, default=None,
                     help=f"app port (default {DEFAULT_PORT}; UI, bridge and MCP share it)")
     ap.add_argument("--mcp-port", type=int, default=None,
@@ -730,7 +749,13 @@ def _say(msg: str) -> None:
 
 def _describe(host, *, token_source: str, harness_file: Path | None) -> None:
     t = host.theater
-    _say(f"theater  : {t.id} ({t.place}), {t.label}")
+    boot = getattr(host, "boot", None)
+    restored = (f"; restored from the store (epoch {boot.epoch})"
+                if getattr(boot, "source", None) == "store" else "")
+    _say(f"theater  : {t.id} ({t.place}), {t.label}{restored}")
+    if getattr(boot, "error", None):
+        _say(f"WARNING  : the persisted theater was not restored ({boot.error}); "
+             f"booted {t.id}")
     _say(f"app      : {host.url}")
     mcp = host.mcp_url
     if host.mcp_port:
@@ -746,6 +771,12 @@ def _describe(host, *, token_source: str, harness_file: Path | None) -> None:
     _say(f"store    : {host.store_dir}")
     ui = "built" if host.ui_built else f"NOT BUILT (looked in {host.ui_dir})"
     _say(f"ui       : {ui}")
+    srv = getattr(host, "server", None)
+    geodata = getattr(srv, "geodata_enabled",
+                      getattr(getattr(host, "config", None), "geodata", False))
+    real = "on" if getattr(srv, "real", None) is not None else "off"
+    _say(f"map data : {'on' if geodata else 'off'} (geocoding and mapped sites); "
+         f"real-data hydration {real}")
     chat = host.chat_summary()
     # The provider is named by its catalog label; its key is never printed.
     provider = chat.get("provider") if isinstance(chat.get("provider"), dict) else {}
@@ -767,7 +798,9 @@ def _config_from_args(args, token: str, *, llm_env: Mapping[str, str] | None = N
         host=args.host, token=token, store_dir=resolve_store(args.store),
         ui_dir=Path(args.ui_dir).expanduser().resolve() if args.ui_dir else default_ui_dir(),
         chat=not args.no_chat, model=args.model, effort=args.effort,
-        llm_env=dict(llm_env or {}))
+        geodata=args.geodata == "on",
+        real_data=None if args.real_data is None else REAL_DATA_MODES[args.real_data],
+        airframe=args.airframe, llm_env=dict(llm_env or {}))
 
 
 def _build(cfg, *, port_explicit: bool, mode: str):

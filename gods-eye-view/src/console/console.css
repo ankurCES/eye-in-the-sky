@@ -277,6 +277,17 @@
   pointer-events: auto;
 }
 
+/* Map overview (WG §4.2.7): the map takes input as in tracking; the dock,
+   its inspector sheet, banners and toasts stay live. */
+.ic-root[data-mode='map'] {
+  --ic-stage-left: 0px;
+  pointer-events: none;
+}
+
+.ic-root[data-mode='map'] > :where(:not(.ic-main, .ic-tether)) {
+  pointer-events: auto;
+}
+
 /* 5. Components (alphabetical) ---------------------------------------------- */
 
 .ic-backfloat {
@@ -428,6 +439,8 @@
   gap: 8px;
   padding: 12px var(--ic-inset) 12px;
   border-bottom: 1px solid var(--ic-hairline);
+  /* Map ⇄ tracking swaps the docks with a 150 ms crossfade (WG §4.2.7). */
+  animation: ic-dock-in 150ms var(--ic-ease-out);
 }
 
 .ic-dock__actions {
@@ -641,6 +654,116 @@
   left: 0;
   right: var(--ic-analyst-w);
   padding: 8px var(--ic-inset) 0;
+}
+
+/* The map overview dock (mapDock.js); it shares .ic-dock's box and the
+   tracking dock's Back to console. An open Key never pushes the analyst
+   out of the column. */
+.ic-mapdock {
+  max-height: 60%;
+  overflow-y: auto;
+}
+
+.ic-mapdock__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ic-mapdock__attribution,
+.ic-mapdock__caveat,
+.ic-mapdock__note {
+  color: var(--ic-pencil);
+  font: var(--ic-type-small);
+}
+
+.ic-mapdock__check {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--ic-film);
+}
+
+.ic-mapdock__dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin: 3px;
+  border-radius: 50%;
+  background: var(--ic-stale);
+}
+
+.ic-mapdock__glyph {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+}
+
+.ic-mapdock__key {
+  font: var(--ic-type-small);
+}
+
+.ic-mapdock__keylist {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 4px 12px;
+  margin: 8px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ic-mapdock__keyrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ic-mapdock__keysum {
+  min-height: var(--ic-target);
+  color: var(--ic-film);
+  font: var(--ic-type-body-strong);
+  cursor: pointer;
+}
+
+.ic-mapdock__line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 12px;
+  font: var(--ic-type-body-strong);
+}
+
+.ic-mapdock__label {
+  min-width: 0;
+  color: var(--ic-film);
+  overflow-wrap: anywhere;
+}
+
+.ic-mapdock__size,
+.ic-mapdock__word {
+  color: var(--ic-pencil);
+}
+
+.ic-mapdock__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--ic-target);
+  font: var(--ic-type-small);
+  cursor: pointer;
+}
+
+.ic-mapdock__warn {
+  color: var(--ic-warn);
+  font: var(--ic-type-small);
+}
+
+/* A pick's inspector: its host moves here, and the inspector (a sheet at
+   compact) covers the dock column from the top. */
+.ic-mapsheet {
+  --ic-inspector-top: 0px;
+  display: contents;
 }
 
 .ic-narrowbar {
@@ -1061,6 +1184,12 @@
   );
 }
 
+@keyframes ic-dock-in {
+  from {
+    opacity: 0;
+  }
+}
+
 .ic-main[data-fade='out'] {
   opacity: 0;
   visibility: hidden;
@@ -1155,7 +1284,8 @@
   border-left: 0;
 }
 
-/* Narrow tracking: the map is full screen; the dock is a bottom sheet. */
+/* Narrow tracking and map: the map is full screen; the dock is a bottom sheet. */
+.ic-root[data-mode='map']:where([data-layout='narrow']) :where(.ic-analyst),
 .ic-root[data-mode='tracking']:where([data-layout='narrow'])
   :where(.ic-analyst) {
   position: absolute;
@@ -1176,8 +1306,9 @@
   padding-block: 4px;
 }
 
-/* Narrow tracking: the critical banner starts under the floating Back to
-   console (12 px + 44 px + 8 px), never beneath it. */
+/* Narrow tracking and map: the critical banner starts under the floating
+   Back to console (12 px + 44 px + 8 px), never beneath it. */
+.ic-root[data-mode='map']:where([data-layout='narrow']) :where(.ic-mapbanner),
 .ic-root[data-mode='tracking']:where([data-layout='narrow'])
   :where(.ic-mapbanner) {
   top: 64px;

@@ -123,6 +123,25 @@ DEFAULT_GEV_ORIGIN = "http://localhost:5199"
 #: Environment override for the origin above.
 GEV_ORIGIN_ENV = "GODSEYE_GEV_ORIGIN"
 
+#: DIRECT mode (WG v2 §4.1.5, D6): terrain and weather straight from the public
+#: upstreams through `geo_http` (identifying UA, per-upstream gate, egress
+#: switch) instead of the GEV proxies. Re:Earth rows carry `ellipsoid`, so the
+#: T1 rule above is unchanged; Open-Meteo's forecast is normalised by the pure
+#: `_openmeteo_to_effects` into the proxy's shape, so `observe()` is unchanged.
+REEARTH_HEIGHTS_URL = "https://terrain.reearth.land/heights.json"
+REEARTH_BATCH_POINTS = 64           # the chunk GEV's proxy sends upstream
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ELEVATION_URL = "https://api.open-meteo.com/v1/elevation"
+#: The `current=` fields GEV's weather proxy asks Open-Meteo for, verbatim.
+OPEN_METEO_CURRENT = ("temperature_2m,apparent_temperature,precipitation,weather_code,"
+                      "cloud_cover,wind_speed_10m,wind_direction_10m,visibility")
+#: Why the two proxy-only feeds are empty in direct mode (always visible).
+DIRECT_INSTALLATIONS_REASON = (
+    "direct mode: mapped installations are not hydrated into an order of battle; "
+    "mapped sites are context from geo_sites (sites.py)")
+DIRECT_TRAFFIC_REASON = (
+    "direct mode: live air traffic needs the God's Eye View proxy (--real-data gev)")
+
 #: Hard per-request cap enforced by gods-eye-view/server/providers/terrain.js
 #: (`MAX_POINTS = 2000`); exceeding it is answered with HTTP 500, not a clamp.
 TERRAIN_MAX_POINTS = 2000
@@ -522,13 +541,20 @@ class TerrainProvider:
                  fallback_ground_msl_m: float | None = None,
                  batch_points: int = TERRAIN_BATCH_POINTS,
                  allow_approx_geoid: bool = False,
-                 now: Callable[[], float] = time.time) -> None:
-        self.origin = (origin or DEFAULT_GEV_ORIGIN).rstrip("/")
+                 now: Callable[[], float] = time.time, direct: bool = False) -> None:
+        self.direct = bool(direct)
+        self.origin = (REEARTH_HEIGHTS_URL if self.direct
+                       else (origin or DEFAULT_GEV_ORIGIN).rstrip("/"))
+        #: `fetch` as given: direct mode hands it to geo_http (None = real client).
+        self._direct_fetch = fetch
         self._fetch = fetch or urllib_fetch
+        self._source = "reearth:heights.json" if self.direct else "gev:/api/terrain/heights"
         self.timeout_s = float(timeout_s)
         self.ttl_s = float(ttl_s)
         self.fallback_ground_msl_m = fallback_ground_msl_m
         self.batch_points = max(1, min(int(batch_points), TERRAIN_MAX_POINTS))
+        if self.direct:
+            self.batch_points = min(self.batch_points, REEARTH_BATCH_POINTS)
         self.allow_approx_geoid = bool(allow_approx_geoid)
         self._now = now
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -588,6 +614,8 @@ class TerrainProvider:
             f"{round(lon, TERRAIN_POINT_DECIMALS):.{TERRAIN_POINT_DECIMALS}f},"
             f"{round(lat, TERRAIN_POINT_DECIMALS):.{TERRAIN_POINT_DECIMALS}f}"
             for lat, lon in points)
+        if self.direct:
+            return f"{REEARTH_HEIGHTS_URL}?points={urllib.parse.quote(param)}"
         return f"{self.origin}/api/terrain/heights?points={urllib.parse.quote(param)}"
 
     def _fetch_batch(self, points: Sequence[tuple[float, float]]) -> int:
@@ -596,13 +624,22 @@ class TerrainProvider:
             raise RealDataUnavailable(
                 "terrain", f"{len(points)} points exceeds the proxy cap of {TERRAIN_MAX_POINTS}")
         self.requests += 1
-        resp = self._fetch(self._url(points), self.timeout_s)
-        if resp.status != 200:
-            raise RealDataUnavailable("terrain", f"HTTP {resp.status} from {self.origin}")
-        try:
-            body = resp.json()
-        except Exception as exc:  # noqa: BLE001 — becomes the visible reason
-            raise RealDataUnavailable("terrain", f"unparsable response: {exc}") from exc
+        if self.direct:
+            from . import geo_http
+
+            try:
+                body = geo_http.fetch_json("reearth", self._url(points),
+                                           timeout_s=self.timeout_s, fetch=self._direct_fetch)
+            except RealDataUnavailable as exc:
+                raise RealDataUnavailable("terrain", f"Re:Earth: {exc.reason}") from exc
+        else:
+            resp = self._fetch(self._url(points), self.timeout_s)
+            if resp.status != 200:
+                raise RealDataUnavailable("terrain", f"HTTP {resp.status} from {self.origin}")
+            try:
+                body = resp.json()
+            except Exception as exc:  # noqa: BLE001 — becomes the visible reason
+                raise RealDataUnavailable("terrain", f"unparsable response: {exc}") from exc
         results = body.get("results") if isinstance(body, dict) else None
         if not isinstance(results, list):
             raise RealDataUnavailable("terrain", "malformed response (no results array)")
@@ -674,18 +711,18 @@ class TerrainProvider:
                 lat=lat, lon=lon, hae_m=hae, msl_m=None,
                 upstream_elevation_m=row.get("elevation"),
                 provenance=_synthetic(
-                    "terrain", "gev:/api/terrain/heights",
+                    "terrain", self._source,
                     f"ellipsoidal height is real but MSL could not be derived: {exc}",
                     attribution=ATTRIBUTION["terrain"], retrieved_at_ms=_ms(at),
                     age_s=max(0.0, now - at)))
         if stale_reason is not None:
             provenance = _synthetic(
-                "terrain", "gev:/api/terrain/heights (STALE)", stale_reason,
+                "terrain", f"{self._source} (STALE)", stale_reason,
                 attribution=ATTRIBUTION["terrain"], retrieved_at_ms=_ms(at),
                 age_s=max(0.0, now - at))
         else:
             provenance = Provenance(
-                feed="terrain", real=True, source="gev:/api/terrain/heights",
+                feed="terrain", real=True, source=self._source,
                 attribution=ATTRIBUTION["terrain"], retrieved_at_ms=_ms(at),
                 age_s=max(0.0, now - at))
         return TerrainSample(
@@ -895,7 +932,7 @@ class TerrainProvider:
                      f"Earth curvature R_eff={r_eff:.0f} m (k={refraction_k:g}); "
                      f"vegetation, buildings and other above-ground structure NOT modelled")
             provenance = Provenance(
-                feed="terrain", real=True, source="gev:/api/terrain/heights",
+                feed="terrain", real=True, source=self._source,
                 attribution=ATTRIBUTION["terrain"], retrieved_at_ms=_ms(self._now()))
         else:
             plane = self.effective_fallback_msl_m()
@@ -933,7 +970,7 @@ class TerrainProvider:
         real = all(s.real for s in samples) and len(usable) == len(samples)
         if real:
             provenance = Provenance(
-                feed="terrain", real=True, source="gev:/api/terrain/heights",
+                feed="terrain", real=True, source=self._source,
                 attribution=ATTRIBUTION["terrain"], retrieved_at_ms=_ms(self._now()))
         else:
             provenance = _synthetic(
@@ -1202,8 +1239,11 @@ class InstallationsProvider:
     def __init__(self, *, origin: str | None = None, fetch: HttpFetch | None = None,
                  timeout_s: float = INSTALLATIONS_TIMEOUT_S,
                  ttl_s: float = INSTALLATIONS_TTL_S,
-                 now: Callable[[], float] = time.time) -> None:
+                 now: Callable[[], float] = time.time,
+                 disabled_reason: str | None = None) -> None:
         self.origin = (origin or DEFAULT_GEV_ORIGIN).rstrip("/")
+        #: Set in direct mode: the feed never fetches and always says why.
+        self.disabled_reason = disabled_reason
         self._fetch = fetch or urllib_fetch
         self.timeout_s = float(timeout_s)
         self.ttl_s = float(ttl_s)
@@ -1232,6 +1272,11 @@ class InstallationsProvider:
         if not (south < north and west < east):
             raise ValueError(f"bbox must satisfy south<north and west<east, got "
                              f"{south},{west},{north},{east}")
+        if self.disabled_reason:
+            return OrderOfBattle(
+                sites=(), saturated=False,
+                provenance=_synthetic("installations", "none", self.disabled_reason,
+                                      caveat=MAPPED_DATA_CAVEAT))
         key = self._key(south, west, north, east)
         now = self._now()
         with self._lock:
@@ -1453,8 +1498,11 @@ class TrafficProvider:
     def __init__(self, *, origin: str | None = None, fetch: HttpFetch | None = None,
                  timeout_s: float = TRAFFIC_TIMEOUT_S, ttl_s: float = TRAFFIC_TTL_S,
                  allow_approx_geoid: bool = False,
-                 now: Callable[[], float] = time.time) -> None:
+                 now: Callable[[], float] = time.time,
+                 disabled_reason: str | None = None) -> None:
         self.origin = (origin or DEFAULT_GEV_ORIGIN).rstrip("/")
+        #: Set in direct mode: the feed never fetches and always says why.
+        self.disabled_reason = disabled_reason
         self._fetch = fetch or urllib_fetch
         self.timeout_s = float(timeout_s)
         self.ttl_s = float(ttl_s)
@@ -1489,6 +1537,13 @@ class TrafficProvider:
                  allow_network: bool = True, include_ground: bool = False,
                  ) -> AirspaceTraffic:
         """Real aircraft within `radius_m` of `(lat, lon)`, nearest first."""
+        if self.disabled_reason:
+            return AirspaceTraffic(
+                contacts=(), center=(lat, lon), radius_m=float(radius_m),
+                provenance=_synthetic(
+                    "traffic", "none",
+                    f"{self.disabled_reason}; the AO shows NO real air traffic - "
+                    "this is an empty feed, not a clear sky"))
         key = self._key(lat, lon)
         now = self._now()
         with self._lock:
@@ -1746,13 +1801,76 @@ def _synthetic_weather(lat: float, lon: float, reason: str) -> WeatherObservatio
             "weather", "synthetic:calm-clear", reason))
 
 
+def _openmeteo_to_effects(payload: Any) -> dict[str, Any] | None:
+    """Open-Meteo `/v1/forecast?current=…` → the GEV `/api/weather-effects`
+    body, field for field (`src/data/regionalModel.js normalizeRegionalWeather`).
+
+    Pure. None when there is no usable `current` block (GEV answers 503 then).
+    Open-Meteo's zone-naive `current.time` is UTC and is pinned to it here;
+    `wind_speed_10m` is km/h (Open-Meteo's default unit), hence `windKph`.
+    """
+    current = payload.get("current") if isinstance(payload, Mapping) else None
+    if not isinstance(current, Mapping) or _finite(current.get("temperature_2m")) is None:
+        return None
+    observed = current.get("time")
+    observed_at = None
+    if isinstance(observed, str) and observed:
+        from datetime import UTC, datetime
+
+        text = observed if observed.endswith("Z") or "+" in observed[10:] else observed + "Z"
+        try:
+            observed_at = datetime.fromisoformat(text).astimezone(UTC).strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z")
+        except ValueError:
+            observed_at = None
+    return {"status": "ready", "coordinates": {"latitude": payload.get("latitude"),
+                                               "longitude": payload.get("longitude")},
+            "weather": {"observedAt": observed_at,
+                        "temperatureC": _finite(current.get("temperature_2m")),
+                        "apparentTemperatureC": _finite(current.get("apparent_temperature")),
+                        "precipitationMm": _finite(current.get("precipitation")),
+                        "cloudCoverPct": _finite(current.get("cloud_cover")),
+                        "windKph": _finite(current.get("wind_speed_10m")),
+                        "windDirectionDeg": _finite(current.get("wind_direction_10m")),
+                        "visibilityM": _finite(current.get("visibility")),
+                        "weatherCode": _finite(current.get("weather_code"))}}
+
+
+def open_meteo_elevation(lat: float, lon: float, *, fetch: HttpFetch | None = None,
+                         timeout_s: float = WEATHER_TIMEOUT_S) -> float:
+    """Copernicus DEM ground height from Open-Meteo `/v1/elevation`, metres.
+
+    The fallback ground source for `theater_plan` (§4.1.2 step 4). The value is
+    orthometric on EGM2008 and is USED AS MSL without a geoid correction — the
+    caller must carry that caveat. Blocking; raises RealDataUnavailable.
+    """
+    from . import geo_http
+
+    query = urllib.parse.urlencode({"latitude": f"{float(lat):.5f}",
+                                    "longitude": f"{float(lon):.5f}"})
+    try:
+        body = geo_http.fetch_json("open-meteo", f"{OPEN_METEO_ELEVATION_URL}?{query}",
+                                   timeout_s=timeout_s, fetch=fetch)
+    except RealDataUnavailable as exc:
+        raise RealDataUnavailable("elevation", f"Open-Meteo: {exc.reason}") from exc
+    values = body.get("elevation") if isinstance(body, Mapping) else None
+    value = _finite(values[0]) if isinstance(values, list) and values else None
+    if value is None:
+        raise RealDataUnavailable("elevation", "Open-Meteo returned no elevation")
+    return value
+
+
 class WeatherProvider:
     """Real current weather at a point, via GEV's Open-Meteo proxy (CC BY 4.0)."""
 
     def __init__(self, *, origin: str | None = None, fetch: HttpFetch | None = None,
                  timeout_s: float = WEATHER_TIMEOUT_S, ttl_s: float = WEATHER_TTL_S,
-                 now: Callable[[], float] = time.time) -> None:
-        self.origin = (origin or DEFAULT_GEV_ORIGIN).rstrip("/")
+                 now: Callable[[], float] = time.time, direct: bool = False) -> None:
+        self.direct = bool(direct)
+        self.origin = (OPEN_METEO_FORECAST_URL if self.direct
+                       else (origin or DEFAULT_GEV_ORIGIN).rstrip("/"))
+        self._direct_fetch = fetch
+        self._source = "open-meteo" if self.direct else "gev:/api/weather-effects"
         self._fetch = fetch or urllib_fetch
         self.timeout_s = float(timeout_s)
         self.ttl_s = float(ttl_s)
@@ -1767,6 +1885,11 @@ class WeatherProvider:
         return f"{round(lat, 1):.1f},{round(lon, 1):.1f}"
 
     def _url(self, lat: float, lon: float) -> str:
+        if self.direct:
+            query = urllib.parse.urlencode({
+                "latitude": f"{float(lat):.5f}", "longitude": f"{float(lon):.5f}",
+                "current": OPEN_METEO_CURRENT, "timezone": "UTC"})
+            return f"{OPEN_METEO_FORECAST_URL}?{query}"
         query = urllib.parse.urlencode({"latitude": lat, "longitude": lon})
         return f"{self.origin}/api/weather-effects?{query}"
 
@@ -1833,20 +1956,20 @@ class WeatherProvider:
                         "0.0 by default, not measured")
         if stale:
             provenance = _synthetic(
-                "weather", "gev:/api/weather-effects",
+                "weather", self._source,
                 f"refresh failed ({reason}); serving the last-good observation",
                 attribution=ATTRIBUTION["weather"], retrieved_at_ms=_ms(at),
                 age_s=max(0.0, now - at))
         elif gaps:
             self._warn("weather: incomplete observation (%s)", "; ".join(gaps))
             provenance = _synthetic(
-                "weather", "gev:/api/weather-effects (INCOMPLETE)",
+                "weather", f"{self._source} (INCOMPLETE)",
                 "observation is real but incomplete: " + "; ".join(gaps),
                 attribution=ATTRIBUTION["weather"], retrieved_at_ms=_ms(at),
                 age_s=max(0.0, now - at))
         else:
             provenance = Provenance(
-                feed="weather", real=True, source="gev:/api/weather-effects",
+                feed="weather", real=True, source=self._source,
                 attribution=ATTRIBUTION["weather"], retrieved_at_ms=_ms(at),
                 age_s=max(0.0, now - at))
         return WeatherObservation(
@@ -1861,6 +1984,19 @@ class WeatherProvider:
             observed_at_ms=observed_ms, provenance=provenance)
 
     def _request(self, lat: float, lon: float) -> Mapping[str, Any]:
+        if self.direct:
+            from . import geo_http
+
+            try:
+                raw = geo_http.fetch_json("open-meteo", self._url(lat, lon),
+                                          timeout_s=self.timeout_s, fetch=self._direct_fetch)
+            except RealDataUnavailable as exc:
+                raise RealDataUnavailable("weather", f"Open-Meteo: {exc.reason}") from exc
+            effects = _openmeteo_to_effects(raw)
+            if effects is None:
+                raise RealDataUnavailable(
+                    "weather", "malformed Open-Meteo response (no current temperature)")
+            return effects
         resp = self._fetch(self._url(lat, lon), self.timeout_s)
         if resp.status != 200:
             raise RealDataUnavailable("weather", f"HTTP {resp.status} from {self.origin}")
@@ -1980,20 +2116,31 @@ class RealWorldData:
     def __init__(self, *, origin: str | None = None, fetch: HttpFetch | None = None,
                  now: Callable[[], float] = time.time,
                  allow_approx_geoid: bool = False,
-                 fallback_ground_msl_m: float | None = None) -> None:
+                 fallback_ground_msl_m: float | None = None,
+                 direct: bool = False) -> None:
         import os
 
-        self.origin = (origin or os.environ.get(GEV_ORIGIN_ENV)
-                       or DEFAULT_GEV_ORIGIN).rstrip("/")
+        #: Direct mode (§4.1.5): terrain from Re:Earth and weather from
+        #: Open-Meteo through geo_http; installations and traffic are proxy-only
+        #: feeds and stay empty with a reason rather than silently absent.
+        self.direct = bool(direct)
+        self.origin = ("direct" if self.direct else
+                       (origin or os.environ.get(GEV_ORIGIN_ENV)
+                        or DEFAULT_GEV_ORIGIN).rstrip("/"))
         self._now = now
         self.terrain = TerrainProvider(
-            origin=self.origin, fetch=fetch, now=now,
+            origin=None if self.direct else self.origin, fetch=fetch, now=now,
             allow_approx_geoid=allow_approx_geoid,
-            fallback_ground_msl_m=fallback_ground_msl_m)
-        self.installations = InstallationsProvider(origin=self.origin, fetch=fetch, now=now)
-        self.traffic = TrafficProvider(origin=self.origin, fetch=fetch, now=now,
-                                       allow_approx_geoid=allow_approx_geoid)
-        self.weather = WeatherProvider(origin=self.origin, fetch=fetch, now=now)
+            fallback_ground_msl_m=fallback_ground_msl_m, direct=self.direct)
+        self.installations = InstallationsProvider(
+            origin=None if self.direct else self.origin, fetch=fetch, now=now,
+            disabled_reason=DIRECT_INSTALLATIONS_REASON if self.direct else None)
+        self.traffic = TrafficProvider(
+            origin=None if self.direct else self.origin, fetch=fetch, now=now,
+            allow_approx_geoid=allow_approx_geoid,
+            disabled_reason=DIRECT_TRAFFIC_REASON if self.direct else None)
+        self.weather = WeatherProvider(origin=None if self.direct else self.origin,
+                                       fetch=fetch, now=now, direct=self.direct)
 
     def hydrate_theater(self, *, theater_id: str, home_lat: float, home_lon: float,
                         bbox: tuple[float, float, float, float],
@@ -2074,7 +2221,9 @@ class BackgroundRefresher:
         while not self._stop.is_set():
             try:
                 result = self.client.hydrate_theater(**self.hydrate_kwargs)
-                if self.on_result is not None:
+                # A hydration that finishes after stop() belongs to a theater
+                # that may no longer be active: never publish it.
+                if self.on_result is not None and not self._stop.is_set():
                     self.on_result(result)
             except Exception as exc:  # noqa: BLE001 — logged, loop survives
                 _LOG.warning("godSeye real-data refresh failed: %s", exc)
@@ -2087,15 +2236,25 @@ class BackgroundRefresher:
             self._thread.start()
         return self
 
-    def stop(self, timeout_s: float = 2.0) -> None:
+    def stop(self, wait: bool = True, *, timeout_s: float = 2.0) -> None:
+        """Stop refreshing. `wait=False` (a theater switch, §4.1.9 #11) only
+        sets the flag and reaps the thread on a daemon helper, so the caller
+        never waits on an in-flight hydration; its result is dropped by the
+        caller's epoch check, not by this join."""
         self._stop.set()
         thread, self._thread = self._thread, None
-        if thread is not None:
+        if thread is None:
+            return
+        if wait:
             thread.join(timeout=timeout_s)
+            return
+        threading.Thread(target=thread.join, kwargs={"timeout": timeout_s},
+                         name="godseye-realdata-reap", daemon=True).start()
 
 
 def default_client(**kwargs: Any) -> RealWorldData:
-    """A `RealWorldData` on the configured GEV origin (`GODSEYE_GEV_ORIGIN`)."""
+    """A `RealWorldData` on the configured GEV origin (`GODSEYE_GEV_ORIGIN`),
+    or, with `direct=True`, straight on Re:Earth and Open-Meteo."""
     return RealWorldData(**kwargs)
 
 

@@ -1,0 +1,17 @@
+{
+  "version": 0.6, "generator": "Overpass API 0.7.62.1 084b4234",
+  "elements": [
+    {"type": "way", "id": 22895320,
+     "bounds": {"minlat": 12.9690, "minlon": 77.5900, "maxlat": 12.9790, "maxlon": 77.5970},
+     "tags": {"leisure": "park", "name": "Cubbon Park"}},
+    {"type": "way", "id": 38872968,
+     "bounds": {"minlat": 12.9779, "minlon": 77.5868, "maxlat": 12.9790, "maxlon": 77.5880},
+     "tags": {"leisure": "park", "name": "MS Building Park"}},
+    {"type": "relation", "id": 555,
+     "bounds": {"minlat": 12.9900, "minlon": 77.6100, "maxlat": 12.9950, "maxlon": 77.6150},
+     "tags": {"leisure": "recreation_ground", "name": "Far ground"}},
+    {"type": "way", "id": 556,
+     "bounds": {"minlat": 12.9760, "minlon": 77.5930, "maxlat": 12.9765, "maxlon": 77.5935},
+     "tags": {"landuse": "grass"}}
+  ]
+}

@@ -152,6 +152,13 @@ class Airframe:
                             the vertical rates a DRY RUN assumes, so the
                             pre-flight gate prices the same let-down the
                             in-flight integrator will measure (T5).
+      `label`               the short human name the console shows
+                            ("Quad, small electric"); empty means the id.
+      `cruise_speed_mps`    the planning cruise speed :func:`reach_radius_m`
+                            prices the out-and-back reach at (D5/C7). It is a
+                            PLANNING number that sizes the AO; it is not the
+                            speed the fake simulator flies (that is capped at
+                            the multirotor's 20 m/s whatever the airframe).
     """
 
     id: str
@@ -164,6 +171,10 @@ class Airframe:
     wind_penalty_max: float = 0.5
     climb_rate_mps: float = 3.0
     descend_rate_mps: float = 2.0
+    # Display only: two profiles with the same numbers ARE the same energy
+    # model whatever they are called, so the label is outside `==` and hash.
+    label: str = field(default="", compare=False)
+    cruise_speed_mps: float = 10.0
 
     def __post_init__(self) -> None:
         # `frozen=True` freezes the FIELDS, not the dict one of them holds, and
@@ -246,6 +257,19 @@ class Airframe:
             if not (math.isfinite(rate) and rate > 0.0):
                 raise ValueError(f"{self.id}: vertical rates must be finite "
                                  f"and > 0, got {name}={rate!r}")
+        # The planning cruise speed sizes the AO through `reach_radius_m`
+        # (D5/C7). Zero, negative, infinite or NaN would size it to nothing or
+        # to the whole planet, so it gets the same refusal as the rates above.
+        try:
+            cruise = float(self.cruise_speed_mps)
+        except (TypeError, ValueError):
+            raise ValueError(f"{self.id}: cruise_speed_mps must be a number, "
+                             f"got {self.cruise_speed_mps!r}") from None
+        if not (math.isfinite(cruise) and cruise > 0.0):
+            raise ValueError(f"{self.id}: cruise_speed_mps must be finite and "
+                             f"> 0, got {self.cruise_speed_mps!r}")
+        object.__setattr__(self, "cruise_speed_mps", cruise)
+        object.__setattr__(self, "label", str(self.label or self.id))
         # The M15 headwind fields are part of the same fuel clock and were the
         # half this validator did not cover. Every one of them has a value that
         # silently DISABLES or INVERTS the penalty rather than failing:
@@ -308,6 +332,7 @@ class Airframe:
                          for p, m in self.phase_multipliers.items())),
             self.wind_penalty_per_mps, self.wind_ref_mps,
             self.wind_penalty_max, self.climb_rate_mps, self.descend_rate_mps,
+            self.cruise_speed_mps,
         ))
 
     @property
@@ -341,6 +366,8 @@ class Airframe:
             "wind_penalty_max": self.wind_penalty_max,
             "climb_rate_mps": self.climb_rate_mps,
             "descend_rate_mps": self.descend_rate_mps,
+            "label": self.label,
+            "cruise_speed_mps": self.cruise_speed_mps,
         }
 
 
@@ -378,6 +405,8 @@ QUAD_SUAS_ELECTRIC = Airframe(
     },
     climb_rate_mps=3.0,
     descend_rate_mps=2.0,
+    label="Quad, small electric",
+    cruise_speed_mps=10.0,
 )
 
 #: A Group-3 catapult-launched fixed-wing ISR UAV (ScanEagle-class). Kept so a
@@ -401,6 +430,10 @@ GROUP3_FIXED_WING = Airframe(
     },
     climb_rate_mps=2.5,
     descend_rate_mps=3.0,
+    label="Fixed-wing, group 3",
+    # ScanEagle-class best-range cruise is ~25 m/s; 20 m/s is the planning
+    # figure the AO is sized from (D5/C7), which gives 352.8 km of reach.
+    cruise_speed_mps=20.0,
 )
 
 AIRFRAMES: dict[str, Airframe] = {
@@ -437,6 +470,34 @@ def default_airframe() -> Airframe:
     if override:
         return get_airframe(override.strip())
     return AIRFRAMES[DEFAULT_AIRFRAME_ID]
+
+
+#: Planning margin `reach_radius_m` holds back on top of the BINGO reserve
+#: (wind, the climb and let-down, a loiter at the far end). D5/C7.
+REACH_MARGIN_PCT = 10.0
+
+
+def reach_radius_m(af: Airframe | str | None, *,
+                   reserve_pct: float = RESERVE_PCT,
+                   margin_pct: float = REACH_MARGIN_PCT) -> float:
+    """Out-and-back planning radius of an airframe, metres (D5/C7).
+
+    ``0.5 x (100 - reserve - margin)/100 x endurance_cruise_s x
+    cruise_speed_mps``: the usable tank, flown at the planning cruise speed,
+    split evenly between going out and coming back. The shipped profiles give
+    7350 m (quad) and 352,800 m (group 3). It is a SIZING number for the AO
+    (the theater proposal clamps the half-extent to ``0.4 x reach``); every
+    real sortie is still priced by the pre-flight gate against the live tank.
+    """
+    prof = get_airframe(af)
+    reserve, margin = float(reserve_pct), float(margin_pct)
+    if not (math.isfinite(reserve) and math.isfinite(margin)
+            and reserve >= 0.0 and margin >= 0.0 and reserve + margin < 100.0):
+        raise ValueError(
+            f"reserve_pct and margin_pct must be finite, >= 0 and together "
+            f"< 100; got reserve_pct={reserve_pct!r}, margin_pct={margin_pct!r}")
+    usable = (100.0 - reserve - margin) / 100.0
+    return 0.5 * usable * prof.endurance_cruise_s * prof.cruise_speed_mps
 
 
 # Legacy aliases: the DEFAULT profile's numbers, kept because they were the
@@ -829,6 +890,28 @@ class BingoLatch:
         }
 
 
+def _checked_time_scale(value) -> float:
+    """`FuelModel.time_scale` as a float, or ValueError (D5).
+
+    Zero, negative, infinite and NaN are refused rather than clamped: each one
+    either stops the fuel clock (BINGO unreachable) or poisons it, and a
+    silently wrong fuel clock is the failure this module exists to prevent.
+    The x1-x10 product range is the SIMULATOR's rule (`fake_airsim`), not the
+    integrator's, so any finite positive scale is accepted here.
+    """
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"time_scale must be a number, got {value!r}") from None
+    # A bool is refused too: `float(True)` is 1.0, which would read a flag
+    # as a sim speed.
+    if isinstance(value, bool) or not (math.isfinite(scale) and scale > 0.0):
+        raise ValueError(f"time_scale must be finite and > 0, got {value!r}; "
+                         "zero or NaN stops the fuel clock and makes BINGO "
+                         "unreachable")
+    return scale
+
+
 @dataclass
 class FuelModel:
     """Tick-reconciled fuel integrator (T5). Capacity is normalized to 100%.
@@ -865,6 +948,21 @@ class FuelModel:
     bingo: BingoLatch = field(default_factory=BingoLatch)
     _last_ts: float | None = None
     _last_alt: float | None = None
+    #: Sim seconds per wall second (D5, the fake's x1-x10 sim speed). `tick`
+    #: charges `min(dt, MAX_TICK_DT_S) * time_scale`: the clamp stays a WALL
+    #: clamp (a stalled process), then the slice is priced in sim time, which
+    #: is what the aircraft flew. Deliberately NOT in `to_dict`/`from_dict`:
+    #: sim speed is a session setting, never journal state, so a restart runs
+    #: at x1. BINGO and `preflight_gate` price sim-time plans and are
+    #: unaffected. Last field so positional construction is unchanged.
+    #: Validated on EVERY assignment (see `__setattr__`), because the server
+    #: sets it on live monitors rather than constructing a new model.
+    time_scale: float = 1.0
+
+    def __setattr__(self, name: str, value) -> None:
+        if name == "time_scale":
+            value = _checked_time_scale(value)
+        super().__setattr__(name, value)
 
     def __post_init__(self) -> None:
         self.airframe = get_airframe(self.airframe)
@@ -963,8 +1061,11 @@ class FuelModel:
             return self.fuel_pct
         if dt > MAX_TICK_DT_S:  # suspended process / wall-clock jump / slow loop
             self.clamped_ticks += 1
-            self.unaccounted_s += dt - MAX_TICK_DT_S
+            self.unaccounted_s += dt - MAX_TICK_DT_S  # WALL seconds dropped
             dt = MAX_TICK_DT_S
+        # D5: the (clamped) wall slice is priced in SIM seconds, the time the
+        # aircraft actually flew at this sim speed. `elapsed_s` is sim time.
+        dt *= self.time_scale
         before = self.fuel_pct
         self.fuel_pct = max(0.0, before - self._burn(phase, dt, headwind_mps))
         self.burned_pct += before - self.fuel_pct
@@ -1152,6 +1253,9 @@ class FuelModel:
             # fuel, so the journal has to carry it (T5).
             "clamped_ticks": self.clamped_ticks,
             "unaccounted_s": round(self.unaccounted_s, 2),
+            # Sim seconds per wall second this row was charged at (D5). A
+            # journal read without it would price a x10 burn as a x1 one.
+            "time_scale": self.time_scale,
             **fields,
         }
 

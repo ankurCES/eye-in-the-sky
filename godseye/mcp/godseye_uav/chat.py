@@ -65,6 +65,7 @@ from typing import Any, Literal
 from fastapi import Request
 from pydantic import BaseModel, Field
 
+from . import theater_tools, theaters
 from .analyst_policy import (
     COMMAND,
     DRY_RUN_TOOLS,
@@ -114,7 +115,8 @@ RESUME_LOST_MESSAGE = ("The analyst could not resume this conversation: Claude C
 _AUTH_RX = re.compile(r"(?i)(authenticat|unauthori[sz]ed|invalid api key|not logged in|"
                       r"/login|oauth|\b401\b|credential)")
 # POI ids carry the POI's name, which may contain spaces ("poi:default:North Field").
-_FOCUS_ID_RX = re.compile(r"^(?:veh|msn|trk|unit|ob|rpt|thr|poi|alarm|feed):[^\r\n\[\]|]{1,160}$")
+_FOCUS_ID_RX = re.compile(
+    r"^(?:veh|msn|trk|unit|ob|rpt|thr|poi|sit|alarm|feed):[^\r\n\[\]|]{1,160}$")
 
 _ASSISTANT_ERRORS = {
     "authentication_failed": ("The analyst could not sign in to Claude.", SIGN_IN_HINT, False),
@@ -629,8 +631,11 @@ class _Session:
         self.approved_calls: dict[str, bool] = {}
         #: call ids the operator denied / let expire / interrupted (never ran).
         self.not_run: dict[str, bool] = {}
-        #: (mission kind, vehicle) -> (summary, EFFECTIVE plan args)
-        self.dry_runs: dict[tuple[str, str], tuple[dict, dict]] = {}
+        #: (mission kind, vehicle) -> (summary, EFFECTIVE plan args, theater
+        #: epoch the gate ran at). A lookup at another epoch drops the stale
+        #: entries: a plan checked in the old AO never vouches for a slip in
+        #: the new one (WG v2 §4.1.9 #10).
+        self.dry_runs: dict[tuple[str, str], tuple[dict, dict, int | None]] = {}
         self.interrupt_evt = asyncio.Event()
         self.closed = False
         self.last_active = time.monotonic()
@@ -836,6 +841,41 @@ def _result_summary(tool: str, payload: Any, *, ok: bool, rejected: bool, error:
         bits.append("truncated")
     bits.append(f"{nbytes / 1024:.1f} KB" if nbytes >= 1024 else f"{nbytes} B")
     return " · ".join(bits)[:200]
+
+
+#: ``ui`` directive actions the console understands (WG v2 §3.6).
+UI_ACTIONS = ("focus", "track", "orb", "inspect", "theater", "map")
+#: Approval previews the service attaches (WG v2 §3.6): tool -> event field.
+PREVIEW_FIELDS = {"sim_set_theater": "theater_preview",
+                  "sim_set_time_scale": "time_scale_preview"}
+#: Classes whose slip asks for the acknowledgement box (WG v2 §3.6), used when
+#: ``Decision`` has no ``acknowledge`` of its own.
+ACKNOWLEDGE_CLASSES = frozenset({"safety_override", "engagement"})
+
+
+def _acknowledge_required(decision: Any) -> bool:
+    flag = getattr(decision, "acknowledge", None)
+    if isinstance(flag, bool):
+        return flag
+    return getattr(decision, "klass", None) in ACKNOWLEDGE_CLASSES
+
+
+def _theater_directive(payload: Mapping) -> dict | None:
+    """``ui {action:"theater", id:"thr:…", label?}`` for an ACCEPTED switch
+    result (WG v2 R11): never for ``unchanged``, a ``duplicate`` replay or a
+    refusal. The label is untrusted text: bidi-stripped and capped."""
+    if payload.get("status") != "accepted" or payload.get("rejected"):
+        return None
+    theater = payload.get("theater")
+    tid = theater.get("id") if isinstance(theater, Mapping) else None
+    graph_id = f"thr:{tid}" if isinstance(tid, str) and tid else ""
+    if not _FOCUS_ID_RX.match(graph_id):
+        return None
+    directive: dict = {"action": "theater", "id": graph_id}
+    label = theaters.clean_text(theater.get("label") or "", limit=80)
+    if label:
+        directive["label"] = label
+    return directive
 
 
 #: Arguments that do not change a plan's geometry, fuel or gate verdict.
@@ -1873,6 +1913,10 @@ class ChatService:
             if vehicle:
                 self._emit_ui(s, {"action": "track", "vehicle": vehicle,
                                   "reason": "mission launched"})
+        if ok and tool == "sim_set_theater" and call_id in s.approved_calls:
+            directive = _theater_directive(payload)  # WG v2 R11: no ui_show_theater tool
+            if directive is not None:
+                self._emit_ui(s, directive)
 
     def _on_system(self, s: _Session, turn: _Turn, msg: Any) -> None:
         if getattr(msg, "subtype", None) != "init":
@@ -2005,7 +2049,11 @@ class ChatService:
                 args["vehicle"] if isinstance(args.get("vehicle"), str) else None),
             "dry_runnable": tool in DRY_RUN_TOOLS,
             "grant_scope": [tool] if decision.allow_session else None,
+            "acknowledge_required": _acknowledge_required(decision),  # WG v2 §3.6
         }
+        if tool in PREVIEW_FIELDS:
+            # Always present for these tools: `{}` makes the slip Deny-only.
+            request[PREVIEW_FIELDS[tool]] = self._approval_preview(tool, args)
         dry = self._dry_run_for(s, tool_name, args)
         if dry is not None:
             request["dry_run"] = dry
@@ -2089,17 +2137,24 @@ class ChatService:
             count = _count_items(payload.get("waypoints"))
         if isinstance(count, int):
             summary["waypoints"] = count
-        s.dry_runs[(kind, vehicle)] = (summary, self._effective_plan_for(s, tool, args))
+        # The epoch the gate itself read (A6a), else the running one.
+        epoch = gate.get("theater_epoch")
+        if not isinstance(epoch, int) or isinstance(epoch, bool):
+            epoch = self._theater_epoch()
+        s.dry_runs[(kind, vehicle)] = (summary, self._effective_plan_for(s, tool, args), epoch)
 
     def _dry_run_for(self, s: _Session, tool: str, args: dict) -> dict | None:
         kind = mission_kind(tool, args)
         vehicle = mission_vehicle(tool, args)
         if not kind or not vehicle:
             return None
+        epoch = self._theater_epoch()
+        for key in [k for k, v in s.dry_runs.items() if v[2] != epoch]:
+            del s.dry_runs[key]  # checked in another theater (WG v2 §4.1.9 #10)
         found = s.dry_runs.get((kind, vehicle))
         if not found:
             return None
-        summary, planned = found
+        summary, planned, _ = found
         out = dict(summary)
         out["gate"] = dict(summary.get("gate") or {})
         # Compared on the EFFECTIVE plans (each path's own defaults applied),
@@ -2116,6 +2171,22 @@ class ChatService:
             tool, args, schema_defaults=s.tool_defaults,
             kind_defaults=kind_defaults if isinstance(kind_defaults, dict) else None)
 
+    def _theater_epoch(self) -> int | None:
+        epoch = getattr(self._server, "theater_epoch", None)
+        return epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
+
+    def _approval_preview(self, tool: str, args: dict) -> dict:
+        """``theater_tools.approval_preview`` as plain JSON; ``{}`` without a
+        server or on any error (the slip is then Deny-only, WG v2 §3.6)."""
+        if self._server is None:
+            return {}
+        try:
+            out = theater_tools.approval_preview(self._server, tool, args)
+            return json.loads(dumps_compact(out)) if isinstance(out, Mapping) else {}
+        except Exception as exc:  # noqa: BLE001 -- a preview never blocks the request
+            log.warning("approval preview for %s failed: %s", tool, type(exc).__name__)
+            return {}
+
     def _envelope_summary(self) -> dict | None:
         env = getattr(self._server, "envelope", None)
         if env is None:
@@ -2130,9 +2201,17 @@ class ChatService:
 
     # ---------------------------------------------------------------- ui --
     def _emit_ui(self, s: _Session, directive: dict) -> None:
-        if not isinstance(directive, dict) or directive.get("action") not in (
-                "focus", "track", "orb", "inspect"):
+        if not isinstance(directive, dict) or directive.get("action") not in UI_ACTIONS:
             raise ValueError("unknown ui directive")
+        action = directive["action"]
+        if action == "theater" and not (isinstance(directive.get("id"), str)
+                                        and directive["id"].startswith("thr:")):
+            raise ValueError("a theater directive needs a thr: id")
+        if action == "map":
+            ids = directive.get("ids")
+            if not (isinstance(ids, list) and 1 <= len(ids) <= 50
+                    and all(isinstance(i, str) and i for i in ids)):
+                raise ValueError("a map directive needs 1 to 50 ids")
         s.emit("ui", dict(directive))
 
 

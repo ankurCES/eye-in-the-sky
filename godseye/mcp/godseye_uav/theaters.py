@@ -84,16 +84,26 @@ only altHae downstream (T1). Waypoint altitudes in this module are metres
 Every theater is anchored to a real place; the comment on each entry says
 which. ISR-only (M14): a theater is an area to observe — nothing here
 describes or supports a strike.
+
+DYNAMIC THEATERS (WG spec §4.1.1). Besides the static table, an AO can be
+defined at runtime (`make_dynamic` -> `register_dynamic`) under a `dyn-` id.
+`get()`, `is_known()`, `as_payload()` and `active_from_server()` see both;
+`ids()` stays the static table (argparse `choices`). `from_dict()` is the
+inverse of `Theater.as_dict()`, for `<store>/theater.json`.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import re
 import threading
+import unicodedata
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any
 
 from .safety import point_in_polygon
 
@@ -134,6 +144,49 @@ def _m_per_deg_lon(lat_deg: float) -> float:
     return 111_320.0 * math.cos(math.radians(lat_deg))
 
 
+class FrozenDict(dict):
+    """A read-only dict (a dynamic theater's `provenance`).
+
+    A `dict` subclass rather than `MappingProxyType`, which `copy.deepcopy`,
+    `pickle` and `dataclasses.asdict` all refuse; `json.dumps` takes it as is.
+    """
+
+    __slots__ = ()
+
+    def _read_only(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise TypeError("theater provenance is read-only")
+
+    __setitem__ = __delitem__ = __ior__ = _read_only
+    clear = pop = popitem = setdefault = update = _read_only
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (type(self), (dict(self),))
+
+    def __copy__(self) -> FrozenDict:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> FrozenDict:
+        return self                        # immutable all the way down
+
+
+def _freeze(value: Any) -> Any:
+    """Deep read-only copy: mappings -> FrozenDict, lists/tuples -> tuples."""
+    if isinstance(value, Mapping):
+        return FrozenDict({str(k): _freeze(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    """Inverse of `_freeze` into plain JSON-ready dicts and lists."""
+    if isinstance(value, Mapping):
+        return {k: _thaw(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw(v) for v in value]
+    return value
+
+
 @dataclass(frozen=True)
 class Poi:
     """A named point inside the AO the panel can orbit (PLAN §4.1 orbit_poi)."""
@@ -153,6 +206,12 @@ class Theater:
     `ao` is `[(lat, lon), ...]` — the format `safety.point_in_polygon` and
     `SafetyEnvelope.geofence` take. `home_alt_msl_m` is MSL (T1, see module
     docstring).
+
+    `provenance` and `dynamic` (WG spec §4.1.1) say where a runtime theater
+    came from; both stay out of `==` and `hash`, so a row's identity is its
+    geometry. `provenance` is deep-frozen on construction (read-only mappings,
+    tuples for lists) — the "frozen row, still-mutable dict field" trap —
+    and must be JSON-ready, because it is persisted in `theater.json`.
     """
 
     id: str
@@ -165,6 +224,23 @@ class Theater:
     ao: tuple[tuple[float, float], ...]
     pois: tuple[Poi, ...] = ()
     orbit_radius_m: float = DEFAULT_ORBIT_RADIUS_M
+    provenance: Mapping[str, Any] | None = field(
+        default=None, compare=False, hash=False, repr=False)
+    dynamic: bool = field(default=False, compare=False, hash=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "dynamic", bool(self.dynamic))
+        if self.provenance is None:
+            return
+        if not isinstance(self.provenance, Mapping):
+            raise TypeError(
+                f"theater provenance must be a mapping, not {type(self.provenance).__name__}")
+        frozen = _freeze(self.provenance)
+        try:
+            json.dumps(_thaw(frozen), allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"theater provenance is not JSON-ready: {exc}") from None
+        object.__setattr__(self, "provenance", frozen)
 
     # ---- home ----
     @property
@@ -320,11 +396,11 @@ class Theater:
                     points.append((lat, lon))
         return points
 
-    def hydrate(self, client: "RealWorldData | None" = None, *,
+    def hydrate(self, client: RealWorldData | None = None, *,
                 allow_network: bool = True,
                 floor_clearance_agl_m: float = FLOOR_CLEARANCE_M_AGL,
                 traffic_radius_m: float = TRAFFIC_RADIUS_M,
-                ob_limit: int | None = 40) -> "TheaterRealData":
+                ob_limit: int | None = 40) -> TheaterRealData:
         """Ingest real terrain / sites / traffic / weather for this theater.
 
         BLOCKS on the network — call it at startup or from a background thread,
@@ -350,7 +426,7 @@ class Theater:
         set_real_data(self.id, result)
         return result
 
-    def hydrate_async(self, client: "RealWorldData | None" = None,
+    def hydrate_async(self, client: RealWorldData | None = None,
                       **kwargs: Any) -> threading.Thread:
         """`hydrate()` on a daemon thread — the non-blocking entry point."""
         thread = threading.Thread(
@@ -359,7 +435,7 @@ class Theater:
         thread.start()
         return thread
 
-    def real_data(self) -> "TheaterRealData | None":
+    def real_data(self) -> TheaterRealData | None:
         """Last hydration for this theater, or None. Never touches the network."""
         return real_data(self.id)
 
@@ -399,8 +475,11 @@ class Theater:
         static offline default or measured — it is never omitted, because an
         absent flag reads as "fine" and that is the failure mode this project
         keeps being bitten by.
+
+        `dynamic` is always present; `provenance` only when set (WG §4.1.1).
+        `from_dict()` is the inverse.
         """
-        return {
+        row = {
             "id": self.id,
             "label": self.label,
             "place": self.place,
@@ -416,7 +495,11 @@ class Theater:
                 "speed_mps": DEMO_SPEED_MPS,
             },
             "real_data": self.real_data_dict(),
+            "dynamic": self.dynamic,
         }
+        if self.provenance is not None:
+            row["provenance"] = _thaw(self.provenance)
+        return row
 
 
 def _box(min_lat: float, min_lon: float, max_lat: float,
@@ -575,22 +658,244 @@ DEFAULT_THEATER_ID = "default"
 DEFAULT_EXPORT_NAME = "theaters.json"
 
 # ---------------------------------------------------------------------------
+# DYNAMIC theaters (WG spec §4.1.1): an AO defined at runtime from chat.
+#
+# The static table above stays the offline default and stays immutable; a
+# runtime theater lives in `_DYNAMIC`, keyed by a `dyn-` id that can never
+# collide with a table id. `get()` resolves the table first, then this
+# registry; `ids()` (argparse `choices`) stays static-only. Labels, places and
+# POI names here are UNTRUSTED text (geocoder, operator): they are cleaned of
+# bidi and control characters and capped, and the id is an ASCII slug plus an
+# AO hash, so it always fits the `[[thr:id|label]]` chip grammar.
+# ---------------------------------------------------------------------------
+
+DYNAMIC_PREFIX = "dyn-"
+
+#: Every id `register_dynamic` accepts. `dynamic_id()` yields at most 35 chars.
+DYNAMIC_ID_RE = re.compile(r"^dyn-[a-z0-9][a-z0-9-]{0,59}$")
+
+DYNAMIC_DESCRIPTION = (
+    "Chat-defined AO (simulation). A real place: mapped data is context only (M14).")
+
+#: Caps on untrusted text kept in a dynamic row.
+LABEL_MAX = 80
+PLACE_MAX = 200
+DESCRIPTION_MAX = 400
+
+#: Bidi controls (U+202A–U+202E, U+2066–U+2069, spec §0.2) plus LRM/RLM/ALM.
+BIDI_CONTROLS = frozenset(
+    [chr(c) for c in range(0x202A, 0x202F)] + [chr(c) for c in range(0x2066, 0x206A)]
+    + [chr(0x200E), chr(0x200F), chr(0x061C)])
+
+_DYNAMIC: dict[str, Theater] = {}
+_DYNAMIC_LOCK = threading.Lock()
+
+
+def clean_text(text: Any, *, limit: int | None = None) -> str:
+    """Untrusted text -> one clean line: bidi controls dropped, control
+    characters and whitespace runs collapsed to one space, capped at `limit`.
+    Idempotent."""
+    out = "".join(
+        " " if unicodedata.category(ch) == "Cc" else ch
+        for ch in str(text if text is not None else "") if ch not in BIDI_CONTROLS)
+    out = " ".join(out.split())
+    if limit is not None and len(out) > limit:
+        out = out[:limit].rstrip()
+    return out
+
+
+def ascii_slug(text: Any) -> str:
+    """Lower-case ASCII slug: accents folded, anything else becomes '-'."""
+    folded = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore")
+    return re.sub(r"[^a-z0-9]+", "-", folded.decode("ascii").lower()).strip("-")
+
+
+def dynamic_id(label: str, ao: Iterable[tuple[float, float]]) -> str:
+    """`dyn-<slug[:24]>-<sha1(AO)[:6]>`: deterministic for a label and an AO.
+
+    The hash is over the vertices at 5 decimals (~1 m), so the same area under
+    the same name always gets the same id (idempotent switches, stable chips)
+    and two areas sharing a name do not collide. A label with no ASCII left
+    after folding (e.g. Cyrillic) slugs to "area".
+    """
+    slug = ascii_slug(label)[:24].strip("-") or "area"
+    key = ";".join(f"{float(lat):.5f},{float(lon):.5f}" for lat, lon in ao)
+    return f"{DYNAMIC_PREFIX}{slug}-{hashlib.sha1(key.encode('ascii')).hexdigest()[:6]}"
+
+
+def _number(value: Any, what: str) -> float:
+    """A finite float, refusing bools (a flag is not a coordinate)."""
+    try:
+        if isinstance(value, bool):
+            raise TypeError("a bool is not a number")
+        out = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{what} must be a number, got {value!r}") from None
+    if not math.isfinite(out):
+        raise ValueError(f"{what} must be finite, got {value!r}")
+    return out
+
+
+def _lat_lon(lat: Any, lon: Any, what: str) -> tuple[float, float]:
+    la, lo = _number(lat, f"{what} lat"), _number(lon, f"{what} lon")
+    if not (-90.0 <= la <= 90.0 and -180.0 <= lo <= 180.0):
+        raise ValueError(f"{what} ({la}, {lo}) is not a valid lat/lon")
+    return la, lo
+
+
+def _poi(p: Any) -> Poi:
+    """A `Poi`, a `{name, lat, lon}` mapping or a `(name, lat, lon)` triple."""
+    if isinstance(p, Poi):
+        name, lat, lon = p.name, p.lat, p.lon
+    elif isinstance(p, Mapping):
+        name, lat, lon = p.get("name"), p.get("lat"), p.get("lon")
+    else:
+        name, lat, lon = p
+    name = clean_text(name, limit=LABEL_MAX)
+    if not name:
+        raise ValueError("a POI needs a name")
+    la, lo = _lat_lon(lat, lon, f"POI {name!r}")
+    return Poi(name, la, lo)
+
+
+def make_dynamic(*, label: str, place: str, center: tuple[float, float],
+                 half_extent_m: float, home: tuple[float, float],
+                 home_alt_msl_m: float, pois: Iterable[Any] = (),
+                 provenance: Mapping[str, Any] | None) -> Theater:
+    """Build (not register) a chat-defined theater around `center` (§4.1.1).
+
+    The AO is the square `center ± half_extent_m`. `home` is `(lat, lon)` and
+    `home_alt_msl_m` is MSL (T1). Raises ValueError on unusable input; whether
+    the row is flyable (home inside, demo box, POI rings) is `validate()`'s
+    job, which `register_dynamic` runs.
+    """
+    name = clean_text(label, limit=LABEL_MAX)
+    if not name:
+        raise ValueError("a dynamic theater needs a label")
+    clat, clon = _lat_lon(center[0], center[1], "centre")
+    half = _number(half_extent_m, "half_extent_m")
+    if half <= 0:
+        raise ValueError(f"half_extent_m must be positive, got {half}")
+    dlat = half / _M_PER_DEG_LAT
+    if abs(clat) + dlat >= 90.0:
+        raise ValueError("the AO would reach a pole; pick a centre further from it")
+    dlon = half / _m_per_deg_lon(clat)
+    if abs(clon) + dlon > 180.0:
+        raise ValueError("the AO would cross the antimeridian; pick a centre further from it")
+    ao = _box(round(clat - dlat, 7), round(clon - dlon, 7),
+              round(clat + dlat, 7), round(clon + dlon, 7))
+    hlat, hlon = _lat_lon(home[0], home[1], "home")
+    return Theater(
+        id=dynamic_id(name, ao), label=name,
+        place=clean_text(place, limit=PLACE_MAX) or name,
+        description=DYNAMIC_DESCRIPTION,
+        home_lat=hlat, home_lon=hlon,
+        home_alt_msl_m=_number(home_alt_msl_m, "home_alt_msl_m"),
+        ao=ao, pois=tuple(_poi(p) for p in pois),
+        provenance=provenance, dynamic=True)
+
+
+def register_dynamic(t: Theater) -> Theater:
+    """Add (or replace) a runtime theater; returns the registered row.
+
+    Refuses with `ValueError(problems)` (a list of sentences) unless the id
+    has the `dyn-` shape and `validate([t]) == []`. The stored row always
+    has `dynamic=True`.
+    """
+    if not isinstance(t, Theater):
+        raise TypeError(f"register_dynamic needs a Theater, not {type(t).__name__}")
+    if not DYNAMIC_ID_RE.match(t.id):
+        raise ValueError([(f"{t.id!r}: a dynamic theater id must look like "
+                           f"'{DYNAMIC_PREFIX}<slug>-<hash>' (lower-case ASCII)")])
+    problems = validate([t])
+    if problems:
+        raise ValueError(problems)
+    if not t.dynamic:
+        t = replace(t, dynamic=True)
+    with _DYNAMIC_LOCK:
+        _DYNAMIC[t.id] = t
+    return t
+
+
+def clear_dynamic() -> None:
+    """Forget every runtime theater (tests; the conftest calls it)."""
+    with _DYNAMIC_LOCK:
+        _DYNAMIC.clear()
+
+
+def dynamic_theaters() -> list[Theater]:
+    """Registered runtime theaters, in registration order."""
+    with _DYNAMIC_LOCK:
+        return list(_DYNAMIC.values())
+
+
+def is_known(theater_id: Any) -> bool:
+    """True when `get(theater_id)` would answer (table or registry)."""
+    if not isinstance(theater_id, str):
+        return False
+    with _DYNAMIC_LOCK:
+        return theater_id in THEATERS or theater_id in _DYNAMIC
+
+
+def from_dict(d: Mapping[str, Any]) -> Theater:
+    """Inverse of `Theater.as_dict()`: `from_dict(t.as_dict()) == t`.
+
+    Derived keys (`demo`, `real_data`, `home_alt_datum`) are not read back.
+    `dynamic` follows the id (`dyn-` prefix). Text fields are cleaned as
+    `make_dynamic` cleans them (a no-op on a row it built), because the input
+    is usually a file on disk. Raises TypeError when `d` is not a mapping and
+    ValueError on a malformed row; it never registers anything.
+    """
+    if not isinstance(d, Mapping):
+        raise TypeError(f"a theater row must be a mapping, not {type(d).__name__}")
+    tid = str(d.get("id") or "").strip()
+    if not tid:
+        raise ValueError("a theater row needs an id")
+    datum = d.get("home_alt_datum", "MSL")
+    if datum != "MSL":
+        raise ValueError(f"{tid}: home altitude datum must be MSL (T1), got {datum!r}")
+    try:
+        home = d["home"]
+        if isinstance(home, (str, bytes)) or len(home) != 3:
+            raise ValueError(f"{tid}: home must be [lat, lon, alt_msl_m]")
+        hlat, hlon = _lat_lon(home[0], home[1], f"{tid} home")
+        ao = tuple(_lat_lon(v[0], v[1], f"{tid} AO vertex") for v in d["ao"])
+        pois = tuple(_poi(p) for p in (d.get("pois") or ()))
+    except (KeyError, TypeError, IndexError) as exc:
+        raise ValueError(f"{tid}: not a theater row ({type(exc).__name__}: {exc})") from None
+    provenance = d.get("provenance")
+    if provenance is not None and not isinstance(provenance, Mapping):
+        raise ValueError(f"{tid}: provenance must be a mapping")
+    return Theater(
+        id=tid,
+        label=clean_text(d.get("label"), limit=LABEL_MAX) or tid,
+        place=clean_text(d.get("place"), limit=PLACE_MAX),
+        description=clean_text(d.get("description"), limit=DESCRIPTION_MAX),
+        home_lat=hlat, home_lon=hlon,
+        home_alt_msl_m=_number(home[2], f"{tid} home_alt_msl_m"),
+        ao=ao, pois=pois,
+        orbit_radius_m=_number(d.get("orbit_radius_m", DEFAULT_ORBIT_RADIUS_M),
+                               f"{tid} orbit_radius_m"),
+        provenance=provenance,
+        dynamic=tid.startswith(DYNAMIC_PREFIX))
+
+# ---------------------------------------------------------------------------
 # Hydration registry. `Theater` is frozen — the static table must stay the
 # offline default and stay immutable — so what a theater has *learned* about
 # the real world lives beside it, keyed by id.
 # ---------------------------------------------------------------------------
 
-_HYDRATION: dict[str, "TheaterRealData"] = {}
+_HYDRATION: dict[str, TheaterRealData] = {}
 _HYDRATION_LOCK = threading.Lock()
 
 
-def set_real_data(theater_id: str, data: "TheaterRealData") -> None:
+def set_real_data(theater_id: str, data: TheaterRealData) -> None:
     """Publish a hydration result. Called by `Theater.hydrate()` and refreshers."""
     with _HYDRATION_LOCK:
         _HYDRATION[theater_id] = data
 
 
-def real_data(theater_id: str) -> "TheaterRealData | None":
+def real_data(theater_id: str) -> TheaterRealData | None:
     """Last hydration for a theater, or None. Non-blocking: memory only."""
     with _HYDRATION_LOCK:
         return _HYDRATION.get(theater_id)
@@ -611,9 +916,9 @@ def clear_hydration(theater_id: str | None = None) -> None:
             _HYDRATION.pop(theater_id, None)
 
 
-def hydrate_all(client: "RealWorldData | None" = None,
+def hydrate_all(client: RealWorldData | None = None,
                 theater_ids: Iterable[str] | None = None,
-                **kwargs: Any) -> dict[str, "TheaterRealData"]:
+                **kwargs: Any) -> dict[str, TheaterRealData]:
     """Hydrate several theaters through one client. BLOCKS — startup only.
 
     One theater failing does not stop the rest: a failure is already a flagged
@@ -646,12 +951,21 @@ def ids() -> list[str]:
 
 
 def get(theater_id: str | None) -> Theater:
-    """Look up a theater; `None` returns the default. Raises KeyError."""
+    """Look up a theater; `None` returns the default. Raises KeyError.
+
+    The static table first, then the dynamic registry (WG §4.1.1).
+    """
     key = theater_id or DEFAULT_THEATER_ID
-    try:
-        return THEATERS[key]
-    except KeyError:
-        raise KeyError(f"unknown theater {key!r}; known: {', '.join(ids())}") from None
+    found = THEATERS.get(key)
+    if found is not None:
+        return found
+    with _DYNAMIC_LOCK:
+        found = _DYNAMIC.get(key)
+        dynamic = list(_DYNAMIC)
+    if found is not None:
+        return found
+    raise KeyError(f"unknown theater {key!r}; known: {', '.join(ids())}; "
+                   f"dynamic: {', '.join(dynamic) or 'none registered'}")
 
 
 def all_theaters() -> list[Theater]:
@@ -705,7 +1019,8 @@ def active_from_server(block: Mapping[str, Any], *, source: str, at_ms: int,
     NOT known — a nameless theater cannot be adopted by a selector, and
     inventing the default here would re-create UI-1.
 
-    `in_table` says whether this bridge's own table has that row, so a consumer
+    `in_table` says whether this bridge's own table (or its dynamic registry,
+    WG §4.1.1) has that row, so a consumer
     can tell "the server is somewhere I can draw" from "the server is running a
     theater I have never heard of" instead of silently showing neither.
 
@@ -780,7 +1095,7 @@ def active_from_server(block: Mapping[str, Any], *, source: str, at_ms: int,
         "label": str(block.get("label") or tid),
         "ground_elevation_msl_m": ground,
         "ao": ao,
-        "in_table": tid in THEATERS,
+        "in_table": is_known(tid),       # table or dynamic registry (§4.1.1)
         # DEEP-copied: the caller's `theater_mismatch` is a nested object out of
         # the bridge's own cached `uav://safety/geofence` document, and
         # `GET /health` returns this block straight to the responder without
@@ -859,7 +1174,8 @@ def as_payload(active: Mapping[str, Any] | None = None) -> dict[str, Any]:
         "real_data_note": "each theater row carries a real_data block saying whether "
                           "it is the static offline default or hydrated from real "
                           "terrain / mapped sites / live traffic / current weather",
-        "theaters": [t.as_dict() for t in _TABLE],
+        # Static rows, then runtime rows (WG §4.1.1); each says `dynamic`.
+        "theaters": [t.as_dict() for t in (*_TABLE, *dynamic_theaters())],
     }
 
 

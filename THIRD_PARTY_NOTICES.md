@@ -103,6 +103,48 @@ Not redistributed, but their terms bind how the running system may be used (see
 - **Re:Earth Terrain / Mapterhorn** — CC BY 4.0; geoid EGM2008 (NGA, public domain).
 - **Google Maps Platform**, **Esri World Imagery** — proprietary, own key and terms.
 
+### 4.1 Services the Python side calls directly (map data and direct hydration)
+
+Since runtime theaters (WG v2 Phase A), `godseye/mcp/godseye_uav/geo_http.py` calls these public
+services itself: for map data (on in the app, `--geodata on`) and for `--real-data direct`. Nothing
+from them is redistributed in this repository; answers are cached under `<store>/geodata-cache/`
+on the user's machine (30 days for place lookups, 24 hours for sites). Every request carries the
+User-Agent `EyeInTheSky/<version> (+godseye; contact: $GODSEYE_GEO_CONTACT)`, and each service has
+its own minimum spacing between requests (`geo_http.MIN_SPACING_S`).
+
+| Service | What the app sends and uses | Data and attribution |
+|---|---|---|
+| **Photon** (komoot), `photon.komoot.io` | place-search text; place names, points and boxes | OpenStreetMap data, © OpenStreetMap contributors, **ODbL 1.0** |
+| **Nominatim** (OpenStreetMap Foundation), `nominatim.openstreetmap.org` | place-search text, only when Photon fails or finds nothing | OpenStreetMap data, **ODbL 1.0**; the service's usage policy asks for at most one request per second, an identifying User-Agent and attribution |
+| **Overpass API**, `overpass-api.de` (one retry on the `overpass.kumi.systems` mirror) | a theater's bounding box; mapped strategic sites and named open ground | OpenStreetMap data, © OpenStreetMap contributors, **ODbL 1.0** |
+| **Re:Earth Terrain / Mapterhorn**, `terrain.reearth.land` | single points; ellipsoidal ground heights | **CC BY 4.0**; geoid EGM2008 (NGA, public domain) |
+| **Open-Meteo**, `api.open-meteo.com` (`/v1/forecast`, `/v1/elevation`) | single points; current weather, and the ground-height fallback (Copernicus DEM) | **CC BY 4.0**, attribution to Open-Meteo.com; the elevation answer derives from the Copernicus DEM |
+
+The attribution the running app shows, verbatim from the code:
+
+- `geocode.ATTRIBUTION`: "Geocoding: Photon by komoot / Nominatim; data © OpenStreetMap
+  contributors, ODbL" (every `geo_lookup` answer's `provenance.attribution`).
+- `sites.ATTRIBUTION`: "© OpenStreetMap contributors, ODbL" (`geo_sites`, the intel graph's
+  `meta.sites.attribution`, the `/intel/overlay` body's `attribution`), with the caveat "Sites are
+  mapped OpenStreetMap data (ODbL), not an order of battle."
+- The map dock, whenever sites are drawn: "Map data: © OpenStreetMap contributors, ODbL."; the site
+  inspector's source line names "OpenStreetMap contributors, ODbL" and Overpass.
+- `realdata.ATTRIBUTION["terrain"]`: "Terrain: Re:Earth / Mapterhorn terrain heights (CC BY 4.0);
+  geoid EGM2008 (NGA, public domain)".
+- `realdata.ATTRIBUTION["weather"]`: "Weather data by Open-Meteo.com (CC BY 4.0)".
+- A theater whose ground came from Open-Meteo says "Copernicus DEM via Open-Meteo (EGM2008), used
+  as sea level; the geoid difference is not corrected."
+
+Unverified here, and to check before any use beyond personal research: each service's current
+usage policy and rate limits (Photon's and Overpass's public instances are shared, best-effort
+services; Nominatim's policy is stated above as generally published, not re-read for this build);
+whether Open-Meteo's free API terms allow the intended use (its free tier is generally described as
+non-commercial); and the attribution the Copernicus DEM licence requires for derived heights. The
+app does not display the Re:Earth or Open-Meteo lines in the console today; they travel in the
+provenance of the data they produced, and the theater slip and theater inspector name Re:Earth or
+Open-Meteo only in the ground-source sentence. Showing the CC BY lines in the console is an open
+item.
+
 ## 5. EGM96 geoid grid
 
 `godseye/mcp/godseye_uav/data/us_nga_egm96_15.tif` (2.6 MB) is the NGA EGM96 15-minute geoid grid.

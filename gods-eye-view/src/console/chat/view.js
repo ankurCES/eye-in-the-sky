@@ -12,7 +12,16 @@
  * ctx = { api, store, orb, chat, bus, mode, root, config } (index.js). The
  * view never moves the operator's view by itself: `ui` directives become bus
  * events the shell owns ('focus:entities', 'inspect', 'track:request',
- * 'track:exit'), and only for LIVE events, never for replayed history.
+ * 'track:exit', 'map:request'), and only for LIVE events, never for replayed
+ * history. `ui theater` only writes its line ("Theater set to …" with Show
+ * on map); the orb transition comes from the intel store.
+ *
+ * 'map:request' payload (WG spec §4.2.3; mode.js shows the notice or toast):
+ *   { ids, bbox:[s,w,n,e], label, reason?, source:'analyst'|'operator',
+ *     countdown:boolean, gate?:null|'tracking'|'composer'|'stage_input'|
+ *     'slip_pending' }
+ * `countdown` is true only for an analyst request that passed the UX §6.9
+ * gate; an operator's Show on map opens the map at once.
  *
  * opts (tests): { doc, now, clock:{setTimeout, clearTimeout, setInterval,
  *   clearInterval}, raf, reducedMotion }
@@ -40,6 +49,7 @@ import {
   statusWord,
 } from './reducer.js';
 import { assess, vehicleFacts } from './validate.js';
+import { assessTheater, fleetOf, isPreviewTool } from './validateTheater.js';
 import {
   USE_API_KEY,
   costNote,
@@ -57,6 +67,7 @@ import {
   ICON,
   SENSOR_TOOLS,
   approvalVehicle,
+  bareId,
   bidiSafe,
   bytes,
   callVehicle,
@@ -290,6 +301,157 @@ export function shouldAutoTrack({
   return { allowed: true, reason: null };
 }
 
+// ---- ui map / ui theater (WG spec §4.2.3) ----------------------------------------
+
+/** Padding around point ids, the vector factor and the minimum extent. */
+export const MAP_PAD = 0.15;
+export const MAP_VECTOR_PAD = 1.15;
+export const MAP_MIN_M = 1000;
+
+const M_PER_DEG = (Math.PI / 180) * 6371008.8;
+const fin = (v) => typeof v === 'number' && Number.isFinite(v);
+
+function bboxOf(value) {
+  return Array.isArray(value) && value.length === 4 && value.every(fin)
+    ? value.slice()
+    : null;
+}
+
+function pointOf(node) {
+  if (!node || typeof node !== 'object') return null;
+  const lat = node.lat ?? node.attrs?.lat;
+  const lon = node.lon ?? node.attrs?.lon;
+  return fin(lat) && fin(lon) ? [lat, lon] : null;
+}
+
+function squareAround([lat, lon], halfM) {
+  const dLat = halfM / M_PER_DEG;
+  const dLon =
+    halfM / (M_PER_DEG * Math.max(0.01, Math.cos((lat * Math.PI) / 180)));
+  return [lat - dLat, lon - dLon, lat + dLat, lon + dLon];
+}
+
+/**
+ * The `[s,w,n,e]` area for a `ui map` directive, resolved client-side:
+ * `thr:` → its `attrs.bbox` (or the active theater block's); `vec:` → its
+ * centre ± half-length × 1.15; anything else → the ids' lat/lon plus 15 %
+ * padding. The result is at least 1 km on each side.
+ * @param {string[]} ids graph ids
+ * @param {(id:string) => object|null} lookup node lookup
+ * @param {object|null} graph the intel graph (for the theater block)
+ * @returns {{bbox: number[]|null, label: string|null, missing: string[]}}
+ */
+export function resolveMapArea(ids, lookup, graph = null) {
+  const list = Array.isArray(ids) ? ids.filter(Boolean).map(String) : [];
+  const boxes = [];
+  const points = [];
+  const missing = [];
+  const labels = [];
+  const active = graph?.theater;
+  for (const id of list) {
+    const node = lookup?.(id) ?? null;
+    const isActive = active?.id != null && id === `thr:${active.id}`;
+    const label =
+      (typeof node?.label === 'string' && node.label) ||
+      (isActive && typeof active.label === 'string' && active.label) ||
+      null;
+    if (label) labels.push(label);
+    if (id.startsWith('thr:')) {
+      const box =
+        bboxOf(node?.attrs?.bbox) || (isActive ? bboxOf(active.bbox) : null);
+      if (box) {
+        boxes.push(box);
+        continue;
+      }
+    } else if (id.startsWith('vec:')) {
+      const c = pointOf(node);
+      const len = node?.attrs?.length_m;
+      if (c && fin(len) && len > 0) {
+        boxes.push(squareAround(c, (len / 2) * MAP_VECTOR_PAD));
+        continue;
+      }
+    }
+    const pt = pointOf(node);
+    if (pt) points.push(pt);
+    else missing.push(id);
+  }
+  const label =
+    list.length === 1
+      ? labels[0] || null
+      : list.length
+        ? `${list.length} items`
+        : null;
+  if (!boxes.length && !points.length) return { bbox: null, label, missing };
+  let bbox = null;
+  if (points.length) {
+    let [s, w, n, e] = [Infinity, Infinity, -Infinity, -Infinity];
+    for (const [lat, lon] of points) {
+      s = Math.min(s, lat);
+      n = Math.max(n, lat);
+      w = Math.min(w, lon);
+      e = Math.max(e, lon);
+    }
+    const padLat = (n - s) * MAP_PAD;
+    const padLon = (e - w) * MAP_PAD;
+    bbox = [s - padLat, w - padLon, n + padLat, e + padLon];
+  }
+  for (const b of boxes) {
+    bbox = bbox
+      ? [
+          Math.min(bbox[0], b[0]),
+          Math.min(bbox[1], b[1]),
+          Math.max(bbox[2], b[2]),
+          Math.max(bbox[3], b[3]),
+        ]
+      : b;
+  }
+  // At least MAP_MIN_M on each side, about the same centre.
+  const midLat = (bbox[0] + bbox[2]) / 2;
+  const midLon = (bbox[1] + bbox[3]) / 2;
+  const min = squareAround([midLat, midLon], MAP_MIN_M / 2);
+  bbox = [
+    Math.min(bbox[0], min[0]),
+    Math.min(bbox[1], min[1]),
+    Math.max(bbox[2], min[2]),
+    Math.max(bbox[3], min[3]),
+  ];
+  return { bbox, label, missing };
+}
+
+/**
+ * Whether a `ui map` directive may open (or move) the map with a 3 s notice
+ * (UX §6.9 gating, WG spec §4.2.3). Otherwise the shell shows a static toast
+ * with Show on map; while tracking, only a toast.
+ */
+export function shouldShowMap({
+  composerText = '',
+  composerFocused = false,
+  lastStageInputAt = null,
+  now = Date.now(),
+  pendingCount = 0,
+  mode = 'orb',
+}) {
+  if (mode === 'tracking' || mode === 'entering_tracking')
+    return { allowed: false, reason: 'tracking' };
+  if (String(composerText || '').trim() || composerFocused)
+    return { allowed: false, reason: 'composer' };
+  if (Number.isFinite(lastStageInputAt) && now - lastStageInputAt < QUIET_MS)
+    return { allowed: false, reason: 'stage_input' };
+  if (pendingCount > 0) return { allowed: false, reason: 'slip_pending' };
+  return { allowed: true, reason: null };
+}
+
+/** The directive-line copy for `ui map` (WG spec §4.2.3, Appendix B). */
+export function mapLineText(d, area, decision) {
+  if (!area?.bbox)
+    return 'The analyst asked to show something without a location on the map.';
+  const what = area.label || 'the area';
+  if (decision && !decision.allowed) {
+    return `The analyst suggests showing ${what} on the map${d.reason ? `: “${d.reason}”` : ''}.`;
+  }
+  return `Asked to show ${what} on the map${d.reason ? `: ${d.reason}` : ''}.`;
+}
+
 /** Caveats to show as Assumed on slips while the real-data layer is off. */
 export function assumedCaveats(graph) {
   const caveats = Array.isArray(graph?.meta?.caveats)
@@ -483,8 +645,12 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
   const slips = new Map();
   const snapshots = new Map();
   const befores = new Map();
+  // The theater epoch when each live approval arrived (WG spec §4.2.2): a
+  // theater slip is blocked once the epoch moves on. Unknown on replay.
+  const requestEpochs = new Map();
   const executed = new Set();
   const trackDecisions = new Map();
+  const mapDecisions = new Map();
   const stopFacts = new Map();
   const expanded = new Set();
   const announced = new Set();
@@ -1245,12 +1411,25 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
       conflicts: index >= 0 ? conflicts : [],
       caveats: assumedCaveats(graph),
       detections: a.klass === 'sensor' ? detectionsFeed(graph) : null,
+      fleet: isPreviewTool(a.tool) ? fleetOf(graph) : null,
       now: t,
       reducedMotion: reduced(),
     };
   }
 
   function assessApproval(a) {
+    if (a.tool === 'sim_set_theater') {
+      // Theater slips: the console's own refusals (validateTheater.js). A
+      // change of state re-arms the slip; 'blocked' makes it Deny-only.
+      const theater = assessTheater(a, graphOf(store), {
+        requestEpoch: requestEpochs.get(a.id) ?? null,
+      });
+      return {
+        state: theater.ok ? 'none' : 'blocked',
+        reasons: theater.reasons,
+        theater,
+      };
+    }
     const vehicle = approvalVehicle(a);
     const kind = missionKind(a.tool, a.args);
     const snap = snapshots.get(`${kind}|${vehicle}`) ?? null;
@@ -1285,8 +1464,46 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     return slip.el;
   }
 
+  /** The area and words for a `ui map` / `ui theater` directive. */
+  function directiveArea(d) {
+    const ids = d.action === 'theater' ? (d.id ? [d.id] : []) : d.ids;
+    const area = resolveMapArea(
+      ids,
+      (id) => lookupNode(store, id),
+      graphOf(store),
+    );
+    if (d.action === 'theater' && !area.label)
+      area.label = stripBidi(d.label) || (d.id ? bareId(d.id) : null);
+    return { ids, ...area };
+  }
+
+  /** Operator's Show on map: the shell opens the map on the area at once. */
+  function showOnMap(d) {
+    const area = directiveArea(d);
+    if (!area.bbox) return;
+    bus?.emit?.('map:request', {
+      ids: area.ids,
+      bbox: area.bbox,
+      label: stripBidi(area.label) ?? undefined,
+      source: 'operator',
+      countdown: false,
+    });
+  }
+
+  function mapButton(d) {
+    const b = h(
+      'button',
+      { type: 'button', class: 'ic-btn', 'data-variant': 'link' },
+      'Show on map',
+    );
+    b.addEventListener('click', () => showOnMap(d));
+    return b;
+  }
+
   function directiveLine(d, key) {
-    const decision = trackDecisions.get(d.seq);
+    const decision = trackDecisions.get(d.seq) ?? mapDecisions.get(d.seq);
+    const area =
+      d.action === 'map' || d.action === 'theater' ? directiveArea(d) : null;
     const sig = JSON.stringify([
       d.action,
       d.ids,
@@ -1294,10 +1511,26 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
       d.vehicle,
       decision,
       d.note,
+      d.reason,
+      area?.label,
+      area?.bbox,
     ]);
     return cached(key, sig, () => {
       const kids = [];
-      if (d.action === 'focus') {
+      if (d.action === 'theater') {
+        // "Theater set to (◎ Kherson, Ukraine)." with Show on map. It never
+        // moves the camera by itself; a repeat is the same line.
+        const label = area.label || 'the new theater';
+        if (d.id) {
+          const chip = createChip({ id: d.id, label }, chipHooks());
+          wireRoving([chip]);
+          kids.push('Theater set to ', chip, '.');
+        } else kids.push(`Theater set to ${label}.`);
+        if (area.bbox) kids.push(' ', mapButton(d));
+      } else if (d.action === 'map') {
+        kids.push(mapLineText(d, area, decision));
+        if (area.bbox) kids.push(' ', mapButton(d));
+      } else if (d.action === 'focus') {
         const n = d.ids.length;
         const single = n === 1 ? lookupNode(store, d.ids[0]) : null;
         const what = n === 1 ? single?.label || d.ids[0] : `${n} entities`;
@@ -2419,6 +2652,10 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
   function runDirective(d) {
     if (!d || executed.has(d.seq)) return;
     executed.add(d.seq);
+    // The slip that launched this may have resolved in the same batch of
+    // events, before the next render: publish the pending count first, so
+    // mode.js gates the view on the count the verdict below used (A14).
+    emitPending();
     if (d.action === 'focus') {
       if (d.ids.length)
         bus?.emit?.('focus:entities', {
@@ -2468,7 +2705,34 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
       if (m.mode === 'tracking' || m.mode === 'entering_tracking') {
         bus?.emit?.('track:exit', { source: 'analyst' });
       }
+    } else if (d.action === 'map') {
+      // The shell (mode.js) runs the notice or the toast; the view resolves
+      // the area and applies the UX §6.9 gate (WG spec §4.2.3).
+      const area = directiveArea(d);
+      if (area.bbox) {
+        const m = modeInfo();
+        const verdict = shouldShowMap({
+          composerText: textarea.value,
+          composerFocused: doc?.activeElement === textarea,
+          lastStageInputAt: Number(store?.lastStageInputAt) || null,
+          now: now(),
+          pendingCount: pendingApprovals(state).length,
+          mode: m.mode,
+        });
+        mapDecisions.set(d.seq, verdict);
+        bus?.emit?.('map:request', {
+          ids: area.ids,
+          bbox: area.bbox,
+          label: stripBidi(area.label) ?? undefined,
+          reason: stripBidi(d.reason) ?? undefined,
+          source: 'analyst',
+          countdown: verdict.allowed,
+          gate: verdict.reason,
+        });
+      }
     }
+    // `ui theater` only writes its line: the orb transition comes from the
+    // intel store's theaterChanged diff, and the camera never moves here.
     // The directive line depends on what was decided here.
     schedule();
   }
@@ -2494,6 +2758,8 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
       if (a && !announced.has(a.id)) {
         announced.add(a.id);
         befores.set(a.id, vehicleNow(approvalVehicle(a)));
+        const epoch = graphOf(store)?.theater?.epoch;
+        if (Number.isFinite(epoch)) requestEpochs.set(a.id, epoch);
         announce(`Approval needed: ${a.title}. ${classMeta(a.klass).phrase}.`, {
           assertive: true,
         });

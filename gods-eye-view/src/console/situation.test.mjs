@@ -32,6 +32,19 @@ import {
   vehicleStateWord,
   zulu,
   _openConfirm,
+  DEFAULT_AIRFRAME_ID,
+  SWITCH_STUCK_TEXT,
+  fleetAirframe,
+  geocoderLine,
+  glyph,
+  homeText,
+  showOnMapRequest,
+  simDuration,
+  simTimeSuffix,
+  switchingText,
+  theaterAreaText,
+  theaterSetLine,
+  timeScaleOf,
 } from './situation.js';
 
 // ---- stub DOM (the GEV convention: no jsdom) ---------------------------------
@@ -1469,5 +1482,413 @@ test('an alarm node is named by its kind label everywhere (displayLabel), unknow
       attrs: { kind: 'odd_thing' },
     }),
     'Odd thing',
+  );
+});
+
+// ---- WG §4.2.5: the theater block ---------------------------------------------------
+
+const XSS = '<img src=x onerror=alert(1)>';
+const BIDI = '‮evil‬';
+const BIDI_RE = /[‪-‮⁦-⁩]/;
+
+/** A chat theater block (§3.2), set from this console at 14:01:40Z. */
+function chatTheater(extra = {}) {
+  return {
+    id: 'dyn-kherson-4f2a',
+    label: 'Kherson',
+    place: 'Kherson, Ukraine',
+    known: false,
+    epoch: 3,
+    dynamic: true,
+    source: 'chat',
+    state: 'active',
+    bbox: [46.6089, 32.5783, 46.6629, 32.6563],
+    center: [46.6359, 32.6173],
+    half_extent_m: 2940,
+    area_km2: 34.6,
+    home: {
+      lat: 46.6371,
+      lon: 32.6189,
+      alt_msl_m: 45,
+      name: 'Grass strip',
+      source: 'overpass-open-ground',
+    },
+    ground_msl_m: 45,
+    ground_source: 'Set by the operator.',
+    airframe: {
+      id: 'quad_suas_electric',
+      label: 'Quad, small electric',
+      reach_m: 7350,
+    },
+    time_scale: 1,
+    geocoder: 'Photon (OpenStreetMap)',
+    query: 'Kherson',
+    set_at_ms: Date.UTC(2026, 8, 27, 14, 1, 40),
+    set_via: 'console',
+    previous: { id: 'default', label: 'Redmond (AirSim default)' },
+    integrity_error: null,
+    ...extra,
+  };
+}
+
+function withTheater(theater, patch = {}) {
+  const g = graph();
+  g.theater = theater;
+  return { ...g, ...patch };
+}
+
+/** Mount with a clock the test moves. */
+function mountClock(state) {
+  const doc = stubDom();
+  globalThis.document = doc;
+  const clock = { t: NOW };
+  const store = fakeStore({
+    alarms: [],
+    status: 'live',
+    lastLiveAt: NOW - 2000,
+    ...state,
+  });
+  const bus = fakeBus();
+  const host = doc.createElement('div');
+  const ctx = { store, bus, root: host, api: fakeApi(), orb: fakeOrb() };
+  const rail = createSituation(host, ctx, {
+    now: () => clock.t,
+    tickMs: 0,
+  });
+  return { doc, store, bus, rail, clock };
+}
+
+const theaterEl = (rail) =>
+  find(rail.element, (el) => el.attrs?.['data-section'] === 'theater');
+
+test('rail: a chat theater says how it was set, its area and home, the geocoder and Previous', () => {
+  const { rail, bus } = mount({
+    state: { graph: withTheater(chatTheater()) },
+  });
+  const t = text(theaterEl(rail));
+  assert.match(t, /Kherson/);
+  assert.match(t, /Kherson, Ukraine/);
+  assert.match(t, /Set from chat at 14:01Z, approved by you/);
+  assert.match(t, /\d+\.\d × \d+\.\d km area/);
+  assert.match(t, /Home Grass strip/);
+  assert.match(t, /Geocoded by Photon \(OpenStreetMap\)/);
+  assert.doesNotMatch(t, /Preset theater/);
+  assert.doesNotMatch(t, /speed/, 'no speed line at ×1');
+  assert.match(t, /Sim running/);
+  assert.match(t, /Previous/);
+  // Show on map: an operator request over the theater's bbox.
+  byKey(rail.element, 'theater:map').fire('click');
+  assert.deepEqual(bus.last('map:request'), {
+    ids: ['thr:dyn-kherson-4f2a'],
+    bbox: [46.6089, 32.5783, 46.6629, 32.6563],
+    label: 'Kherson',
+    source: 'operator',
+    countdown: false,
+  });
+  // Previous is a chip that inspects the theater before this one.
+  byKey(rail.element, 'theater:previous').fire('click');
+  assert.deepEqual(bus.last('inspect'), { id: 'thr:default' });
+});
+
+test('rail: a preset theater reads "Preset theater", with no geocoder line', () => {
+  const preset = {
+    id: 'default',
+    label: 'Redmond (AirSim default)',
+    place: 'Redmond, Washington, USA',
+    known: true,
+    epoch: 0,
+    dynamic: false,
+    source: 'preset',
+    state: 'active',
+    bbox: [47.621468, -122.170165, 47.661468, -122.110165],
+    home: { lat: 47.641468, lon: -122.140165, name: null, source: 'preset' },
+    geocoder: 'Theater table',
+    set_via: 'boot',
+    previous: null,
+  };
+  const { rail } = mount({ state: { graph: withTheater(preset) } });
+  const t = text(theaterEl(rail));
+  assert.match(t, /Preset theater/);
+  assert.doesNotMatch(t, /Set from chat/);
+  assert.doesNotMatch(t, /Geocoded by/);
+  assert.doesNotMatch(t, /Previous/);
+  assert.match(
+    t,
+    /Home 47\.64147, -122\.1401[67]/,
+    'no home name: coordinates',
+  );
+  assert.ok(byKey(rail.element, 'theater:map'), 'Show on map is offered');
+});
+
+test('rail: the old picture without the new keys still renders, with no Show on map', () => {
+  const { rail } = mount();
+  const t = text(theaterEl(rail));
+  assert.match(t, /Redmond \(AirSim default\)/);
+  assert.doesNotMatch(t, /Preset theater|Set from chat|km area/);
+  assert.equal(byKey(rail.element, 'theater:map'), null);
+});
+
+test('rail: sim speed, sim-time durations and a non-default airframe in the Fleet caption', () => {
+  const g = withTheater(
+    chatTheater({
+      time_scale: 4,
+      airframe: {
+        id: 'group3_fixed_wing',
+        label: 'Fixed-wing, group 3',
+        reach_m: 62000,
+      },
+    }),
+  );
+  const { rail } = mount({ state: { graph: g } });
+  const all = text(rail.element);
+  assert.match(all, /Sim running at ×4 speed/);
+  const fleet = find(
+    rail.element,
+    (el) => el.attrs?.['data-section'] === 'fleet',
+  );
+  assert.match(text(fleet), /Fixed-wing, group 3/);
+  // The running mission's 110 s left is sim time: ≈ 28 s real at ×4.
+  assert.match(all, /≈ 1 min 50 s left in sim time \(≈ 28 s real\)/);
+});
+
+test('rail: the default airframe is not named; no speed feed still states the speed', () => {
+  const g = withTheater(chatTheater({ time_scale: 2.5 }));
+  g.nodes = g.nodes.filter((n) => n.id !== 'feed:sim');
+  const { rail } = mount({ state: { graph: g } });
+  const fleet = find(
+    rail.element,
+    (el) => el.attrs?.['data-section'] === 'fleet',
+  );
+  assert.doesNotMatch(text(fleet), /Quad, small electric/);
+  assert.match(text(rail.element), /Sim speed set to ×2\.5/);
+  assert.doesNotMatch(text(rail.element), /Sim running/);
+});
+
+test('rail: switching counts seconds, names the new theater once the block moves, and warns at 20 s', () => {
+  const { rail, store, clock } = mountClock({
+    graph: withTheater(chatTheater({ id: 'default', label: 'Redmond' })),
+  });
+  // The switch starts: the block still describes the theater being left.
+  store.change({
+    graph: withTheater(
+      chatTheater({ id: 'default', label: 'Redmond', state: 'switching' }),
+    ),
+  });
+  let t = text(theaterEl(rail));
+  assert.match(t, /Switching to the new theater… 0 s/);
+  assert.equal(theaterEl(rail).attrs['data-state'], 'switching');
+  clock.t += 5000;
+  store.change({
+    graph: withTheater(chatTheater({ state: 'switching', epoch: 4 })),
+  });
+  t = text(theaterEl(rail));
+  assert.match(t, /Switching to Kherson… 5 s/);
+  assert.doesNotMatch(t, /Still switching/);
+  clock.t += 16_000;
+  rail.render();
+  t = text(theaterEl(rail));
+  assert.match(t, /Switching to Kherson… 21 s/);
+  const warn = find(
+    theaterEl(rail),
+    (el) =>
+      text(el) === SWITCH_STUCK_TEXT && el.attrs?.['data-status'] === 'warn',
+  );
+  assert.ok(warn, 'the stuck line is in warn');
+  store.change({ graph: withTheater(chatTheater({ epoch: 4 })) });
+  t = text(theaterEl(rail));
+  assert.doesNotMatch(t, /Switching|Still switching/);
+  assert.equal(theaterEl(rail).attrs['data-state'], 'active');
+});
+
+test('rail: the title cross-fades only when the theater id or epoch changes', () => {
+  const { rail, store, clock } = mountClock({
+    graph: withTheater(chatTheater()),
+  });
+  const title = () => byCls(rail.element, 'ic-rail__theater')[0];
+  assert.equal(
+    hasCls(title(), 'is-changed'),
+    false,
+    'not on the first picture',
+  );
+  store.change({ graph: withTheater(chatTheater({ query: 'x' })) });
+  assert.equal(hasCls(title(), 'is-changed'), false, 'same id and epoch');
+  store.change({ graph: withTheater(chatTheater({ epoch: 9 })) });
+  assert.equal(hasCls(title(), 'is-changed'), true);
+  clock.t += 1000;
+  rail.render();
+  assert.equal(hasCls(title(), 'is-changed'), false, 'the fade is over');
+});
+
+test('rail: an integrity error is stated in critical', () => {
+  const { rail } = mount({
+    state: {
+      graph: withTheater(
+        chatTheater({ integrity_error: 'Origin moved but the sim disagreed.' }),
+      ),
+    },
+  });
+  const line = find(
+    theaterEl(rail),
+    (el) => text(el) === 'Origin moved but the sim disagreed.',
+  );
+  assert.equal(line?.attrs['data-status'], 'critical');
+});
+
+test('rail: XSS and bidi fixtures in the label, place and home render as text (§3.11)', () => {
+  const { rail } = mount({
+    state: {
+      graph: withTheater(
+        chatTheater({
+          label: XSS,
+          place: `${BIDI} ${XSS}`,
+          home: { lat: 46.6, lon: 32.6, name: XSS, source: 'operator' },
+          previous: { id: 'dyn-x', label: BIDI },
+        }),
+      ),
+    },
+  });
+  assert.equal(findAll(rail.element, (el) => el.tag === 'img').length, 0);
+  assert.equal(
+    findAll(rail.element, (el) =>
+      Object.keys(el.attrs || {}).some((k) => /^on/i.test(k)),
+    ).length,
+    0,
+  );
+  const t = text(theaterEl(rail));
+  assert.ok(t.includes(XSS), 'the literal angle-bracket text is visible');
+  assert.ok(t.includes(`Home ${XSS}`));
+  assert.doesNotMatch(t, BIDI_RE);
+  assert.match(t, /evil/);
+});
+
+test('theater words: set line, geocoder, area, home, switching, speed and sim time', () => {
+  const at = Date.UTC(2026, 8, 27, 14, 1, 40);
+  assert.equal(
+    theaterSetLine({ source: 'chat', set_via: 'console', set_at_ms: at }),
+    'Set from chat at 14:01Z, approved by you',
+  );
+  assert.equal(
+    theaterSetLine({ source: 'preset', set_via: 'console', set_at_ms: at }),
+    'Set from chat at 14:01Z, approved by you',
+    'a preset chosen in chat was still approved here',
+  );
+  assert.equal(
+    theaterSetLine({ source: 'preset', set_via: 'boot' }),
+    'Preset theater',
+  );
+  assert.equal(theaterSetLine({ dynamic: false }), 'Preset theater');
+  assert.equal(
+    theaterSetLine({ source: 'chat', set_via: 'mcp', set_at_ms: at }),
+    'Set by an MCP client at 14:01Z',
+  );
+  assert.equal(
+    theaterSetLine({ source: 'chat', set_via: 'boot' }),
+    'Set from chat before the last restart',
+  );
+  assert.equal(theaterSetLine({ source: 'chat' }), 'Set from chat');
+  assert.equal(theaterSetLine({ id: 'x' }), null, 'an old block: no line');
+  assert.equal(theaterSetLine(null), null);
+
+  assert.equal(
+    geocoderLine({ source: 'chat', geocoder: 'Nominatim (OpenStreetMap)' }),
+    'Geocoded by Nominatim (OpenStreetMap)',
+  );
+  assert.equal(
+    geocoderLine({ source: 'chat', geocoder: 'Coordinates' }),
+    'Placed from coordinates, not geocoded',
+  );
+  assert.equal(
+    geocoderLine({ source: 'preset', geocoder: 'Theater table' }),
+    null,
+  );
+
+  assert.equal(theaterAreaText({ half_extent_m: 2500 }), '5.0 × 5.0 km area');
+  assert.equal(theaterAreaText({}), null);
+  assert.equal(homeText({ name: `${BIDI}Field`, lat: 1, lon: 2 }), 'evilField');
+  assert.equal(homeText({ lat: 46.6, lon: 32.6 }), '46.60000, 32.60000');
+  assert.equal(homeText(null), '');
+
+  assert.equal(switchingText('Kherson'), 'Switching to Kherson…');
+  assert.equal(switchingText(null), 'Switching to the new theater…');
+
+  assert.equal(timeScaleOf({ time_scale: 1 }), null);
+  assert.equal(timeScaleOf({ time_scale: 4 }), 4);
+  assert.equal(timeScaleOf({ time_scale: 'x' }), null);
+  assert.equal(simDuration(660, 4), '11 min in sim time (≈ 2 min 45 s real)');
+  assert.equal(simDuration(660, 1), '11 min');
+  assert.equal(simDuration(null, 4), '');
+  assert.equal(simTimeSuffix(60, null), '');
+});
+
+test('fleetAirframe names only a non-default airframe, from the block or a vehicle', () => {
+  assert.equal(
+    fleetAirframe({
+      theater: { airframe: { id: DEFAULT_AIRFRAME_ID, label: 'Quad' } },
+    }),
+    null,
+  );
+  assert.deepEqual(
+    fleetAirframe({
+      theater: {},
+      nodes: [
+        {
+          type: 'vehicle',
+          attrs: {
+            airframe: { id: 'group3_fixed_wing', label: 'Fixed-wing, group 3' },
+          },
+        },
+      ],
+    }),
+    { id: 'group3_fixed_wing', label: 'Fixed-wing, group 3' },
+  );
+  assert.equal(fleetAirframe(null), null);
+});
+
+test('showOnMapRequest: a bbox, else a 1 km box on a point, else null', () => {
+  assert.deepEqual(
+    showOnMapRequest('thr:x', { bbox: [1, 2, 3, 4], label: BIDI }),
+    {
+      ids: ['thr:x'],
+      bbox: [1, 2, 3, 4],
+      label: 'evil',
+      source: 'operator',
+      countdown: false,
+    },
+  );
+  const pt = showOnMapRequest('sit:x', { lat: 46, lon: 32 });
+  assert.equal(pt.bbox.length, 4);
+  assert.ok(
+    pt.bbox[0] < 46 && pt.bbox[2] > 46 && pt.bbox[1] < 32 && pt.bbox[3] > 32,
+  );
+  assert.ok(Math.abs((pt.bbox[2] - pt.bbox[0]) * 111_320 - 1000) < 1);
+  assert.equal(pt.label, undefined);
+  assert.equal(
+    showOnMapRequest('sit:x', { bbox: [3, 2, 1, 4] }),
+    null,
+    'bad bbox, no point',
+  );
+  assert.equal(showOnMapRequest('sit:x', {}), null);
+});
+
+test('unknown types and sites in the kit: lilac, never green; sites are Pencil context', () => {
+  globalThis.document = stubDom();
+  const el = glyph('force', 'ok', 16);
+  assert.equal(el.attrs['data-type'], 'unknown');
+  assert.equal(el.attrs['data-status'], 'unknown');
+  assert.doesNotMatch(String(el.innerHTML), /#5DD39B/i, 'never the ok green');
+  assert.match(String(el.innerHTML), /#BBA7E0/i);
+  const site = glyph('site', 'ok', 16, undefined, { category: 'airfield' });
+  assert.equal(site.attrs['data-type'], 'site');
+  assert.doesNotMatch(String(site.innerHTML), /#5DD39B/i);
+  assert.equal(statusWord({ type: 'force', status: 'ok' }), 'Not assessed');
+  assert.equal(toneOf('force', 'ok'), 'unknown');
+  assert.equal(
+    statusWord({ type: 'site', status: 'ok' }),
+    'Mapped, not verified',
+  );
+  assert.equal(toneOf('site', 'critical'), 'neutral');
+  assert.equal(
+    displayLabel({ id: 'sit:x', type: 'site', label: BIDI }),
+    'evil',
   );
 });

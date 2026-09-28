@@ -29,6 +29,12 @@ keep it honest live here once:
     down (an empty list is not a negative finding), stale custody, the scope
     and dedupe arithmetic.
 
+WG v2 (A11) adds mapped OSM `site` nodes around the active theater
+(`intel_sites`, context only: no edge points at a site), the full §3.2
+theater block from the in-process server (which always wins, R22),
+`meta.theater_epoch` / `meta.overlay_rev` / `meta.sites`, and the map's
+`/intel/overlay` feed (`intel_overlay`).
+
 `build_graph` is PURE (inputs in, dict out) so it is exhaustively testable
 without a sim. `IntelService` gathers the inputs from the bridge's in-process
 state (`app.state.godseye`, bridge.py `_godseye_context`) and, when given one,
@@ -89,11 +95,12 @@ NOT_ASSESSED = "not assessed"
 THREAT_RANK = {"critical": 5, "high": 4, "moderate": 3, "low": 2, "none": 1}
 CONFIDENCE_RANK = {"confirmed": 3, "probable": 2, "possible": 1}
 
-#: Node type -> id prefix (CONTRACT §4 "Node types and ids").
+#: Node type -> id prefix (CONTRACT §4 "Node types and ids"). `site` is the
+#: mapped OSM context around the active theater (WG v2 §3.2, `intel_sites`).
 TYPE_PREFIX = {
     "vehicle": "veh", "mission": "msn", "track": "trk", "unit": "unit",
     "equipment": "ob", "report": "rpt", "theater": "thr", "poi": "poi",
-    "alarm": "alarm", "feed": "feed",
+    "alarm": "alarm", "feed": "feed", "site": "sit",
 }
 PREFIX_TYPE = {v: k for k, v in TYPE_PREFIX.items()}
 
@@ -151,6 +158,11 @@ class GraphInputs:
     threat_rings: dict = field(default_factory=dict)
     #: the bridge's `sim_state` string ("up", "down: ...", ...)
     sim_state: str | None = None
+    #: `theater_tools.theater_state(srv)` (the §3.2 theater block) when the
+    #: server is in-process, else None (WG v2 R22).
+    theater_state: dict | None = None
+    #: `srv.sites` (a `sites.SiteSet`) when the server is in-process, else None.
+    sites: Any = None
     #: sources that could not be read while gathering, as sentences
     source_errors: list[str] = field(default_factory=list)
     #: wall clock for staleness; None = now. Tests pin it.
@@ -504,6 +516,13 @@ class _GraphBuilder:
         self.report_rows: dict[str, dict] = {}
         self.alarm_rows: dict[str, dict] = {}
         self.feed_rows: dict[str, dict] = {}
+        # sites (intel_sites.add_site_nodes): drawn, every current one, meta
+        self.site_rows: dict[str, Any] = {}
+        self.site_index: dict[str, Any] = {}
+        self.sites_current: Any = None
+        self.meta_sites: dict = {}
+        #: caveats a context module adds (sites); `_caveats` places them
+        self.context_caveats: list[str] = []
         self.caveats: list[str] = []
         self.meta: dict = {}
         self.active: dict = {}
@@ -518,6 +537,8 @@ class _GraphBuilder:
 
     # ---- entry -------------------------------------------------------------
     def build(self) -> dict:
+        from . import intel_sites  # imports this module, so loaded on first build
+
         self._theaters()
         self._tracks()
         self._vehicle_nodes()
@@ -528,6 +549,7 @@ class _GraphBuilder:
         self._alarm_nodes()
         self._feed_nodes()
         self._edges()
+        intel_sites.add_site_nodes(self)
         self._caveats()
         counts: dict[str, int] = {}
         for n in self.nodes.values():
@@ -552,6 +574,9 @@ class _GraphBuilder:
                 ("ok", row.get("ok")), ("status", self.nodes[name]["status"]),
                 ("error", row.get("error")), ("at_ms", row.get("at_ms"))) if v is not None}
                 for name, row in self.feed_rows.items()},
+            "theater_epoch": self.theater_epoch(),
+            "overlay_rev": self.overlay_rev(),
+            "sites": self.meta_sites,
         }
         self.graph = {
             "schema": SCHEMA,
@@ -562,6 +587,8 @@ class _GraphBuilder:
             "edges": self.edges,
             "meta": self.meta,
         }
+        # sites give way first when the picture is over budget (WG v2 §3.2)
+        intel_sites.fit_sites_to_budget(self, GRAPH_TARGET_BYTES)
         return self.graph
 
     def resolve(self, entity_id: str) -> str | None:
@@ -572,12 +599,17 @@ class _GraphBuilder:
         if eid in self.alias:
             return self.alias[eid]
         if ":" not in eid:
-            for prefix in ("trk", "msn", "veh", "rpt", "thr", "ob", "feed", "alarm"):
+            for prefix in ("trk", "msn", "veh", "rpt", "thr", "ob", "feed", "alarm", "sit"):
                 cand = f"{prefix}:{eid}"
                 if cand in self.nodes:
                     return cand
                 if cand in self.alias:
                     return self.alias[cand]
+        elif eid.split(":", 1)[0] not in PREFIX_TYPE:
+            # a bare site id is `{theater_id}:{osm_type}/{osm_id}`
+            cand = f"{TYPE_PREFIX['site']}:{eid}"
+            if cand in self.nodes:
+                return cand
         return None
 
     # ---- theaters ------------------------------------------------------------
@@ -605,11 +637,43 @@ class _GraphBuilder:
     def _theater_block(self) -> dict:
         if not self.active_id:
             return {"id": None, "label": None, "place": None, "known": False,
-                    "reason": _s(self.active.get("reason")) or "no active theater was published"}
+                    "reason": _s(self.active.get("reason")) or "no active theater was published",
+                    **self._theater_extras()}
         row = self.theater_rows.get(self.active_id, {})
         return {"id": self.active_id,
                 "label": _s(self.active.get("label")) or _s(row.get("label")) or self.active_id,
-                "place": _s(row.get("place")) or None, "known": True}
+                "place": _s(row.get("place")) or None, "known": True,
+                **self._theater_extras()}
+
+    def _theater_extras(self) -> dict:
+        """The WG v2 §3.2 keys past `{id,label,place,known}`: the in-process
+        server's `theater_state` for the same theater (R22), else `epoch` and
+        `dynamic` from the bridge's copy of uav://safety/geofence."""
+        base = ("id", "label", "place", "known", "reason")
+        st = _d(self.inp.theater_state)
+        if st and (st.get("id") or None) == self.active_id:
+            out = {k: v for k, v in st.items() if k not in base}
+            row = _d(self.theater_rows.get(self.active_id)) if self.active_id else {}
+            if self.active_id and not _s(row.get("place")) and _s(st.get("place")):
+                out["place"] = st["place"]      # a row this bridge's table lacks
+            return out
+        fence = _d(_d(self.inp.geofence).get("theater"))
+        if self.active_id and _s(fence.get("id")) == self.active_id:
+            return {k: fence[k] for k in ("epoch", "dynamic") if k in fence}
+        return {}
+
+    def theater_epoch(self) -> int | None:
+        """The running theater's switch counter, or None when unknown."""
+        epoch = self._theater_extras().get("epoch")
+        return epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
+
+    def overlay_rev(self, *, truth: bool = False) -> str:
+        """`/intel/overlay`'s `rev` for the picture this graph was built from."""
+        from .intel_overlay import overlay_rev
+        from .intel_sites import fetched_at_ms
+
+        return overlay_rev(self.theater_epoch() or 0, fetched_at_ms(self.sites_current) or 0,
+                           0, truth)
 
     # ---- tracks --------------------------------------------------------------
     def _tracks(self) -> None:
@@ -762,7 +826,14 @@ class _GraphBuilder:
                        "track_id": _s(row.get("track_id")) or None,
                        "stale_ms": stale_ms or None,
                        "datum_degraded": True if row.get("datum_degraded") else None,
-                       "lost_link": lost_link}))
+                       "lost_link": lost_link, "airframe": self._airframe()}))
+
+    def _airframe(self) -> dict | None:
+        """`{id, label}` of the airframe the server prices every drone as (D5)."""
+        af = _d(_d(self.inp.theater_state).get("airframe"))
+        if not _s(af.get("id")):
+            return None
+        return {"id": _s(af.get("id")), "label": _s(af.get("label")) or None}
 
     def _lost_link(self, status_x: dict) -> dict | None:
         """The lost-link plan this vehicle would fly (CONTRACT §10.4), or None.
@@ -942,15 +1013,19 @@ class _GraphBuilder:
             rd = _d(row.get("real_data"))
             status = ("warn" if active and mismatch else "ok") if active else "ok"
             label = (_s(self.active.get("label")) if active else "") or _s(row.get("label")) or tid
+            attrs = {"active": active, "place": _s(row.get("place")) or None,
+                     "in_table": bool(row), "real_data": rd.get("hydrated"),
+                     "theater_mismatch": True if active and mismatch else None,
+                     "out_of_theater": outside}
+            if active:   # the §3.2 block's keys, also on the active node (WG v2)
+                attrs = {**self._theater_block(),
+                         **{k: v for k, v in attrs.items() if v is not None}}
             self._add(_node(
                 f"thr:{tid}", "theater", label,
                 subtitle=(_s(row.get("place")) + (" · active" if active else "")).strip(" ·"),
                 group="theater", salience=0.95 if active else 0.25, status=status,
                 ts_ms=_int(self.active.get("at_ms")) if active else None, lat=lat, lon=lon,
-                attrs={"active": active, "place": _s(row.get("place")) or None,
-                       "in_table": bool(row), "real_data": rd.get("hydrated"),
-                       "theater_mismatch": True if active and mismatch else None,
-                       "out_of_theater": outside}))
+                attrs=attrs))
             for p in _l(row.get("pois")):
                 name = _s(_d(p).get("name"))
                 plat, plon = _num(_d(p).get("lat")), _num(_d(p).get("lon"))
@@ -1198,6 +1273,7 @@ class _GraphBuilder:
         if self.active.get("theater_mismatch"):
             out.append("The server reports a theater mismatch: its enforced envelope belongs to "
                        "a different theater than its theater row.")
+        out.extend(self.context_caveats)          # mapped sites (intel_sites)
         if self.out_of_theater_raw:
             out.append(f"{self.out_of_theater_raw} track(s) ({self.out_of_theater_contacts} "
                        "contact(s)) from other theaters' runs are hidden in theater scope; "
@@ -1363,6 +1439,8 @@ def _normalise_types(types: Iterable[str] | None) -> set[str] | None:
             out.add("track")
         elif t in ("ob", "ob_class", "class"):
             out.add("equipment")
+        elif t in ("place", "places"):        # the console's Places filter (WG v2)
+            out |= {"theater", "poi", "site"}
     return out or None
 
 
@@ -1458,6 +1536,13 @@ def search_nodes(graph: dict, query: str, types: Iterable[str] | None = None,
 #: `active.source` when the theater came from the in-process server rather
 #: than the bridge's copy of uav://safety/geofence.
 SERVER_THEATER_SOURCE = "in-process server (theater block of uav://safety/geofence)"
+#: `theaters.DYNAMIC_PREFIX`, mirrored (this module imports theaters lazily).
+_DYNAMIC_ID_PREFIX = "dyn-"
+#: A chat theater's `real_data` in the inspector: the static table's
+#: "hand-entered anchors" note is not true of it (review A, ui).
+CHAT_THEATER_REAL_DATA_NOTE = (
+    "not hydrated with real data; the area, home and ground height come from the "
+    "approved chat proposal, and the ground row says how that height was found")
 
 
 def _server_active_theater(srv: Any, now_ms: int | None) -> dict | None:
@@ -1476,6 +1561,14 @@ def _server_active_theater(srv: Any, now_ms: int | None) -> dict | None:
         block, source=SERVER_THEATER_SOURCE,
         at_ms=int(now_ms if now_ms is not None else time.time() * 1000),
         theater_mismatch=getattr(srv, "theater_mismatch", None))
+
+
+def _server_theater_state(srv: Any) -> dict:
+    """`theater_tools.theater_state(srv)`, the §3.2 block (WG v2 R22). The
+    module duck-types `srv` and never imports `server.py`."""
+    from . import theater_tools
+
+    return theater_tools.theater_state(srv)
 
 
 def _call(ctx: Any, name: str, *args: Any) -> Any:
@@ -1558,16 +1651,20 @@ class IntelService:
 
     def _gather_server(self, inp: GraphInputs, attempt: Callable) -> None:
         srv = self.server
-        if not _d(inp.active_theater).get("known"):
-            # The bridge learns the theater from loop C's first read of
-            # uav://safety/geofence, so right after boot (and in any host whose
-            # loops are not running) it is honestly unknown. The in-process
-            # server IS the authority that resource reports, so ask it
-            # directly - same block, same checks, a source that says so.
-            active = attempt("in-process theater",
-                             lambda: _server_active_theater(srv, inp.now_ms))
-            if isinstance(active, dict) and active.get("known"):
-                inp.active_theater = active
+        # The in-process server IS the authority uav://safety/geofence
+        # reports, so its theater always wins (WG v2 R22): the bridge's copy
+        # is unknown until loop C's first read and lags a runtime switch by
+        # up to one re-read. Same block, same checks, a source that says so.
+        # A server with no theater is not guessed: the bridge block stays.
+        # `at_ms`: when that theater was set (a runtime switch), else now.
+        set_at = _int(getattr(srv, "theater_set_at_ms", None))
+        active = attempt("in-process theater",
+                         lambda: _server_active_theater(srv, set_at or inp.now_ms))
+        if isinstance(active, dict) and active.get("known"):
+            inp.active_theater = active
+        state = attempt("in-process theater state", lambda: _server_theater_state(srv))
+        inp.theater_state = state if isinstance(state, dict) else None
+        inp.sites = getattr(srv, "sites", None)
         reports = attempt("reports", lambda: _copy_mapping(getattr(srv, "reports", None)))
         inp.reports = reports if isinstance(reports, dict) else {}
         rd = attempt("real-data status", srv.real_data_status) \
@@ -1627,6 +1724,19 @@ class IntelService:
 
     def graph(self, scope: str = "theater") -> dict:
         return self._builder(scope).graph
+
+    def invalidate(self) -> None:
+        """Drop every cached graph (the host's theater listener calls this
+        after a switch, so no read serves the old theater for up to a TTL)."""
+        with self._lock:
+            self._cache.clear()
+
+    # ---- overlay ---------------------------------------------------------------
+    def overlay(self, *, truth: bool = False, rev: str | None = None) -> dict:
+        """`GET /intel/overlay` (WG v2 §3.3): the map's context features."""
+        from .intel_overlay import build_overlay
+
+        return build_overlay(self.server, truth=truth, rev=rev)
 
     # ---- search ----------------------------------------------------------------
     def search(self, query: str, types: list[str] | None = None,
@@ -1737,17 +1847,25 @@ class IntelService:
         or a collapsed duplicate's id is still inspectable (a duplicate id
         resolves to the contact it was folded into, and says so).
         """
+        from . import intel_sites
+
         b = self._builder("all")
         nid = b.resolve(entity_id)
         if nid is None:
-            return None
-        node = b.nodes[nid]
+            # a mapped site past the graph's 60-node cap (the map draws more)
+            node = intel_sites.offgraph_node(b, entity_id)
+            if node is None:
+                return None
+            nid = node["id"]
+        else:
+            node = b.nodes[nid]
         builder = {
             "track": self._track_entity, "vehicle": self._vehicle_entity,
             "mission": self._mission_entity, "theater": self._theater_entity,
             "poi": self._poi_entity, "unit": self._unit_entity,
             "equipment": self._equipment_entity, "report": self._report_entity,
             "alarm": self._alarm_entity, "feed": self._feed_entity,
+            "site": intel_sites.site_entity,
         }[node["type"]]
         fields, provenance, raw = builder(b, nid, node)
         related = []
@@ -1946,13 +2064,25 @@ class IntelService:
         fields = {"id": tid, **row, "active": active,
                   "active_block": b.active if active else None,
                   "envelope": envelope or None}
+        # A chat theater has a row too (the registry lists it after the
+        # table), so "a row exists" is not "from the static table"; and the
+        # envelope follows every switch, so it names the epoch it was read at
+        # (review A, ui).
+        dynamic = row.get("dynamic") is True or tid.startswith(_DYNAMIC_ID_PREFIX)
+        real_data = row.get("real_data")
+        if dynamic and not _d(real_data).get("hydrated"):
+            real_data = {"hydrated": False, "real": False, "note": CHAT_THEATER_REAL_DATA_NOTE}
+        epoch = _d(fence.get("theater")).get("epoch")
+        epoch = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None
         provenance = {
-            "table": "theaters.py static table" if row else "not in this build's table",
+            "table": ("not in this build's table" if not row
+                      else "set from chat (not in the static table)" if dynamic
+                      else "theaters.py static table"),
             "active_source": _s(b.active.get("source")) or None if active else None,
             "active_learned_at_ms": _int(b.active.get("at_ms")) if active else None,
-            "real_data": row.get("real_data"),
-            "envelope_source": "uav://safety/geofence (read once at boot)" if envelope
-            else None,
+            "real_data": real_data,
+            "envelope_source": None if not envelope else "uav://safety/geofence" if epoch is None
+            else f"uav://safety/geofence (theater epoch {epoch})",
         }
         return fields, provenance, None
 
@@ -2062,7 +2192,8 @@ class IntelService:
 # ---------------------------------------------------------------------------
 
 def intel_router(service: IntelService, auth: Callable) -> Any:
-    """GET /intel/graph, /intel/entity/{id}, /intel/events/recent (CONTRACT §3).
+    """GET /intel/graph, /intel/entity/{id}, /intel/events/recent (CONTRACT §3)
+    and /intel/overlay (WG v2 §3.3).
 
     `auth` is a FastAPI dependency (the host's bearer check). Handlers are
     sync `def`s so graph building runs in the threadpool, never on the loop
@@ -2093,5 +2224,17 @@ def intel_router(service: IntelService, auth: Callable) -> Any:
     @router.get("/events/recent")
     def intel_events(limit: int = 50):
         return {"events": service.recent_events(max(1, min(int(limit), 100)))}
+
+    @router.get("/overlay")
+    def intel_overlay(truth: str = "0", rev: str | None = None):
+        """WG v2 §3.3: the map's context features; `{rev, unchanged}` when
+        `rev` is still current (the map polls every 3 s)."""
+        from .intel_overlay import parse_truth
+
+        flag = parse_truth(truth)
+        if flag is None:
+            return JSONResponse({"error": "invalid_truth", "allowed": ["0", "1"]},
+                                status_code=422)
+        return service.overlay(truth=flag, rev=rev)
 
     return router

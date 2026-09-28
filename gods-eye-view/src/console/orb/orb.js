@@ -3,12 +3,19 @@
  *
  *   createOrb(canvas, {onSelect, onHover, a11yHost?, onInput?, onAction?, onNotice?, env?})
  *     → { setGraph, highlight, filter, focus, select, resize, destroy, project,
- *         onFrame, setViewport, snapshot, setOptions, reveal, … }
+ *         onFrame, setViewport, snapshot, setOptions, reveal, reframe, … }
  *
  * Default view: the first real picture, and every reset (double-click on
  * empty space, Home), frames the populated latitudes (framingOrientation).
  * After that the orb never turns itself except as the spec allows (select
- * easing, analyst focus, idle rotation).
+ * easing, analyst focus, idle rotation, and the theater transition's
+ * reframe(), which waits for 3 s without stage input and nothing selected,
+ * focused or filtered: WG spec §4.2.4).
+ *
+ * A theater change (intelStore `diff.theaterChanged`, or a new
+ * `graph.theater` id or epoch) is one event: no per-item ripples or arrival
+ * notices, one ripple on the new theater (which takes the pole), and one
+ * `onNotice({kind:'theater', text, holdMs, announce:'polite', …})` caption.
  *
  * Render on demand: a dirty flag drives requestAnimationFrame, which keeps
  * running only while the camera eases, a ripple plays, a node fades, or the
@@ -40,7 +47,14 @@ import {
   pullWithin,
   quatSlerp,
 } from './camera.js';
-import { COLORS, missionPhaseClass, statusColor, statusKey } from './glyphs.js';
+import {
+  COLORS,
+  isKnownType,
+  missionPhaseClass,
+  statusColor,
+  statusKey,
+} from './glyphs.js';
+import { safeText, siteCategory, theaterChangedText } from './placeText.js';
 import { computeLayout, toVector } from './layout.js';
 import {
   MARGIN_LABEL_MAX,
@@ -76,6 +90,10 @@ export const ORB_TIMING = Object.freeze({
   rippleGap: 400,
   idleAfter: 30_000,
   idleFrame: 1000 / 30,
+  /** reframe() waits this long after the last stage input (WG §4.2.4). */
+  reframeQuiet: 3_000,
+  /** The theater-change caption stays up to this long. */
+  theaterCaption: 20_000,
 });
 export const IDLE_DEG_PER_S = 2;
 export const LABEL_BUDGETS = Object.freeze({ wide: 12, compact: 6, narrow: 4 });
@@ -281,6 +299,74 @@ const NOT_LIVE = new Set(['stale', 'offline', 'unauthorized']);
 /** Whether an orb `pictureStatus` means the picture is not live. */
 export function pictureNotLive(status) {
   return NOT_LIVE.has(status);
+}
+
+/** A theater reference ({id, epoch, label} or a bare id) as an object. */
+function theaterRef(value) {
+  if (typeof value === 'string' && value) return { id: value };
+  if (value && typeof value === 'object' && typeof value.id === 'string')
+    return value;
+  return null;
+}
+
+/**
+ * The theater change a graph update carries (WG §4.2.4): intelStore's
+ * `diff.theaterChanged = {from, to}` when the store says (null when it says
+ * nothing changed); otherwise derived from `graph.theater` id and epoch.
+ * @returns {{from: object|null, to: object}|null}
+ */
+export function theaterChangeOf(diff, prevGraph, nextGraph) {
+  if (diff && typeof diff === 'object' && 'theaterChanged' in diff) {
+    const given = diff.theaterChanged;
+    const to = theaterRef(given?.to) ?? theaterRef(nextGraph?.theater);
+    return given && to ? { from: theaterRef(given.from), to } : null;
+  }
+  const a = theaterRef(prevGraph?.theater);
+  const b = theaterRef(nextGraph?.theater);
+  if (!a || !b) return null;
+  const epoch = (t) => (Number.isFinite(t.epoch) ? t.epoch : null);
+  if (a.id === b.id && epoch(a) === epoch(b)) return null;
+  return { from: a, to: b };
+}
+
+/**
+ * The orb node for the theater a change moved to: `thr:{to.id}` when that is
+ * in the picture, else the active theater node, else null.
+ * @param {{to: {id: string}}|null} change
+ * @param {object[]} nodes graph nodes
+ */
+export function theaterNodeId(change, nodes) {
+  const list = Array.isArray(nodes) ? nodes : [];
+  const raw = change?.to?.id;
+  if (typeof raw === 'string' && raw) {
+    const id = raw.startsWith('thr:') ? raw : `thr:${raw}`;
+    if (list.some((node) => node?.id === id)) return id;
+  }
+  const active = list.find(
+    (node) => node?.type === 'theater' && node?.attrs?.active === true,
+  );
+  return active ? active.id : null;
+}
+
+/**
+ * The site band's caption numbers (WG §4.2.6): drawn on the orb, omitted
+ * (fetched but not drawn: capped out of the graph or sector overflow), and
+ * whether the map data feed is degraded.
+ * @param {object} graph the intel graph (reads `meta.sites`)
+ * @param {object} layout computeLayout() result
+ */
+export function siteBandState(graph, layout) {
+  const meta = graph?.meta?.sites;
+  const inGraph = layout?.counts?.site || 0;
+  const drawn = Math.max(0, inGraph - (layout?.overflow?.site || 0));
+  const total = Number.isFinite(meta?.total)
+    ? Math.max(meta.total, inGraph)
+    : inGraph;
+  return {
+    count: drawn,
+    omitted: Math.max(0, total - drawn),
+    degraded: meta?.degraded === true,
+  };
 }
 
 /** Whether the graph says the detections (contacts) feed is down. */
@@ -690,9 +776,18 @@ export function createOrb(canvas, options = {}) {
     const offline = pictureNotLive(opts.pictureStatus);
     const now = t0();
     const previous = new Map(state.vms.map((vm) => [vm.id, vm]));
-    state.vms = layout.nodes.map((node) => {
+    state.vms = layout.nodes.map((node, index) => {
       const type = String(node.type || '');
-      const status = offline ? 'stale' : statusKey(node.status);
+      const known = isKnownType(type);
+      // Fail-safe (WG §4.2.1): an unknown type's status is ignored, so it
+      // never rings, halos or reads green; a site's status is ignored too.
+      const status = offline
+        ? 'stale'
+        : !known
+          ? 'unknown'
+          : type === 'site'
+            ? 'ok'
+            : statusKey(node.status);
       const phase = node.attrs?.phase;
       const conf =
         type === 'track' ? confidenceKey(node.attrs?.confidence) : '';
@@ -700,7 +795,9 @@ export function createOrb(canvas, options = {}) {
         type === 'track' &&
         (Number(node.attrs?.duplicate_count) > 0 ||
           (node.attrs?.duplicates?.length ?? 0) > 0);
-      const spec = { type, status, phase, conf, dup };
+      const category = type === 'site' ? siteCategory(node) : undefined;
+      const spec = { type, status, phase, conf, dup, category };
+      const glyphKey = !known ? '?' : category ? `site:${category}` : type;
       const style =
         type === 'mission'
           ? offline
@@ -717,7 +814,7 @@ export function createOrb(canvas, options = {}) {
         type,
         status,
         spec,
-        spriteKey: `${type}|${status}|${type === 'mission' ? missionPhaseClass(phase) : ''}|${conf}|${dup ? 1 : 0}`,
+        spriteKey: `${glyphKey}|${status}|${type === 'mission' ? missionPhaseClass(phase) : ''}|${conf}|${dup ? 1 : 0}`,
         color: style,
         critical: status === 'critical',
         label: truncate(nodeLabel(node), 32),
@@ -737,6 +834,7 @@ export function createOrb(canvas, options = {}) {
         fromR: prev ? prev.r : r,
         r,
         isNew: isNew(node.id, now),
+        hidden: Boolean(layout.hidden?.[index]),
         alpha: 1,
         sizeFactor: 1,
         ring: 0,
@@ -796,6 +894,9 @@ export function createOrb(canvas, options = {}) {
       }
       // Criticals are never dimmed below 40 % (spec §4.3).
       if (vm.critical) alpha = Math.max(alpha, 0.4);
+      // Site-band overflow is counted, not drawn, until something points at
+      // it (a search pick, a chip, the analyst): then it shows in place.
+      if (vm.hidden && !ring) alpha = 0;
       vm.alpha = alpha;
       vm.sizeFactor = sizeFactor;
       vm.ring = ring;
@@ -1132,6 +1233,7 @@ export function createOrb(canvas, options = {}) {
     const allCaptions = bandCaptions(layout.counts, {
       recent,
       detectionsDown: state.detectionsDown,
+      sites: siteBandState(state.graph, layout),
     });
     const captions =
       R >= 160
@@ -1410,6 +1512,54 @@ export function createOrb(canvas, options = {}) {
     return framingOrientation(state.layout, camera.rest());
   }
 
+  /**
+   * Whether the orb may turn itself (WG §4.2.4): no stage input in the last
+   * 3 s, no drag, and nothing selected, focused or filtered.
+   */
+  function mayReframe(now = t0()) {
+    return (
+      now - state.lastInputAt >= ORB_TIMING.reframeQuiet &&
+      !drag &&
+      state.selected == null &&
+      !state.focus &&
+      !state.filter
+    );
+  }
+
+  /**
+   * The theater transition (WG §4.2.4): one ripple on the new theater (a
+   * static ring under reduced motion), a re-frame when the operator is not
+   * using the orb, and the caption "Theater changed to {label}. {n} items
+   * arrived." for the shell to show (up to 20 s, with Show on map when the
+   * port can) and announce politely.
+   */
+  function theaterTransition(change, added, now) {
+    const id = theaterNodeId(change, state.graph.nodes);
+    const i = indexOf(id);
+    if (i >= 0) addRipple(id, state.vms[i].color, now);
+    const reframed = orb.reframe();
+    const label =
+      change.to?.label ||
+      (state.graph?.theater?.id === change.to?.id
+        ? state.graph.theater.label
+        : null) ||
+      (i >= 0 ? state.vms[i].fullLabel : null) ||
+      change.to?.id;
+    const count = added.filter((a) => a !== id).length;
+    onNotice?.({
+      kind: 'theater',
+      count,
+      ids: id ? [id] : [],
+      text: theaterChangedText(label, count),
+      label: safeText(label, 80),
+      from: change.from ?? null,
+      to: change.to,
+      holdMs: ORB_TIMING.theaterCaption,
+      announce: 'polite',
+      reframed,
+    });
+  }
+
   /** Double-click on empty space and Home: ease back to the default view. */
   function resetView() {
     startCameraTween(homeOrientation(), 1, ORB_TIMING.camera, easeOut);
@@ -1615,6 +1765,7 @@ export function createOrb(canvas, options = {}) {
       const animateChanges = prevLayout.n > 0;
       const prevStatus = new Map(state.vms.map((vm) => [vm.id, vm.status]));
       const prevVms = new Map(state.vms.map((vm) => [vm.id, vm]));
+      const prevGraph = state.graph;
       state.graph =
         graph && typeof graph === 'object' ? graph : { nodes: [], edges: [] };
       state.layout = computeLayout(state.graph, prevLayout);
@@ -1672,68 +1823,77 @@ export function createOrb(canvas, options = {}) {
             });
           }
         }
-        // Status changes: one ring in the new colour.
-        for (const vm of state.vms) {
-          const before = prevStatus.get(vm.id);
-          if (
-            before &&
-            before !== vm.status &&
-            !pictureNotLive(opts.pictureStatus)
-          )
-            addRipple(vm.id, vm.color, now);
-        }
-        // Arrivals.
-        if (added.length) {
+        const change = theaterChangeOf(diff, prevGraph, state.graph);
+        if (change) {
+          // A theater change (WG §4.2.4) is one event: no per-item ripples
+          // or arrival notices, just the transition and its caption.
           for (const id of added) state.newAt.set(id, now);
-          state.arrivals = state.arrivals.filter(
-            (at) => now - at < ORB_TIMING.batchWindow,
-          );
-          for (let k = 0; k < added.length; k += 1) state.arrivals.push(now);
-          const batched = state.arrivals.length > 3;
-          if (batched) {
-            const perSector = new Map();
-            for (const id of added) {
-              const i = layout.index.get(id);
-              const key =
-                layout.band[i] === 'track'
-                  ? `s${layout.sector[i]}`
-                  : layout.band[i];
-              if (!perSector.has(key)) perSector.set(key, id);
-            }
-            for (const id of perSector.values())
-              addRipple(id, state.vms[layout.index.get(id)].color, now);
-            const contacts = added.filter(
-              (id) => layout.band[layout.index.get(id)] === 'track',
-            ).length;
-            onNotice?.({
-              kind: 'batch',
-              count: state.arrivals.length,
-              ids: added.slice(),
-              text:
-                contacts === added.length
-                  ? `${state.arrivals.length} new contacts`
-                  : `${state.arrivals.length} new entities`,
-            });
-          } else {
-            const behind = [];
-            for (const id of added) {
-              const i = layout.index.get(id);
-              addRipple(id, state.vms[i].color, now);
-              if (camera.project(posOf(i)).z < 0) {
-                state.behind.set(id, now);
-                behind.push(id);
+          for (const vm of state.vms) vm.isNew = isNew(vm.id, now);
+          theaterTransition(change, added, now);
+        } else {
+          // Status changes: one ring in the new colour.
+          for (const vm of state.vms) {
+            const before = prevStatus.get(vm.id);
+            if (
+              before &&
+              before !== vm.status &&
+              !pictureNotLive(opts.pictureStatus)
+            )
+              addRipple(vm.id, vm.color, now);
+          }
+          // Arrivals.
+          if (added.length) {
+            for (const id of added) state.newAt.set(id, now);
+            state.arrivals = state.arrivals.filter(
+              (at) => now - at < ORB_TIMING.batchWindow,
+            );
+            for (let k = 0; k < added.length; k += 1) state.arrivals.push(now);
+            const batched = state.arrivals.length > 3;
+            if (batched) {
+              const perSector = new Map();
+              for (const id of added) {
+                const i = layout.index.get(id);
+                const key =
+                  layout.band[i] === 'track'
+                    ? `s${layout.sector[i]}`
+                    : layout.band[i];
+                if (!perSector.has(key)) perSector.set(key, id);
+              }
+              for (const id of perSector.values())
+                addRipple(id, state.vms[layout.index.get(id)].color, now);
+              const contacts = added.filter(
+                (id) => layout.band[layout.index.get(id)] === 'track',
+              ).length;
+              onNotice?.({
+                kind: 'batch',
+                count: state.arrivals.length,
+                ids: added.slice(),
+                text:
+                  contacts === added.length
+                    ? `${state.arrivals.length} new contacts`
+                    : `${state.arrivals.length} new entities`,
+              });
+            } else {
+              const behind = [];
+              for (const id of added) {
+                const i = layout.index.get(id);
+                addRipple(id, state.vms[i].color, now);
+                if (camera.project(posOf(i)).z < 0) {
+                  state.behind.set(id, now);
+                  behind.push(id);
+                }
+              }
+              if (behind.length) {
+                onNotice?.({
+                  kind: 'new_behind',
+                  count: behind.length,
+                  ids: behind,
+                  text: `${behind.length} new behind`,
+                });
               }
             }
-            if (behind.length) {
-              onNotice?.({
-                kind: 'new_behind',
-                count: behind.length,
-                ids: behind,
-                text: `${behind.length} new behind`,
-              });
-            }
+            for (const vm of state.vms) vm.isNew = isNew(vm.id, now);
           }
-          for (const vm of state.vms) vm.isNew = isNew(vm.id, now);
         }
       }
       for (const id of removed) {
@@ -1806,6 +1966,19 @@ export function createOrb(canvas, options = {}) {
       applyState();
       invalidate();
       return moved;
+    },
+    /**
+     * Ease to the default view (the populated latitudes, north up, the
+     * theater on the pole) over --ic-t-travel; instant under reduced motion.
+     * Only when the operator is not using the orb (no stage input in the
+     * last 3 s, nothing selected, focused or filtered) unless `force`.
+     * @returns {boolean} whether the camera moves
+     */
+    reframe({ force = false } = {}) {
+      if (state.destroyed || state.layout.n === 0) return false;
+      if (!force && !mayReframe()) return false;
+      startCameraTween(homeOrientation(), 1, ORB_TIMING.travel, easeInOutCubic);
+      return true;
     },
     /** Rotate the given entities' centroid to the front without changing focus. */
     reveal(ids, { duration = ORB_TIMING.travel } = {}) {

@@ -616,7 +616,7 @@ function stubComponents(log) {
     createInspector(host) {
       log.inspectorHost = host;
       let cur = null;
-      return {
+      return (log.inspector = {
         show: (id) => {
           cur = id;
           log.calls.push(['inspector.show', id]);
@@ -628,7 +628,7 @@ function stubComponents(log) {
         current: () => cur,
         setLayout: record('inspector.setLayout'),
         destroy: record('inspector.destroy'),
-      };
+      });
     },
     createSituation(host) {
       log.railHost = host;
@@ -1784,4 +1784,545 @@ test('analystUnavailableCopy covers the provider reasons', () => {
     analystUnavailableCopy({ reason: 'sdk_missing' }).action,
     undefined,
   );
+});
+
+// ---- map overview (WG spec §4.2.3, §4.2.4, §4.2.7) --------------------------------------
+
+test('createPortProxy: the map methods degrade when the port has none', async () => {
+  const bare = createPortProxy({ enter: async () => true });
+  assert.equal(bare.supports('showArea'), false);
+  assert.equal(await bare.showArea({ bbox: [0, 0, 1, 1] }), false);
+  assert.equal(bare.enterOverview(), undefined);
+  assert.equal(bare.exitOverview(), undefined);
+  assert.equal(bare.setOverlayVisibility({ sites: true }), undefined);
+  assert.equal(bare.overlayStats(), null);
+  const off = bare.onPick(() => {});
+  assert.equal(typeof off, 'function');
+  off();
+  const none = createPortProxy(null);
+  assert.equal(none.supports('showArea'), false);
+  assert.equal(await none.showArea({ bbox: [0, 0, 1, 1] }), false);
+  none.enterOverview();
+  none.destroy();
+});
+
+test('createPortProxy forwards the map methods, picks and a late port', async () => {
+  const calls = [];
+  let pickCb = null;
+  const full = createPortProxy({
+    showArea: async (t, o) => {
+      calls.push(['showArea', t, o]);
+      return true;
+    },
+    enterOverview: () => calls.push(['enterOverview']),
+    exitOverview: () => calls.push(['exitOverview']),
+    setOverlayVisibility: (v) => calls.push(['vis', v]),
+    overlayStats: () => ({ sites: { drawn: 3, total: 4 } }),
+    onPick: (cb) => {
+      pickCb = cb;
+      return () => {
+        pickCb = null;
+      };
+    },
+  });
+  assert.equal(full.supports('showArea'), true);
+  assert.equal(full.supports('onPick'), true);
+  assert.equal(full.supports('launchMissiles'), false);
+  assert.equal(
+    await full.showArea({ bbox: [1, 2, 3, 4] }, { animate: false }),
+    true,
+  );
+  full.enterOverview();
+  full.exitOverview();
+  full.setOverlayVisibility({ sites: false });
+  assert.deepEqual(calls, [
+    ['showArea', { bbox: [1, 2, 3, 4] }, { animate: false }],
+    ['enterOverview'],
+    ['exitOverview'],
+    ['vis', { sites: false }],
+  ]);
+  assert.deepEqual(full.overlayStats(), { sites: { drawn: 3, total: 4 } });
+  const picks = [];
+  full.onPick((p) => picks.push(p));
+  pickCb({ id: 'sit:x:node/1' });
+  assert.deepEqual(picks, [{ id: 'sit:x:node/1' }]);
+  full.destroy();
+  assert.equal(pickCb, null, 'destroy unsubscribes from the port');
+
+  // The port's own supports() wins (the deferred port knows its real one).
+  const own = createPortProxy({ supports: (n) => n === 'showArea' });
+  assert.equal(own.supports('showArea'), true);
+  assert.equal(own.supports('onPick'), false);
+  // showArea waits for a port that arrives late; false from it is false.
+  let resolve;
+  const late = createPortProxy(new Promise((r) => (resolve = r)));
+  assert.equal(late.supports('showArea'), false);
+  const pending = late.showArea({ bbox: [1, 2, 3, 4] });
+  resolve({ showArea: async () => false });
+  assert.equal(await pending, false);
+  assert.equal(late.supports('showArea'), true);
+});
+
+test("createPortProxy reads GEV's overlayStatus() for the dock counts", () => {
+  const status = { sites: { drawn: 150, total: 212, served: 212 } };
+  const gev = createPortProxy({ overlayStatus: () => status });
+  assert.deepEqual(gev.overlayStats(), status);
+  const idle = createPortProxy({ overlayStatus: () => null });
+  assert.equal(idle.overlayStats(), null);
+});
+
+const THEATER_BBOX = [12.9491, 77.5715, 12.9941, 77.6176];
+
+function theaterGraph(label = 'Bengaluru centre', { sites = 41 } = {}) {
+  return graphWith(
+    [
+      {
+        id: 'thr:dyn-blr',
+        type: 'theater',
+        label,
+        attrs: { active: true, bbox: THEATER_BBOX },
+      },
+      { id: 'veh:Drone1', type: 'vehicle', label: 'Drone1', attrs: {} },
+    ],
+    {
+      theater: { id: 'dyn-blr', label, epoch: 1, bbox: THEATER_BBOX },
+      meta: { counts: { track: 0 }, sites: { total: sites } },
+    },
+  );
+}
+
+function mapPort() {
+  const port = trackingPort();
+  const pickCbs = new Set();
+  return Object.assign(port, {
+    showArea: async (target, opts) => {
+      port.calls.push(`area:${target.bbox.join(',')}:${opts?.animate}`);
+      return true;
+    },
+    enterOverview: () => port.calls.push('overview:on'),
+    exitOverview: () => port.calls.push('overview:off'),
+    setOverlayVisibility: (v) => port.calls.push(`sites:${v.sites}`),
+    onPick(cb) {
+      pickCbs.add(cb);
+      return () => pickCbs.delete(cb);
+    },
+    pick: (id) => {
+      for (const cb of [...pickCbs]) cb({ id });
+    },
+  });
+}
+
+async function openMap(t) {
+  t.el.viewMap.fire('click');
+  await flush(8);
+  await t.clock.advance(400); // the iris and the fade
+}
+
+test('Map in the toggle is disabled with the reason when the port cannot show areas', async () => {
+  const t = await mount({ port: trackingPort(), graph: theaterGraph() });
+  try {
+    const map = t.el.viewMap;
+    assert.equal(textOf(map).replace(/^map /, ''), 'Map');
+    assert.equal(map.attrs['aria-disabled'], 'true');
+    assert.equal(map.attrs.title, "The map can't show areas in this build.");
+    map.fire('click');
+    await flush();
+    assert.match(
+      textOf(t.el.toasts),
+      /The map can't show areas in this build\./,
+    );
+    assert.equal(t.el.root.attrs['data-mode'], 'orb');
+    assert.match(
+      textOf(t.el.livePolite),
+      /The map can't show areas in this build\./,
+    );
+  } finally {
+    t.restore();
+  }
+});
+
+test('Map opens the overview on the theater: dock "Map  label  W × H km", sites, ODbL; Esc returns', async () => {
+  const port = mapPort();
+  const t = await mount({ port, graph: theaterGraph() });
+  try {
+    assert.equal(t.el.viewMap.attrs['aria-disabled'], undefined);
+    await openMap(t);
+    assert.equal(t.el.root.attrs['data-mode'], 'map');
+    assert.equal(t.el.viewMap.attrs['aria-pressed'], 'true');
+    assert.deepEqual(port.calls.slice(0, 4), [
+      `area:${THEATER_BBOX.join(',')}:false`,
+      'map:true',
+      `inset:${port.calls.find((c) => c.startsWith('inset:')).slice(6)}`,
+      'overview:on',
+    ]);
+    assert.ok(port.calls.includes('sites:true'));
+    const dock = t.el.mapDock.element;
+    assert.equal(isHidden(dock), false);
+    assert.equal(isHidden(t.el.dock), true, 'not the tracking dock');
+    assert.equal(
+      textOf(byClass(dock, 'ic-mapdock__line')),
+      'Map Bengaluru centre 5.0 × 5.0 km',
+    );
+    assert.match(textOf(dock), /Track Drone1/);
+    assert.match(textOf(dock), /Show Sites 41/);
+    assert.match(
+      textOf(dock),
+      /Map data: © OpenStreetMap contributors, ODbL\./,
+    );
+    assert.match(
+      textOf(t.el.livePolite),
+      /Map of Bengaluru centre\. Press Escape to return to the console\./,
+    );
+    assert.ok(
+      t.log.calls.some((c) => c[0] === 'analyst.setDocked' && c[1] === true),
+    );
+    assert.equal(t.el.main.attrs.inert, '', 'the orb side is inert');
+
+    // The Sites switch reaches the overlay.
+    const box = byClass(dock, 'ic-mapdock__check');
+    box.checked = false;
+    box.fire('change');
+    assert.equal(port.calls.at(-1), 'sites:false');
+    assert.doesNotMatch(textOf(dock), /ODbL/, 'no sites drawn, no attribution');
+
+    // Esc (from outside the console, e.g. the map) is the innermost layer.
+    const ev = t.win.key({ key: 'Escape', target: t.doc.body });
+    assert.equal(ev.defaultPrevented, true);
+    await flush(8);
+    await t.clock.advance(400);
+    assert.equal(t.el.root.attrs['data-mode'], 'orb');
+    assert.ok(port.calls.includes('overview:off'));
+    assert.equal(port.calls.at(-2), 'map:false');
+    assert.equal(isHidden(dock), true);
+  } finally {
+    t.restore();
+  }
+});
+
+test('M in the orb scope opens the map; never from a text field or outside the orb', async () => {
+  const port = mapPort();
+  const t = await mount({ port, graph: theaterGraph() });
+  try {
+    const field = t.doc.createElement('input');
+    field.type = 'text';
+    t.el.searchHost.append(field);
+    t.win.key({ key: 'm', target: field });
+    const rail = t.doc.createElement('button');
+    t.el.railHost.append(rail);
+    t.win.key({ key: 'm', target: rail });
+    await flush(8);
+    assert.equal(t.el.root.attrs['data-mode'], 'orb');
+    const ev = t.win.key({ key: 'm', target: t.el.stage });
+    assert.equal(ev.defaultPrevented, true);
+    await flush(8);
+    await t.clock.advance(400);
+    assert.equal(t.el.root.attrs['data-mode'], 'map');
+    // The shortcut sheet names it.
+    assert.match(textOf(t.el.sheet.children[1]), /M Map view/);
+  } finally {
+    t.restore();
+  }
+});
+
+test('a map pick opens the inspector as a sheet over the dock; Esc closes it, then the map', async () => {
+  const port = mapPort();
+  const t = await mount({ port, graph: theaterGraph() });
+  try {
+    const inspects = [];
+    t.bus.on('inspect', (p) => inspects.push(p.id));
+    port.pick('sit:dyn-blr:node/1');
+    assert.deepEqual(inspects, [], 'picks count only in the map');
+    await openMap(t);
+    assert.equal(t.el.plate.parent, t.el.mapSheet, 'the host moved');
+    assert.equal(isHidden(t.el.mapSheet), false);
+    assert.deepEqual(
+      t.log.calls.filter((c) => c[0] === 'inspector.setLayout').at(-1),
+      ['inspector.setLayout', 'compact'],
+    );
+    port.pick('sit:dyn-blr:node/1');
+    assert.deepEqual(inspects, ['sit:dyn-blr:node/1']);
+    t.log.inspector.show('sit:dyn-blr:node/1'); // the real one hears 'inspect'
+    t.win.key({ key: 'Escape', target: t.doc.body });
+    assert.ok(t.log.calls.some((c) => c[0] === 'inspector.hide'));
+    assert.equal(t.el.root.attrs['data-mode'], 'map', 'the sheet went first');
+    t.win.key({ key: 'Escape', target: t.doc.body });
+    await flush(8);
+    await t.clock.advance(400);
+    assert.equal(t.el.root.attrs['data-mode'], 'orb');
+    assert.equal(t.el.plate.parent, t.el.stageBottom, 'back on the stage');
+    assert.deepEqual(t.el.stageBottom.children, [
+      t.el.caption,
+      t.el.plate,
+      t.el.footer,
+    ]);
+    assert.equal(isHidden(t.el.mapSheet), true);
+    assert.deepEqual(
+      t.log.calls.filter((c) => c[0] === 'inspector.setLayout').at(-1),
+      ['inspector.setLayout', 'wide'],
+    );
+  } finally {
+    t.restore();
+  }
+});
+
+test('Track from the map dock: tracking, then Esc goes back to the map, Back to console to the orb', async () => {
+  const port = mapPort();
+  const t = await mount({ port, graph: theaterGraph() });
+  try {
+    await openMap(t);
+    const track = find(
+      t.el.mapDock.element,
+      (el) => el.tag === 'button' && /Track Drone1/.test(textOf(el)),
+    );
+    track.fire('click');
+    await flush(8);
+    await t.clock.advance(400);
+    assert.equal(t.el.root.attrs['data-mode'], 'tracking');
+    assert.ok(port.calls.includes('overview:off'));
+    assert.equal(isHidden(t.el.mapDock.element), true);
+    assert.equal(isHidden(t.el.dock), false);
+    // Esc inside the console, in tracking: the innermost layer is the map.
+    t.el.root.fire('keydown', {
+      key: 'Escape',
+      stopPropagation() {},
+      preventDefault() {},
+    });
+    await flush(8);
+    assert.equal(t.el.root.attrs['data-mode'], 'map');
+    assert.equal(isHidden(t.el.mapDock.element), false);
+    assert.equal(port.calls.at(-1), `area:${THEATER_BBOX.join(',')}:true`);
+    t.el.mapDock.back.fire('click');
+    await flush(8);
+    await t.clock.advance(400);
+    assert.equal(t.el.root.attrs['data-mode'], 'orb');
+  } finally {
+    t.restore();
+  }
+});
+
+test("the orb's theater notice: caption with Show on map for 20 s, announced, the hidden map pre-positioned", async () => {
+  const port = mapPort();
+  const t = await mount({ port, graph: theaterGraph() });
+  try {
+    t.log.orbOpts.onNotice({
+      kind: 'theater',
+      count: 12,
+      ids: ['thr:dyn-blr'],
+      text: 'Theater changed to Bengaluru centre. 12 items arrived.',
+      label: 'Bengaluru centre',
+      holdMs: 20000,
+      announce: 'polite',
+    });
+    await flush();
+    assert.equal(
+      textOf(t.el.caption),
+      'Theater changed to Bengaluru centre. 12 items arrived. Show on map',
+    );
+    assert.equal(t.el.caption.attrs['data-kind'], 'theater');
+    assert.match(textOf(t.el.livePolite), /Theater changed to Bengaluru/);
+    assert.equal(port.calls.at(-1), `area:${THEATER_BBOX.join(',')}:false`);
+    await t.clock.advance(19000);
+    assert.match(textOf(t.el.caption), /Theater changed/);
+    await t.clock.advance(1500);
+    assert.equal(isHidden(t.el.caption), true, 'gone after holdMs');
+
+    // Show on map opens the map on the theater at once.
+    t.log.orbOpts.onNotice({
+      kind: 'theater',
+      ids: [],
+      to: { id: 'dyn-blr' },
+      text: 'Theater changed to Bengaluru centre. 0 items arrived.',
+      holdMs: 20000,
+    });
+    const show = find(
+      t.el.caption,
+      (el) => el.tag === 'button' && textOf(el) === 'Show on map',
+    );
+    show.fire('click');
+    await flush(8);
+    await t.clock.advance(400);
+    assert.equal(t.el.root.attrs['data-mode'], 'map');
+    assert.equal(isHidden(t.el.caption), true);
+  } finally {
+    t.restore();
+  }
+});
+
+test('without showArea the theater caption has no Show on map', async () => {
+  const t = await mount({ port: trackingPort(), graph: theaterGraph() });
+  try {
+    t.log.orbOpts.onNotice({
+      kind: 'theater',
+      ids: ['thr:dyn-blr'],
+      text: 'Theater changed to Bengaluru centre. 1 item arrived.',
+      holdMs: 20000,
+    });
+    assert.equal(
+      textOf(t.el.caption),
+      'Theater changed to Bengaluru centre. 1 item arrived.',
+    );
+  } finally {
+    t.restore();
+  }
+});
+
+test('opening the map by keyboard, or returning to it from tracking, puts focus in the map dock', async () => {
+  // Review: Enter on the Map toggle (or M on the orb, or Esc from tracking)
+  // left focus on <body>; the toggle and the tracking dock were gone.
+  const port = mapPort();
+  const t = await mount({ port, graph: theaterGraph() });
+  try {
+    t.el.viewMap.focus();
+    await openMap(t);
+    assert.equal(t.el.root.attrs['data-mode'], 'map');
+    assert.equal(t.doc.activeElement, t.el.mapDock.back, 'the Map toggle');
+
+    // Track Drone1 from the dock, then Esc: back in the map, in its dock.
+    const track = find(
+      t.el.mapDock.element,
+      (el) => el.tag === 'button' && /Track Drone1/.test(textOf(el)),
+    );
+    track.fire('click');
+    await flush(8);
+    await t.clock.advance(400);
+    assert.equal(t.el.root.attrs['data-mode'], 'tracking');
+    t.el.dockBack.focus();
+    t.el.root.fire('keydown', {
+      key: 'Escape',
+      stopPropagation() {},
+      preventDefault() {},
+    });
+    await flush(8);
+    assert.equal(t.el.root.attrs['data-mode'], 'map');
+    assert.equal(t.doc.activeElement, t.el.mapDock.back, 'from tracking');
+
+    // Back to the orb, then M from the orb: the same.
+    t.el.mapDock.back.fire('click');
+    await flush(8);
+    await t.clock.advance(400);
+    assert.equal(t.el.root.attrs['data-mode'], 'orb');
+    t.el.stage.focus();
+    t.win.key({ key: 'm', target: t.el.stage });
+    await flush(8);
+    await t.clock.advance(400);
+    assert.equal(t.el.root.attrs['data-mode'], 'map');
+    assert.equal(t.doc.activeElement, t.el.mapDock.back, 'M on the orb');
+  } finally {
+    t.restore();
+  }
+});
+
+test('opening the map leaves focus alone where it is still usable (the composer)', async () => {
+  const port = mapPort();
+  const t = await mount({ port, graph: theaterGraph() });
+  try {
+    t.el.analystBody.focus();
+    t.bus.emit('map:request', {
+      ids: ['thr:dyn-blr'],
+      bbox: THEATER_BBOX,
+      label: 'Bengaluru centre',
+      source: 'operator',
+    });
+    await flush(8);
+    await t.clock.advance(400);
+    assert.equal(t.el.root.attrs['data-mode'], 'map');
+    assert.equal(t.doc.activeElement, t.el.analystBody);
+  } finally {
+    t.restore();
+  }
+});
+
+test("an analyst's ui map: the 3 s notice as a toast, Stay in console cancels", async () => {
+  const port = mapPort();
+  const t = await mount({ port, graph: theaterGraph() });
+  try {
+    t.bus.emit('map:request', {
+      ids: ['thr:dyn-blr'],
+      bbox: THEATER_BBOX,
+      label: 'Bengaluru centre',
+      reason: 'Watch the recce',
+      source: 'analyst',
+      countdown: true,
+    });
+    assert.match(
+      textOf(t.el.toasts),
+      /The analyst suggests showing Bengaluru centre on the map: "Watch the recce"\. Opening the map in 3 s\./,
+    );
+    const stay = find(
+      t.el.toasts,
+      (el) => el.tag === 'button' && textOf(el) === 'Stay in console',
+    );
+    stay.fire('click');
+    await t.clock.advance(4000);
+    assert.equal(t.el.root.attrs['data-mode'], 'orb');
+    assert.ok(!port.calls.includes('map:true'));
+  } finally {
+    t.restore();
+  }
+});
+
+test('untrusted text: an XSS or bidi theater label reaches the dock only as text', async () => {
+  const label = '‮evil‬ <img src=x onerror=alert(1)>';
+  const port = mapPort();
+  const t = await mount({ port, graph: theaterGraph(label) });
+  try {
+    await openMap(t);
+    const line = textOf(byClass(t.el.mapDock.element, 'ic-mapdock__line'));
+    assert.ok(line.includes('evil <img src=x onerror=alert(1)>'));
+    assert.doesNotMatch(line, /[‪-‮⁦-⁩]/);
+    assert.equal(
+      find(t.el.root, (el) => el.tag === 'img'),
+      null,
+      'no img element is created',
+    );
+    assert.equal(
+      find(t.el.root, (el) => 'onerror' in (el.attrs || {})),
+      null,
+    );
+    assert.doesNotMatch(textOf(t.el.livePolite), /[‪-‮]/);
+  } finally {
+    t.restore();
+  }
+});
+
+test('map CSS: the overview passes input to the map but never through the tether', () => {
+  const css = readFileSync(new URL('./console.css', import.meta.url), 'utf8');
+  assert.match(css, /\.ic-root\[data-mode='map'\] \{[^}]*pointer-events: none/);
+  assert.match(
+    css,
+    /\.ic-root\[data-mode='map'\] > :where\(:not\(\.ic-main, \.ic-tether\)\) \{\s*pointer-events: auto;/,
+  );
+  assert.match(css, /\.ic-mapsheet \{[^}]*--ic-inspector-top: 0px/);
+});
+
+test('off the orb the theater change is a toast; its Show on map moves the map', async () => {
+  const port = mapPort();
+  const t = await mount({ port, graph: theaterGraph() });
+  try {
+    await openMap(t);
+    t.log.orbOpts.onNotice({
+      kind: 'theater',
+      ids: ['thr:dyn-blr'],
+      text: 'Theater changed to Bengaluru centre. 3 items arrived.',
+      holdMs: 20000,
+    });
+    assert.ok(
+      !port.calls.slice(-1)[0].endsWith(':false'),
+      'no hidden pre-positioning while the map shows',
+    );
+    assert.match(
+      textOf(t.el.toasts),
+      /Theater changed to Bengaluru centre\. 3 items arrived\./,
+    );
+    const show = find(
+      t.el.toasts,
+      (el) => el.tag === 'button' && textOf(el) === 'Show on map',
+    );
+    show.fire('click');
+    await flush(8);
+    assert.equal(port.calls.at(-1), `area:${THEATER_BBOX.join(',')}:true`);
+    assert.doesNotMatch(textOf(t.el.toasts), /Theater changed/);
+  } finally {
+    t.restore();
+  }
 });

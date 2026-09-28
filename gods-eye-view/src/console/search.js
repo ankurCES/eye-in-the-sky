@@ -13,7 +13,11 @@
  * matches. Global ⌘K / `/` focus is index.js's job: it calls `open()`.
  */
 import { h, replaceKids, setHidden } from '../ui/uavDom.js';
-import { cleanSubtitle } from './orb/text.js';
+import { SITE_CATEGORIES, siteCategoryKey } from './orb/glyphPaths.js';
+import { isKnownType } from './orb/glyphs.js';
+import { siteCountLabel, siteWord, sitePlural } from './orb/placeText.js';
+import { cleanSubtitle, typeLabel } from './orb/text.js';
+import { siteKeyTag } from './inspectorPlaces.js';
 import {
   ICON,
   TYPE_WORD,
@@ -43,7 +47,12 @@ export const TYPE_FILTERS = Object.freeze([
   }),
   Object.freeze({ key: 'vehicles', label: 'Vehicles', types: ['vehicle'] }),
   Object.freeze({ key: 'missions', label: 'Missions', types: ['mission'] }),
-  Object.freeze({ key: 'places', label: 'Places', types: ['theater', 'poi'] }),
+  // WG §4.2.6: mapped sites are places.
+  Object.freeze({
+    key: 'places',
+    label: 'Places',
+    types: ['theater', 'poi', 'site'],
+  }),
   Object.freeze({ key: 'reports', label: 'Reports', types: ['report'] }),
   Object.freeze({ key: 'alarms', label: 'Alarms', types: ['alarm'] }),
 ]);
@@ -77,25 +86,63 @@ const QUESTION_WORDS = new Set([
   'compare',
   'write',
   'summarize',
+  // WG §4.2.6: taskings that move the theater or plan over a place.
+  'set',
+  'go',
+  'recce',
+  'move',
+  'change',
 ]);
 
-/** Attribute key -> match reason. Keys not listed read "Details". */
-const ATTR_REASON = Object.freeze({
-  ob_class: 'Equipment',
-  category: 'Equipment',
-  vehicle: 'Vehicle',
-  mission: 'Mission',
-  mission_id: 'ID match',
-  kind: 'Kind',
-  phase: 'Phase',
-  severity: 'Severity',
-  threat: 'Threat',
-  confidence: 'Confidence',
-  theater: 'Theater',
-  place: 'Place',
-  format: 'Format',
-  link: 'Link',
+/**
+ * Attribute key -> match reason, by node type (WG §4.2.6): `'*'` holds the
+ * reasons every type shares, and a type's own table wins over it (a site's
+ * `category` reads "Category", a unit's "Equipment"). Keys not listed read
+ * "Details".
+ */
+export const ATTR_REASON = Object.freeze({
+  '*': Object.freeze({
+    ob_class: 'Equipment',
+    category: 'Equipment',
+    vehicle: 'Vehicle',
+    mission: 'Mission',
+    mission_id: 'ID match',
+    kind: 'Kind',
+    phase: 'Phase',
+    severity: 'Severity',
+    threat: 'Threat',
+    confidence: 'Confidence',
+    theater: 'Theater',
+    place: 'Place',
+    format: 'Format',
+    link: 'Link',
+  }),
+  site: Object.freeze({
+    category: 'Category',
+    subtype: 'Category',
+    tags: 'Tags',
+  }),
 });
+
+/** The match reason for an attribute key of a node type. */
+export function attrReason(type, key) {
+  const own =
+    typeof type === 'string' && Object.hasOwn(ATTR_REASON, type)
+      ? ATTR_REASON[type]
+      : null;
+  if (own && Object.hasOwn(own, key)) return own[key];
+  return Object.hasOwn(ATTR_REASON['*'], key)
+    ? ATTR_REASON['*'][key]
+    : 'Details';
+}
+
+/** Site attrs that are plumbing, never a reason to match (ids, counts, times). */
+const SITE_QUIET_ATTRS = new Set([
+  'tags_total',
+  'fetched_at_ms',
+  'source',
+  'register',
+]);
 
 const CONFIDENCE_WORDS = new Set([
   'confirmed',
@@ -149,11 +196,27 @@ function safeRanges(label, lower, ranges) {
   return String(label ?? '').length === lower.length ? ranges : [];
 }
 
-function attrEntries(attrs) {
+function attrEntries(node) {
+  const attrs = node?.attrs || {};
+  const site = node?.type === 'site';
   const out = [];
-  for (const [key, value] of Object.entries(attrs || {})) {
+  for (const [key, value] of Object.entries(attrs)) {
+    if (site && SITE_QUIET_ATTRS.has(key)) continue;
     if (typeof value === 'string' || typeof value === 'number') {
       out.push([key, String(value)]);
+    }
+  }
+  if (site) {
+    // A site matches its category words ("military" finds "Military
+    // site") and its mapped tags ("OIFM" finds icao=OIFM).
+    out.push(
+      ['category', siteWord(attrs.category)],
+      ['category', sitePlural(attrs.category)],
+    );
+    const tags = attrs.tags && typeof attrs.tags === 'object' ? attrs.tags : {};
+    for (const [k, v] of Object.entries(tags)) {
+      if (typeof v === 'string' || typeof v === 'number')
+        out.push(['tags', `${k}=${v}`]);
     }
   }
   return out;
@@ -215,7 +278,13 @@ export function matchNode(node, query, extra = {}) {
   }
   if (q.length < 2) return null;
 
-  if (id.includes(q) || dups.some((d) => d.includes(q))) {
+  // A site id repeats its theater's id (`sit:{theater}:{osm}`): only the
+  // OSM part is a partial-id match, or every site would match the place.
+  const partial =
+    node.type === 'site'
+      ? normalize(node.id.split(':').slice(2).join(':'))
+      : id;
+  if (partial.includes(q) || dups.some((d) => d.includes(q))) {
     return { tier: TIER.partialId, reason: 'Partial ID', ranges: [] };
   }
 
@@ -235,11 +304,11 @@ export function matchNode(node, query, extra = {}) {
     };
   }
 
-  for (const [key, value] of attrEntries(node.attrs)) {
+  for (const [key, value] of attrEntries(node)) {
     if (normalize(value).includes(q)) {
       return {
         tier: TIER.attribute,
-        reason: ATTR_REASON[key] || 'Details',
+        reason: attrReason(node.type, key),
         ranges: [],
       };
     }
@@ -317,11 +386,43 @@ export function filterCounts(matches) {
   return counts;
 }
 
-/** Matches kept by a filter chip. */
-export function applyTypeFilter(matches, key) {
+/**
+ * Matches kept by a filter chip, and within Places by a site category chip
+ * (`siteCategory`, WG §4.2.6): then only that category's sites stay.
+ */
+export function applyTypeFilter(matches, key, siteCategory = null) {
   const f = TYPE_FILTERS.find((x) => x.key === key);
   if (!f?.types) return matches;
-  return matches.filter((m) => f.types.includes(m.node?.type));
+  const kept = matches.filter((m) => f.types.includes(m.node?.type));
+  if (key !== 'places' || !siteCategory) return kept;
+  return kept.filter(
+    (m) =>
+      m.node?.type === 'site' &&
+      siteCategoryKey(m.node.attrs?.category) === siteCategory,
+  );
+}
+
+/**
+ * Site matches per category, in the copy deck's order: `[[category, n]]`
+ * for the Places category chips ("Airfields 3"). Unknown categories count
+ * as `other`.
+ */
+export function siteCategoryCounts(matches) {
+  const counts = new Map();
+  for (const m of matches || []) {
+    if (m?.node?.type !== 'site') continue;
+    const key = siteCategoryKey(m.node.attrs?.category);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return SITE_CATEGORIES.filter((c) => counts.has(c)).map((c) => [
+    c,
+    counts.get(c),
+  ]);
+}
+
+/** The words a search row states for a node type: "Contact", "Unrecognised (force)". */
+export function typeWordOf(type) {
+  return isKnownType(type) ? TYPE_WORD[type] || 'Entity' : typeLabel(type);
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +483,8 @@ export function createSearch(host, ctx, opts = {}) {
 
   let query = '';
   let filterKey = 'all';
+  /** A site category chip under Places (WG §4.2.6), or null. */
+  let siteCat = null;
   let matches = [];
   let options = [];
   let active = -1;
@@ -427,6 +530,12 @@ export function createSearch(host, ctx, opts = {}) {
     role: 'group',
     'aria-label': 'Filter by type',
   });
+  const siteChips = h('div', {
+    class: 'ic-search__chips ic-search__chips--sites',
+    role: 'group',
+    'aria-label': 'Filter sites by category',
+    hidden: true,
+  });
   const caption = h('p', { class: 'ic-search__caption' });
   const list = h('ul', {
     class: 'ic-search__list',
@@ -444,6 +553,7 @@ export function createSearch(host, ctx, opts = {}) {
     'div',
     { class: 'ic-search__pop', hidden: true },
     chips,
+    siteChips,
     caption,
     list,
     foot,
@@ -501,7 +611,7 @@ export function createSearch(host, ctx, opts = {}) {
   }
 
   function filtered() {
-    return applyTypeFilter(matches, filterKey);
+    return applyTypeFilter(matches, filterKey, siteCat);
   }
 
   function buildOptions() {
@@ -578,11 +688,38 @@ export function createSearch(host, ctx, opts = {}) {
       // render() puts focus back on the rebuilt chip with this data-filter.
       b.addEventListener('click', () => {
         filterKey = f.key;
+        siteCat = null;
         update({ keepActive: false });
       });
       kids.push(b);
     }
     replaceKids(chips, kids);
+  }
+
+  /** Category chips under Places when sites match ("Airfields 3"). */
+  function renderSiteChips(show) {
+    const counts =
+      show && filterKey === 'places' ? siteCategoryCounts(matches) : [];
+    const kids = counts.map(([category, n]) => {
+      const b = h(
+        'button',
+        {
+          type: 'button',
+          class: 'ic-search__chip ic-search__chip--site',
+          'aria-pressed': siteCat === category ? 'true' : 'false',
+          'data-filter': `site:${category}`,
+        },
+        siteCountLabel(category, n),
+      );
+      b.addEventListener('mousedown', (event) => event?.preventDefault?.());
+      b.addEventListener('click', () => {
+        siteCat = siteCat === category ? null : category;
+        update({ keepActive: false });
+      });
+      return b;
+    });
+    replaceKids(siteChips, kids);
+    setHidden(siteChips, !kids.length);
   }
 
   function labelWithHits(label, ranges) {
@@ -610,23 +747,41 @@ export function createSearch(host, ctx, opts = {}) {
     // (and already says Up/Down, so no second status word).
     const word = feed ? '' : statusWord(node);
     const where = outsideWords(node);
+    const known = isKnownType(node.type);
+    const site = node.type === 'site';
+    // WG §4.2.6: "Site  Airfield  Mapped, not verified  ICAO OIFM".
+    const keyTag = site ? siteKeyTag(node) : '';
     const meta = h(
       'span',
       { class: 'ic-search__meta' },
-      h('span', { class: 'ic-search__type' }, TYPE_WORD[node.type] || 'Entity'),
-      feed
+      h(
+        'span',
+        {
+          class: known
+            ? 'ic-search__type'
+            : 'ic-search__type ic-search__type--unrecognised',
+        },
+        typeWordOf(node.type),
+      ),
+      site
         ? h(
             'span',
-            {
-              class: 'ic-search__status',
-              'data-status': node.status,
-              'data-tone': toneOf(node.type, node.status),
-            },
-            feedSummary(node, now()),
+            { class: 'ic-search__category' },
+            siteWord(node.attrs?.category),
           )
-        : cleanSubtitle(node.subtitle)
-          ? segments(cleanSubtitle(node.subtitle))
-          : null,
+        : feed
+          ? h(
+              'span',
+              {
+                class: 'ic-search__status',
+                'data-status': node.status,
+                'data-tone': toneOf(node.type, node.status),
+              },
+              feedSummary(node, now()),
+            )
+          : cleanSubtitle(node.subtitle)
+            ? segments(cleanSubtitle(node.subtitle))
+            : null,
       where
         ? h(
             'span',
@@ -648,6 +803,7 @@ export function createSearch(host, ctx, opts = {}) {
             word,
           )
         : null,
+      keyTag ? h('span', { class: 'ic-search__tag' }, keyTag) : null,
     );
     const li = h(
       'li',
@@ -658,11 +814,13 @@ export function createSearch(host, ctx, opts = {}) {
         'aria-selected': i === active ? 'true' : 'false',
         'data-status': node.status || 'unknown',
         'data-tone': toneOf(node.type, node.status),
-        'data-type': node.type,
+        'data-type': known ? node.type : 'unknown',
         'data-id': node.id,
         'data-kind': 'result',
       },
-      glyph(node.type, node.status, 16, node.attrs?.phase),
+      glyph(node.type, node.status, 16, node.attrs?.phase, {
+        category: node.attrs?.category,
+      }),
       h(
         'span',
         { class: 'ic-search__main' },
@@ -854,6 +1012,7 @@ export function createSearch(host, ctx, opts = {}) {
         return;
       }
       renderChips(Boolean(query) && Boolean(st.graph));
+      renderSiteChips(Boolean(query) && Boolean(st.graph));
       renderCaption(st);
       replaceKids(
         list,
@@ -898,6 +1057,12 @@ export function createSearch(host, ctx, opts = {}) {
   function update({ keepActive = false } = {}) {
     const previous = keepActive ? options[active] : null;
     recompute();
+    // A category chip whose sites no longer match lets go.
+    if (
+      siteCat &&
+      !siteCategoryCounts(matches).some(([category]) => category === siteCat)
+    )
+      siteCat = null;
     options = buildOptions();
     if (previous) {
       const idx = options.findIndex((o) =>
@@ -944,7 +1109,10 @@ export function createSearch(host, ctx, opts = {}) {
       .trim();
     if (next !== query) lastCountMsg = null;
     query = next;
-    if (!query) filterKey = 'all';
+    if (!query) {
+      filterKey = 'all';
+      siteCat = null;
+    }
   }
 
   function clearQuery() {

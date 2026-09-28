@@ -1,0 +1,10 @@
+{
+  "version": 0.6, "generator": "Overpass API 0.7.62.1 084b4234",
+  "elements": [
+    {"type": "way", "id": 24591212,
+     "bounds": {"minlat": 46.6601, "minlon": 32.4889, "maxlat": 46.6789, "maxlon": 32.5198}},
+    {"type": "node", "id": 40010, "lat": 46.6360, "lon": 32.6180},
+    {"type": "relation", "id": 7001,
+     "bounds": {"minlat": 46.6201, "minlon": 32.5501, "maxlat": 46.6299, "maxlon": 32.5652}}
+  ]
+}

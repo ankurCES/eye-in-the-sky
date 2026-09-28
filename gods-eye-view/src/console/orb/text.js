@@ -4,7 +4,23 @@
  *
  * The console never writes `·`; server strings are split on " · " into
  * segments and rendered with spacing. Everything here is pure.
+ *
+ * Fail-safe (WG spec §4.2.1): a type the console does not know reads
+ * "Unrecognised" ("Unrecognised (force)" in List view), its status is not
+ * read at all, and its label is shown verbatim as text, bidi-safe.
  */
+
+import { isKnownType } from './glyphs.js';
+import {
+  SITE_REGISTER,
+  SITE_STATUS_TEXT,
+  safeText,
+  siteCategory,
+  siteLabel,
+  siteSubtitle,
+  siteWord,
+  stripBidi,
+} from './placeText.js';
 
 export const TYPE_WORDS = Object.freeze({
   theater: 'Theater',
@@ -17,7 +33,14 @@ export const TYPE_WORDS = Object.freeze({
   equipment: 'Equipment',
   report: 'Report',
   alarm: 'Alarm',
+  site: 'Site',
 });
+
+/** The type word for a type the console does not know. */
+export const UNRECOGNISED_WORD = 'Unrecognised';
+/** The inspector's fixed line for an unrecognised item (§4.2.1). */
+export const UNRECOGNISED_ITEM_LINE =
+  "The console doesn't recognise this kind of item, so it shows it as unknown. That isn't a statement that it's safe.";
 
 const PHASE_WORDS = Object.freeze({
   planning: 'Planning',
@@ -30,7 +53,24 @@ const PHASE_WORDS = Object.freeze({
 const CONTACT_TYPES = new Set(['track', 'unit']);
 
 export function typeWord(type) {
-  return Object.hasOwn(TYPE_WORDS, type) ? TYPE_WORDS[type] : 'Entity';
+  return isKnownType(type) ? TYPE_WORDS[type] : UNRECOGNISED_WORD;
+}
+
+/** A type as untrusted text (≤ 40 characters, bidi-safe). */
+function typeText(type) {
+  return safeText(type, 40) || 'no type';
+}
+
+/** List view's type cell: "Contact", or "Unrecognised (force)". */
+export function typeLabel(type) {
+  return isKnownType(type)
+    ? TYPE_WORDS[type]
+    : `${UNRECOGNISED_WORD} (${typeText(type)})`;
+}
+
+/** The inspector header for an unknown type: "Unrecognised item (force)". */
+export function unrecognisedItemTitle(type) {
+  return `Unrecognised item (${typeText(type)})`;
 }
 
 /** Sentence-case first letter. */
@@ -162,7 +202,7 @@ export function feedState(node, { downSince = null } = {}) {
  * re-joined with " · " so splitSegments() still works on it.
  */
 export function cleanSubtitle(text) {
-  return splitSegments(text)
+  return splitSegments(typeof text === 'string' ? stripBidi(text) : text)
     .filter((segment) => !RAW_SEGMENT.test(segment))
     .map((segment) =>
       segment.length > SEGMENT_MAX
@@ -172,12 +212,16 @@ export function cleanSubtitle(text) {
     .join(' · ');
 }
 
-/** The name the orb shows for a node (feeds get plain names). */
+/**
+ * The name the orb shows for a node (feeds get plain names). Always text:
+ * bidi controls and control characters are removed (§3.11).
+ */
 export function nodeLabel(node) {
   if (node?.type === 'feed') return feedLabel(node);
+  if (node?.type === 'site') return siteLabel(node);
   const alarm = alarmNodeLabel(node);
   if (alarm) return alarm;
-  return String(node?.label || node?.id || '');
+  return safeText(node?.label || node?.id || '', 400);
 }
 
 /** An alarm node's spec label by kind ("BINGO fuel"), or null. */
@@ -197,6 +241,11 @@ export function alarmNodeLabel(node) {
  */
 export function nodeSubtitle(node, options = {}) {
   if (node?.type === 'feed') return feedState(node, options);
+  if (node?.type === 'site') return siteSubtitle(node);
+  if (!isKnownType(node?.type)) {
+    const rest = cleanSubtitle(node?.subtitle);
+    return [typeLabel(node?.type), rest].filter(Boolean).join(' · ');
+  }
   return cleanSubtitle(node?.subtitle);
 }
 
@@ -278,6 +327,9 @@ export function threatWord(node) {
 export function statusWord(node) {
   const type = node?.type;
   const status = node?.status;
+  // Fail-safe: an unknown type's status is never read (§4.2.1).
+  if (!isKnownType(type)) return 'Not assessed';
+  if (type === 'site') return SITE_STATUS_TEXT;
   if (CONTACT_TYPES.has(type)) {
     if (status === 'stale') return 'Stale';
     return threatWord(node);
@@ -321,6 +373,8 @@ export function statusWord(node) {
  */
 export function registerOf(node) {
   const attrs = node?.attrs || {};
+  if (!isKnownType(node?.type)) return 'Not assessed';
+  if (node?.type === 'site') return SITE_REGISTER;
   if (CONTACT_TYPES.has(node?.type)) {
     return threatWord(node) === 'Not assessed' ? 'Not assessed' : 'Estimated';
   }
@@ -340,9 +394,17 @@ export function registerOf(node) {
  */
 export function optionText(node, { isNew = false, downSince = null } = {}) {
   const parts = [nodeLabel(node)];
-  parts.push(typeWord(node?.type).toLowerCase());
+  parts.push(typeLabel(node?.type).toLowerCase());
   const segments = splitSegments(nodeSubtitle(node, { downSince }));
-  if (node?.type === 'feed') {
+  if (!isKnownType(node?.type)) {
+    // "X, unrecognised (force), not assessed, …": the type is not repeated.
+    parts.push('not assessed', ...segments.slice(1));
+  } else if (node?.type === 'site') {
+    parts.push(
+      siteWord(siteCategory(node)).toLowerCase(),
+      SITE_STATUS_TEXT.toLowerCase(),
+    );
+  } else if (node?.type === 'feed') {
     const state = segments[0] || '';
     parts.push(state ? state[0].toLowerCase() + state.slice(1) : '');
   } else if (CONTACT_TYPES.has(node?.type)) {

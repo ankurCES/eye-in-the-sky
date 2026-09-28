@@ -11,6 +11,7 @@
  */
 
 import { h, replaceKids, setHidden } from '../../ui/uavDom.js';
+import { isKnownType } from './glyphs.js';
 import { BANDS, BAND_ORDER, bandOfType } from './layout.js';
 import {
   formatZ,
@@ -20,7 +21,7 @@ import {
   registerOf,
   splitSegments,
   statusWord,
-  typeWord,
+  typeLabel,
 } from './text.js';
 
 let instances = 0;
@@ -28,6 +29,16 @@ let instances = 0;
 const compareIds = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const bySalience = (a, b) =>
   (b.salience || 0) - (a.salience || 0) || compareIds(a.id, b.id);
+
+/**
+ * The status key List view colours a row's status word by: an unknown type's
+ * status is never read (WG §4.2.1), and a site's is context, not a state.
+ */
+export function displayStatus(node) {
+  if (!isKnownType(node?.type)) return 'unknown';
+  if (node.type === 'site') return 'mapped';
+  return String(node.status || 'unknown');
+}
 
 /**
  * Group nodes by band (pole to pole), most salient first inside each band.
@@ -337,7 +348,7 @@ export function createOrbListView(host, { onSelect } = {}) {
       'td',
       {
         class: 'ic-orb-list__td ic-orb-list__status',
-        'data-status': String(node.status || 'unknown'),
+        'data-status': displayStatus(node),
       },
       statusWord(node),
     );
@@ -345,7 +356,12 @@ export function createOrbListView(host, { onSelect } = {}) {
     const tr = h(
       'tr',
       { class: 'ic-orb-list__row', 'data-id': node.id },
-      cell(typeWord(node.type)),
+      cell(
+        typeLabel(node.type),
+        isKnownType(node.type)
+          ? 'ic-orb-list__td'
+          : 'ic-orb-list__td ic-orb-list__type--unrecognised',
+      ),
       name,
       status,
       cell(registerOf(node), 'ic-orb-list__td ic-orb-list__register'),

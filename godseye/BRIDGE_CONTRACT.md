@@ -24,7 +24,7 @@ Every route except `/health` needs `Authorization: Bearer <token>`. `/events` al
 | Route | Response |
 |---|---|
 | `GET /health` | Open. `{ok, sim_state, vehicles, theater, datum_degraded, datum_source, telemetry_error, camera_error, vehicles_fallback, cors, events:{subscribers, published, kinds}, mission_feed:{url, polls, …feeds}}` |
-| `GET /snapshot` | `{sim_state, observedAtMs, count, vehicles[], missions[], contacts[], feeds{}}`, a pure cache read |
+| `GET /snapshot` | `{sim_state, observedAtMs, count, vehicles[], missions[], contacts[], feeds{}, theater{id, epoch}}`, a pure cache read |
 | `GET /snapshot/{name}` | One vehicle row, or 404 |
 | `GET /mission-overlay` | GeoJSON FeatureCollection |
 | `GET /theaters` | `theaters.as_payload()` (schema `godseye.theaters/v1`) plus `active` |
@@ -51,7 +51,8 @@ analyst never uses it. `tests/test_bridge.py` pins the exact POST route set (`/c
   "vehicles": [ /* rows, below */ ],
   "missions": [ /* rows, below */ ],
   "contacts": [ /* rows, below */ ],
-  "feeds": { "mission_state": {"ok": true, "atMs": 0, "detail": "…"}, "contacts": {…} }
+  "feeds": { "mission_state": {"ok": true, "atMs": 0, "detail": "…"}, "contacts": {…} },
+  "theater": {"id": "dyn-bengaluru-centre-1a2b3c", "epoch": 1}   // WG v2 §3.4
 }
 ```
 
@@ -61,6 +62,15 @@ the sim answers with an error for one vehicle, for example a datalink it reports
 with the error (`bridge.sim_answered`). `feeds` reports each loop-C feed (`mission_state`,
 `contacts`, and `loop_c` when a poll raised) as `{ok, atMs, error?, detail?}`; a missing MCP tool or
 resource shows up there, never as a plausible default.
+
+`theater` is the running theater's id and epoch, both read from one cached `uav://safety/geofence`
+document (`MissionFeed.theater_ref()`), so a new id is never paired with an old epoch. `epoch` is
+the server's `theater_epoch`: 0 at a fresh boot, one more after each runtime switch, and kept
+across a restart that restores the same theater. It is `null` when the server publishes no plain
+integer (an older server, or a bool or string), when the theater is unknown, and for up to one
+loop-C poll (about 0.5 s) after a switch while the geofence is re-read. Clients reset trails and
+overlays on an id change or on a change between two non-null epochs, so one switch causes one reset.
+The active block's keys (`ACTIVE_KEYS`) are unchanged.
 
 ### `vehicles[]`
 
@@ -138,9 +148,9 @@ mission-state change. Every feature carries `properties.kind`:
 | `route` | LineString | planned route |
 | `waypoint` | Point | `properties.index` |
 | `grid` | LineString/Polygon | lawnmower or expanding-square pattern |
-| `flown` | LineString | the track actually flown |
+| `flown` | LineString | the track actually flown. A fix more than 2 km (`FLOWN_JUMP_M`) from the last vertex starts a new track instead of drawing the jump; a theater switch clears every track (`reset_flown`) |
 | `coverage` | Polygon | ground actually imaged; `properties.coverage_pct` |
-| `geofence` | Polygon | the AO; `properties.enforced: false` when it came from the theater table rather than the server's envelope |
+| `geofence` | Polygon | the AO; `properties.enforced: false` when it came from the theater table rather than the server's envelope. Rebuilt once the geofence is re-read after a theater switch |
 | `target` | Point | `properties.track_id`, `confidence`, `category`, `threat_level` |
 | `threat_ring` | Polygon | `properties.track_id`, `radius_m`, `ring` (`engagement` \| `acquisition`) |
 
@@ -178,7 +188,7 @@ gets `detail.dropped_since_last`. The kinds are fixed (`ALARM_SEVERITY`, pinned 
 ```jsonc
 {
   "known": true,              // false => do NOT adopt it, whatever the id looks like
-  "id": "iran-isfahan", "label": "Iran — Isfahan",
+  "id": "iran-isfahan", "label": "Iran — Isfahan",   // or a chat theater's "dyn-…" id
   "ground_elevation_msl_m": 1570.0, "ao": [[lat, lon], …],
   "in_table": true,           // this bridge's table has the row
   "theater_mismatch": null,   // the server's own report that its envelope belongs to another theater
@@ -190,6 +200,44 @@ gets `detail.dropped_since_last`. The kinds are fixed (`ALARM_SEVERITY`, pinned 
 The table's `default` is never the running theater. `known: false` wins over a plausible id; a
 selector that disagrees with the running theater is shown, not silently corrected
 (`INTEGRATION_FINDINGS.md`, UI-1).
+
+### Runtime theaters (WG v2 Phase A)
+
+The theater can change while the app runs: the analyst proposes one and the operator approves
+`sim_set_theater` (`INTEL_CONSOLE.md`, "Runtime theaters and sim speed"). The bridge follows:
+
+- **The table grows.** A theater set from chat has a `dyn-…` id and lives in the process's dynamic
+  registry (`theaters.register_dynamic`). `/theaters` lists it after the static rows, and the
+  active block's `in_table` is true for it. The geofence document's `theater` block gains `epoch`
+  (an integer) and `dynamic` (a bool); the rest of that document is unchanged.
+- **Re-reading the geofence.** Loop C reads `uav://safety/geofence` at once when nothing is cached,
+  retries every 30 s (`GEOFENCE_RETRY_S`) while no read has succeeded, and re-reads a good document
+  every 30 s (`GEOFENCE_REREAD_S`). The slow re-read catches a theater change no listener reported,
+  such as a separately restarted MCP server behind `GODSEYE_MCP_URL`. A change is the pair
+  `(theater.id, theater.epoch)` changing, so an airframe-only switch (same id, new epoch) counts. A
+  failed re-read keeps the last good document.
+- **`MissionFeed.invalidate_geofence()`** drops the cached document and the overlay key under the
+  feed lock. It does no I/O and never raises. Until the next read lands, `active_theater()` is
+  `known: false` with the reason "the theater changed; uav://safety/geofence is being re-read"
+  (or the upstream error if that read fails). A read that was already in flight when the
+  invalidate happened is thrown away, because it may describe the old theater.
+- **`BridgeState.reset_flown()`** clears every vehicle's flown track.
+- **`AirSimAdapter.home_geo`** is now a read-only property that returns a `geo.GeoPoint` (HAE);
+  it used to be a `HomeGeoPoint` attribute. **`AirSimAdapter.relocate(new_home: GeoPoint)`** moves
+  the adapter's origin copy: it sets `home_declared` and `home_datum = "hae"` and swaps the cached
+  projection in one assignment, so a telemetry sample in flight uses the old origin or the new one,
+  never a mix. A non-finite or out-of-range point raises `ValueError` and keeps the old origin.
+  Nothing is converted here: the switch converts the theater's MSL ground to HAE once (T1).
+- **The host wires it.** `host.py` registers the adapter with `server.attach_origin_holder(adapter)`,
+  so a switch moves it together with the fake simulator's and the MCP backend's copies and
+  cross-checks all three against the simulator's own `getHomeGeoPoint`. It also adds a theater
+  listener that runs, after every switch, `feed.invalidate_geofence()`, then
+  `app.state.bridge.reset_flown()`, then the intel graph's cache invalidation. The feed is read
+  when the listener runs, because it can be swapped. Every step runs even if an earlier one
+  fails; the failures are raised together afterwards, and the switch records a
+  `theater_listener_failed` audit row but still completes.
+- **The legacy launcher** (`launch.py`) attaches no origin holder and adds no listener, so a
+  runtime switch is refused there with "runtime theater change needs the app host".
 
 ## In-process access: `app.state.godseye`
 
@@ -218,12 +266,17 @@ The callables read `state.feed` at call time, because the feed is swappable
 treat the nested values as read-only. A feed without an accessor yields an empty answer, not an
 error.
 
+`create_app` also leaves the `BridgeState` on `app.state.bridge` (the same object as
+`app.state.godseye.state`). The host's theater listener reaches `bridge.feed.invalidate_geofence()`
+and `bridge.reset_flown()` through it. Those two calls and `adapter.relocate()` (made by the switch
+itself) are how the bridge follows an approved theater switch; none of them commands flight.
+
 ## Routes the host adds
 
 `host.py` adds these to the same app from outside `create_app` (details in `INTEL_CONSOLE.md`):
-`/app/config`, `/intel/graph`, `/intel/entity/{id}`, `/intel/events/recent`, `/chat/*`, `/mcp`,
-`/api/*` (404 `not_available_in_app_host`), and the built UI at `/` with the token injected into
-`index.html`. It also wraps the app in a loopback `Host`-header check and strips the bridge's CORS
+`/app/config`, `/intel/graph`, `/intel/entity/{id}`, `/intel/events/recent`, `/intel/overlay`,
+`/chat/*`, `/settings/llm*`, `/mcp`, `/api/*` (404 `not_available_in_app_host`), and the built UI at
+`/` with the token injected into `index.html`. It also wraps the app in a loopback `Host`-header check and strips the bridge's CORS
 headers from the token-bearing pages.
 
 ## CORS

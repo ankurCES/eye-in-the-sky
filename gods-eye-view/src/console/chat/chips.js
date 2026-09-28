@@ -19,7 +19,7 @@ const h = bidiSafe(domH);
 export const MISSING_TIP =
   'Not in the current picture (outside this theater or aged out).';
 
-const NODE_TYPES = new Set([
+export const NODE_TYPES = new Set([
   'vehicle',
   'mission',
   'track',
@@ -30,6 +30,7 @@ const NODE_TYPES = new Set([
   'poi',
   'alarm',
   'feed',
+  'site',
 ]);
 const STATUSES = new Set(['ok', 'warn', 'critical', 'stale', 'unknown']);
 
@@ -54,12 +55,28 @@ export function lookupNode(store, id) {
   return null;
 }
 
+/**
+ * A chip's status word. An unrecognised node type ignores its status and is
+ * never green (WG spec §4.2.1): it shows as 'unknown', like the orb's lilac
+ * "Unrecognised" glyph.
+ */
+export function chipStatus(type, status) {
+  if (!NODE_TYPES.has(type)) return 'unknown';
+  return STATUSES.has(status) ? status : 'unknown';
+}
+
 /** The glyph markup for a chip: constant SVG from orb/glyphs.js only. */
-function chipGlyph(type, status) {
+function chipGlyph(type, status, category = null) {
+  // orb/glyphs.js draws any type it doesn't know as the unrecognised glyph.
   const safeType = NODE_TYPES.has(type) ? type : 'unknown';
-  const safeStatus = STATUSES.has(status) ? status : 'unknown';
+  const safeStatus = chipStatus(type, status);
   try {
-    const svg = glyphSvg(safeType, { status: safeStatus, size: 10 });
+    // `category` picks a site's glyph (A15); other types ignore it.
+    const svg = glyphSvg(safeType, {
+      status: safeStatus,
+      size: 10,
+      category: typeof category === 'string' ? category : undefined,
+    });
     return typeof svg === 'string' ? svg : '';
   } catch {
     return '';
@@ -74,7 +91,7 @@ function chipGlyph(type, status) {
 export function createChip(ref, hooks = {}) {
   const node = lookupNode(hooks.store, ref.id);
   const type = node?.type || nodeTypeOf(ref.id);
-  const status = node?.status || 'unknown';
+  const status = chipStatus(type, node?.status);
   // A feed without a markup label gets the orb's plain name ("Contacts
   // feed"), never the server's internal one.
   const labelText =
@@ -82,7 +99,7 @@ export function createChip(ref, hooks = {}) {
     (node?.type === 'feed' ? feedLabel(node) : node?.label) ||
     null;
   const glyph = h('span', { class: 'ic-chip__glyph', 'aria-hidden': 'true' });
-  const svg = chipGlyph(type, status);
+  const svg = chipGlyph(type, status, node?.attrs?.category);
   if (svg) glyph.innerHTML = svg;
   const text = h(
     'span',
@@ -95,7 +112,8 @@ export function createChip(ref, hooks = {}) {
       type: 'button',
       class: 'ic-chip',
       'data-id': ref.id,
-      'data-status': STATUSES.has(status) ? status : 'unknown',
+      'data-status': status,
+      'data-type': NODE_TYPES.has(type) ? type : 'unrecognised',
       'data-missing': node ? null : 'true',
       title: node ? null : MISSING_TIP,
       tabindex: '-1',

@@ -33,6 +33,7 @@ import {
   UAV_MODEL_URL,
   VEHICLE_PREFIX,
 } from './policy.js';
+import { JUMP_GUARD_M } from './motion.js';
 
 /** Text, trimmed, or '' — the bridge sends '' for "no value" in several slots. */
 function text(value) {
@@ -162,6 +163,18 @@ export function createRendering({ state, parts, resolveAsset }) {
     const atMs = Number.isFinite(record.observedAtMs)
       ? record.observedAtMs
       : observedAtMs;
+    // Jump guard (§4.2.8): a fix more than JUMP_GUARD_M from the last trail
+    // vertex (a theater switch re-parks the fleet) starts a new trail and new
+    // interpolation, so no line or sweep joins the old theater to the new.
+    const held = state.trails.get(reference);
+    const lastVertex = held?.[held.length - 1];
+    if (
+      lastVertex &&
+      Cesium.Cartesian3.distance(lastVertex, cart) > JUMP_GUARD_M
+    ) {
+      motion.forget(reference);
+      held.length = 0;
+    }
     motion.addSample(reference, cart, atMs);
     motion.setAttitude(reference, {
       heading: record.velocity?.heading,
@@ -379,6 +392,17 @@ export function createRendering({ state, parts, resolveAsset }) {
     }
   }
 
+  /**
+   * Theater changed (§4.2.8): empty every trail in place (the polylines read
+   * them each frame) and drop all interpolation, so the next fix of every
+   * drone starts clean in the new theater. Vehicles and contacts stay.
+   * @returns {void}
+   */
+  function resetTrails() {
+    for (const trail of state.trails.values()) trail.length = 0;
+    motion.clear();
+  }
+
   /** Release every rendered entity without touching the data source itself. */
   function clear() {
     state.entities.clear();
@@ -396,6 +420,7 @@ export function createRendering({ state, parts, resolveAsset }) {
     pruneContacts,
     vehicleLabel,
     modelHeadingOffsetDeg: MODEL_HEADING_OFFSET_DEG,
+    resetTrails,
     clear,
   };
 }

@@ -10,6 +10,7 @@ PLAN constraints:
 Feeds served (BRIDGE_CONTRACT.md):
     GET /health          open; `theater` = the ACTIVE theater (see below)
     GET /snapshot        vehicles[] + missions[] + contacts[] + feeds{}
+                         + theater{id, epoch} (WG §3.4)
     GET /snapshot/{name} one vehicle
     GET /mission-overlay GeoJSON FeatureCollection, refreshed on mission change
     GET /events          Server-Sent Events, the alarm lane
@@ -237,12 +238,26 @@ CAMERA_SUB_TTL_S = 12.0
 FLOWN_MAX_POINTS = 4000
 FLOWN_MIN_STEP_M = 2.0
 
+#: A fix this far from the last flown vertex starts a NEW track (WG §3.4, D7
+#: #7). No airframe here covers 2 km in one 10 Hz sample, so a gap that size is
+#: an origin move (a runtime theater switch) or a teleport - and joining the
+#: two with a line drew a 13,000 km "flown" leg across the globe, scored as
+#: coverage. Same distance as the console's `JUMP_GUARD_M`.
+FLOWN_JUMP_M = 2000.0
+
 #: How long the bridge waits before re-reading `uav://safety/geofence` after a
 #: read that produced nothing. The resource is static for a run, so it is read
 #: once and then retried on a slow clock: a server that registers it late still
 #: gets the geofence layer and the ACTIVE theater, and one that never will is
 #: not hammered.
 GEOFENCE_RETRY_S = 30.0
+
+#: How often a SUCCESSFUL read of `uav://safety/geofence` is re-read. The
+#: resource stopped being static with runtime theaters (WG §4.1.7): the host
+#: calls `MissionFeed.invalidate_geofence()` on a switch, and this slow re-read
+#: catches a theater change that no listener reported (a separately restarted
+#: MCP server behind `GODSEYE_MCP_URL`).
+GEOFENCE_REREAD_S = 30.0
 
 #: Where the ACTIVE theater comes from. The bridge does not choose a theater and
 #: cannot see `launch.py`'s `--theater`; the only authority is the MCP server
@@ -325,7 +340,10 @@ def _m_per_deg(lat: float) -> tuple[float, float]:
 
 def _ground_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     m_lat, m_lon = _m_per_deg((lat1 + lat2) / 2.0)
-    return math.hypot((lat2 - lat1) * m_lat, (lon2 - lon1) * m_lon)
+    # Wrapped, so a step across the antimeridian (a theater anywhere, WG §4)
+    # is metres, not ~40,000 km that would trip FLOWN_JUMP_M on every crossing.
+    dlon = (lon2 - lon1 + 180.0) % 360.0 - 180.0
+    return math.hypot((lat2 - lat1) * m_lat, dlon * m_lon)
 
 
 def circle_ring(lat: float, lon: float, radius_m: float,
@@ -789,8 +807,10 @@ class AirSimAdapter:
         self.datum_source = ""
         #: THE home conversion, done once. With `home_datum="hae"` there is
         #: nothing to convert, so no geoid is touched at construction and a
-        #: bridge still boots where the EGM96 grid is missing.
-        self.home_geo = HomeGeoPoint.from_geo(
+        #: bridge still boots where the EGM96 grid is missing. `_home` is the
+        #: cached NED->geo projection; `home_geo` (a property) reads its point,
+        #: and `relocate()` replaces it in ONE assignment.
+        self._home = HomeGeoPoint.from_geo(
             home if home_datum == "hae" else
             GeoPoint(home.latitude, home.longitude,
                      self.altitude_fix(home.altitude, home.latitude,
@@ -806,6 +826,38 @@ class AirSimAdapter:
         self.vehicles_fallback: str | None = None
         #: last camera failure, so a 503 can say WHY the PIP is dark.
         self.camera_error: str | None = None
+
+    @property
+    def home_geo(self) -> GeoPoint:
+        """The origin this adapter projects NED against: HAE (T1), a GeoPoint.
+
+        The origin-holder protocol (WG §3.10: `.relocate(GeoPoint)` and
+        `.home_geo -> GeoPoint`); a theater switch cross-checks this copy
+        against the sim's and the MCP backend's (§4.1.3 step 2e).
+        """
+        return self._home.geo
+
+    def relocate(self, new_home: GeoPoint) -> None:
+        """Move this adapter's origin copy to `new_home` (WG §4.1.3 step 2d).
+
+        `new_home` is HAE: the switch converted the theater's MSL ground ONCE
+        (T1), so nothing is converted here. The cached projection is replaced
+        in a single assignment, so a loop-A sample in flight projects wholly
+        against the old origin or wholly against the new one, never a mix.
+        Raises ValueError on a non-finite or out-of-range point, leaving the
+        old origin in place (the switch's cross-check then fails loudly).
+        """
+        lat = float(new_home.latitude)
+        lon = float(new_home.longitude)
+        alt = float(new_home.altitude)
+        if not (math.isfinite(lat) and math.isfinite(lon) and math.isfinite(alt)
+                and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise ValueError(
+                f"relocate needs a finite WGS84 point, got ({lat}, {lon}, {alt})")
+        geo = GeoPoint(lat, lon, alt)
+        self.home_declared = geo
+        self.home_datum = "hae"
+        self._home = HomeGeoPoint.from_geo(geo)
 
     def _ensure(self):
         if self._client is None:
@@ -896,7 +948,9 @@ class AirSimAdapter:
             q = st.kinematics_estimated.orientation
             pitch_deg, roll_deg = _attitude_from_quat(q)
             ned = NedPoint(pos.x_val, pos.y_val, pos.z_val)
-            gp = ned_to_geodetic(ned, self.home_geo)
+            # One read of the origin: `relocate()` may swap it from another
+            # thread (a theater switch), and this sample uses exactly one.
+            gp = ned_to_geodetic(ned, self._home)
             # `gp.altitude` is HAE (GeoPoint's contract, and what
             # ned_to_geodetic documents it returns). Convert once, here, in
             # the direction the datum actually runs (T1).
@@ -1304,6 +1358,16 @@ class MissionFeed:
         #: "unknown", not an empty field.
         self._geofence_error: str | None = None
         self._geofence_ms = 0
+        #: `(theater.id, theater.epoch)` of the last stored geofence document:
+        #: `_refresh_geofence` reports a change of THIS pair, not a re-read.
+        self._theater_epoch: tuple[str | None, int | None] | None = None
+        #: bumped by `invalidate_geofence()`; a read that was in flight across
+        #: an invalidation is dropped, since it may describe the old theater.
+        self._geofence_gen = 0
+        #: set by `invalidate_geofence()` until the next read lands, so the
+        #: unknown answer in between says "re-reading" (until a read fails,
+        #: when it carries that error like any unread resource).
+        self._geofence_invalidated = False
         self._detail_missing: set[str] = set()
         #: The raw `uav_list_tracks` rows (full SALUTE) behind the last
         #: `contacts[]`. `/snapshot` publishes only the compact contact row;
@@ -1376,21 +1440,59 @@ class MissionFeed:
         to `theaters.DEFAULT_THEATER_ID` — "unknown, because X" is a state the
         panel can show as a mismatch, whereas a plausible wrong theater is not.
 
-        KNOWN LIMIT, stated rather than papered over: `uav://safety/geofence`
-        is read ONCE and then cached for the life of the bridge (see
-        `_refresh_geofence`), so if an MCP server were replaced under a running
-        bridge by one flying a DIFFERENT theater, this would keep answering the
-        old one. `at_ms` is published for exactly that reason - it is when the
-        answer was learned, not when it was served. The shipped topology cannot
-        reach the condition (`launch.py` runs the sim, the MCP server and this
-        bridge in one process, and the theater is fixed at server construction
-        - `sim_reset` does not change it); a deployment that points
-        `GODSEYE_MCP_URL` at a separately-restartable server can, and wants a
-        periodic re-read here.
+        The theater can change at runtime (WG §4.1.7). The host's switch
+        listener calls `invalidate_geofence()`, and loop C re-reads the
+        resource every GEOFENCE_REREAD_S regardless, which also catches a
+        separately restarted MCP server. `at_ms` is when the answer was last
+        read, not when it was served.
         """
         with self._lock:
-            doc, err, at_ms = (self._geofence, self._geofence_error,
-                               self._geofence_ms)
+            doc, err, at_ms, pending = (
+                self._geofence, self._geofence_error, self._geofence_ms,
+                self._geofence_invalidated)
+        return self._active_from(doc, err, at_ms, pending)
+
+    def theater_ref(self) -> dict:
+        """`/snapshot.theater` (WG §3.4): `{id, epoch}` from ONE cached read.
+
+        `id` is the active block's; `epoch` is the geofence document's
+        `theater.epoch` (None from a server that predates it, or when the
+        theater is unknown). Both come from the same document, so a switch
+        landing between two reads can never pair the new id with the old epoch.
+        """
+        with self._lock:
+            doc, err, at_ms, pending = (
+                self._geofence, self._geofence_error, self._geofence_ms,
+                self._geofence_invalidated)
+        tid = self._active_from(doc, err, at_ms, pending)["id"]
+        epoch = _doc_theater_key(doc)[1] if tid and doc is not None else None
+        return {"id": tid, "epoch": epoch}
+
+    def invalidate_geofence(self) -> None:
+        """Forget the cached geofence document; loop C re-reads it next poll.
+
+        Called by the host's theater listener after a switch (WG §4.1.10).
+        The old document describes an area the server no longer enforces, so
+        it is dropped rather than served until the re-read lands; the overlay
+        key is reset so that poll rebuilds the geofence layer. Never raises
+        and does no I/O: it runs on the tasking loop.
+        """
+        with self._lock:
+            self._geofence = None
+            self._geofence_at = 0.0
+            self._geofence_error = None
+            self._geofence_invalidated = True
+            self._geofence_gen += 1
+            self._overlay_key = None
+
+    @staticmethod
+    def _active_from(doc: dict | None, err: str | None, at_ms: int,
+                     pending: bool) -> dict:
+        """The active block for one cached (doc, error, at_ms) read."""
+        if doc is None and pending and not err:
+            return theaters.active_unknown(
+                "the theater changed; uav://safety/geofence is being re-read",
+                source=ACTIVE_THEATER_SOURCE)
         if doc is None:
             return theaters.active_unknown(
                 f"uav://safety/geofence could not be read: {err}" if err else
@@ -2028,33 +2130,48 @@ class MissionFeed:
 
     # ---- safety resource: the geofence layer AND the active theater ---------
     def _refresh_geofence(self) -> bool:
-        """Read `uav://safety/geofence` once, then retry on a slow clock.
+        """Read `uav://safety/geofence`, then re-read it on a slow clock.
 
-        Returns True only when a document was newly stored, so the caller can
-        rebuild the overlay on the poll the layer actually arrived.
+        Unread (or after `invalidate_geofence()`): read now, and retry every
+        GEOFENCE_RETRY_S on failure. Read: re-read every GEOFENCE_REREAD_S.
+        Returns True only when `(theater.id, theater.epoch)` changed (the
+        first document counts), so the caller rebuilds the overlay on the poll
+        a new theater arrived and not on every re-read (WG §4.1.7).
 
-        A failure is RECORDED, not discarded. The old code did
-        `if not err: self._geofence = doc` and dropped `err` on the floor,
-        which was survivable while this only fed a map layer and is not now
-        that it also answers "which theater am I flying?".
+        A failure is RECORDED, not discarded. A failed RE-read keeps the last
+        document: the theater did not change because the server stopped
+        answering, and `at_ms` says how old the answer is. A read that was in
+        flight across an invalidation is dropped (it may describe the old
+        theater); the next poll reads again.
         """
-        if self._geofence is not None:
-            return False
+        with self._lock:
+            cached = self._geofence is not None
+            last_at = self._geofence_at
+            gen = self._geofence_gen
         now = time.monotonic()
-        if now - self._geofence_at <= GEOFENCE_RETRY_S:
-            return False
-        self._geofence_at = now
-        doc, err = self.mcp.read_resource("uav://safety/geofence")
-        if err or not isinstance(doc, dict):
-            with self._lock:
-                self._geofence_error = (
-                    err or "uav://safety/geofence returned no JSON object")
+        wait = GEOFENCE_REREAD_S if cached else GEOFENCE_RETRY_S
+        if last_at and now - last_at <= wait:
             return False
         with self._lock:
+            if gen != self._geofence_gen:
+                return False
+            self._geofence_at = now
+        doc, err = self.mcp.read_resource("uav://safety/geofence")
+        with self._lock:
+            if gen != self._geofence_gen:
+                return False
+            if err or not isinstance(doc, dict):
+                self._geofence_error = (
+                    err or "uav://safety/geofence returned no JSON object")
+                return False
+            key = _doc_theater_key(doc)
+            changed = key != self._theater_epoch
             self._geofence = doc
             self._geofence_error = None
+            self._geofence_invalidated = False
             self._geofence_ms = int(time.time() * 1000)
-        return True
+            self._theater_epoch = key
+        return changed
 
     # ---- overlay -----------------------------------------------------------
     def _refresh_overlay(self, intel: MissionIntel) -> None:
@@ -2277,6 +2394,23 @@ def _empty_overlay(reason: str) -> dict:
             "degraded": [reason], "generatedAtMs": int(time.time() * 1000)}
 
 
+def _doc_theater_key(doc: Any) -> tuple[str | None, int | None]:
+    """`(theater.id, theater.epoch)` of a geofence document (WG §3.4).
+
+    The epoch is the server's switch counter (A6a); a server that predates it,
+    or sends a non-integer, gives None rather than a guessed 0. A bool is not
+    an epoch, although Python counts it as an int.
+    """
+    block = doc.get("theater") if isinstance(doc, dict) else None
+    if not isinstance(block, dict):
+        return None, None
+    tid = str(block.get("id") or "").strip() or None
+    epoch = block.get("epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int):
+        epoch = None
+    return tid, epoch
+
+
 # ---------------------------------------------------------------------------
 # bridge state (loops A + B)
 # ---------------------------------------------------------------------------
@@ -2310,12 +2444,29 @@ class BridgeState:
         with self._lock:
             return list(self._flown.get(vehicle) or ())
 
+    def reset_flown(self) -> None:
+        """Drop every vehicle's flown track (WG §3.4).
+
+        The host's theater listener calls this after a switch: a track flown
+        in the old area is neither coverage nor a trail in the new one.
+        """
+        with self._lock:
+            self._flown.clear()
+
     def _record_flown(self, snap: VehicleSnapshot) -> None:
+        """Append a fix; the caller holds `_lock`.
+
+        A fix more than FLOWN_JUMP_M from the last vertex starts a new track
+        instead of drawing the jump as a flown leg (D7 #7).
+        """
         track = self._flown.setdefault(snap.name, deque(maxlen=FLOWN_MAX_POINTS))
         if track:
             lat, lon = track[-1]
-            if _ground_m(lat, lon, snap.latitude, snap.longitude) < FLOWN_MIN_STEP_M:
+            step = _ground_m(lat, lon, snap.latitude, snap.longitude)
+            if step < FLOWN_MIN_STEP_M:
                 return
+            if step > FLOWN_JUMP_M:
+                track.clear()
         track.append((snap.latitude, snap.longitude))
 
     # ---- loop A: telemetry -------------------------------------------------
@@ -2762,6 +2913,26 @@ def create_app(adapter: AirSimAdapter | None = None, token: str = "dev-token",
                                  "polls": getattr(state.feed, "polls", 0),
                                  **state.feed.intel().feeds_dict()}}
 
+    def snapshot_theater() -> dict:
+        """`/snapshot.theater = {id, epoch}` (WG §3.4); the console resets
+        trails and overlays when `epoch` changes.
+
+        From the feed's `theater_ref()`, which reads the id and the epoch off
+        one cached document. A state source without it, or one that answers
+        with something unusable, gives the active block's id and `epoch: None`
+        - an unknown epoch, never a guessed one.
+        """
+        ref = _feed_call(state, "theater_ref", None)
+        if isinstance(ref, dict):
+            tid, epoch = ref.get("id"), ref.get("epoch")
+            if tid is None:
+                return {"id": None, "epoch": None}
+            if (isinstance(tid, str) and tid.strip()
+                    and (epoch is None or (isinstance(epoch, int)
+                                           and not isinstance(epoch, bool)))):
+                return {"id": tid, "epoch": epoch}
+        return {"id": active_theater()["id"], "epoch": None}
+
     def snapshot_body() -> dict:
         # Pure cache read. No MCP call, no camera pull, no geoid lookup - a
         # slow feed can never stall the poll (BRIDGE_CONTRACT rule 4).
@@ -2778,6 +2949,7 @@ def create_app(adapter: AirSimAdapter | None = None, token: str = "dev-token",
             "missions": intel.missions,
             "contacts": intel.contacts,
             "feeds": intel.feeds_dict(),
+            "theater": snapshot_theater(),
         }
 
     @app.get("/snapshot")

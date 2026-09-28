@@ -229,6 +229,34 @@ test('a bridge without missions[]/contacts[] degrades instead of throwing', asyn
     assert.deepEqual(snap.contacts, []);
     assert.equal(snap.sections.missions, false);
     assert.equal(snap.sections.contacts, false);
+    assert.equal(snap.theater, null, 'an older bridge sends no theater');
+  } finally {
+    fetchStub.restore();
+  }
+});
+
+test('/snapshot.theater reaches the snapshot as {id, epoch}', async () => {
+  const source = createUavSource();
+  let theater = { id: 'dyn-12p97160-77p59460', epoch: 1, extra: 'dropped' };
+  const fetchStub = stubFetch({
+    '/snapshot': () => ({
+      ok: true,
+      json: async () => ({ ...BRIDGE_SNAPSHOT, theater }),
+    }),
+  });
+  try {
+    assert.deepEqual((await source.getSnapshot({})).theater, {
+      id: 'dyn-12p97160-77p59460',
+      epoch: 1,
+    });
+    // One poll after a switch the epoch can be null: the id still counts.
+    theater = { id: 'redmond', epoch: null };
+    assert.deepEqual((await source.getSnapshot({})).theater, {
+      id: 'redmond',
+      epoch: null,
+    });
+    theater = { id: '', epoch: true };
+    assert.equal((await source.getSnapshot({})).theater, null);
   } finally {
     fetchStub.restore();
   }

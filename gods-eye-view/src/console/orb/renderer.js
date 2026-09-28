@@ -23,6 +23,7 @@ import {
   parsePath,
   tracePath,
 } from './glyphs.js';
+import { SITES_DEGRADED_TEXT, siteBandCaption } from './placeText.js';
 import {
   BANDS,
   BAND_ORDER,
@@ -603,7 +604,11 @@ export function placeCaptions(
     }
     if (best) found.push({ caption, y: best[1] });
   }
-  found.sort((a, b) => a.y - b.y);
+  // A warning caption (a feed down: contacts or map data "may be missing,
+  // not absent") claims its row first; the rest go top to bottom.
+  found.sort(
+    (a, b) => (a.caption.ink ? 0 : 1) - (b.caption.ink ? 0 : 1) || a.y - b.y,
+  );
   const rowAt = (caption, y, w) => {
     const dy = y - cy;
     const chord = Math.sqrt(Math.max(0, R * R - dy * dy));
@@ -747,7 +752,7 @@ export function createRenderer(env = {}) {
   /** Paint one node glyph directly (sprite construction, or no-sprite fallback). */
   function paintNode(g, spec, x, y, r) {
     const style = glyphStyle(spec.type, spec.status, { phase: spec.phase });
-    const d = glyphFor(spec.type).path;
+    const d = glyphFor(spec.type, { category: spec.category }).path;
     const k = r / GLYPH_NOMINAL_RADIUS;
     const drawGlyph = (ox, oy, alpha) => {
       g.save();
@@ -1375,7 +1380,7 @@ export function createRenderer(env = {}) {
       for (const sector of SECTORS) {
         toVector(BANDS.track.lat, sector.lonCenter, probe);
         if (camera.toView(probe)[2] < 0.5) continue;
-        toVector(GRATICULE_PARALLELS.beltTop - 3, sector.lonCenter, probe);
+        toVector(GRATICULE_PARALLELS.sectorNames, sector.lonCenter, probe);
         camera.projectXYZ(probe[0], probe[1], probe[2], tmp, 0);
         const w = measure(ctx, sector.label);
         const box = [tmp[0] - w / 2 - 2, tmp[1] - 9, w + 4, 18];
@@ -1498,16 +1503,29 @@ export function createRenderer(env = {}) {
   };
 }
 
-/** Band captions in pole-to-pole order, e.g. "Contacts 23 (+1)". */
+/**
+ * Band captions in pole-to-pole order, e.g. "Contacts 23 (+1)". The site band
+ * (WG §4.2.6) reads "Sites 41 (12 more on the map)", draws nothing when
+ * empty, and says so in warn ink when the map data feed is degraded.
+ * @param {object} counts layout.counts
+ * @param {{recent?: object, detectionsDown?: boolean,
+ *   sites?: {count?: number, omitted?: number, degraded?: boolean}}} [options]
+ *   `sites.count` is the number drawn on the orb (default counts.site)
+ */
 export function bandCaptions(
   counts,
-  { recent = {}, detectionsDown = false } = {},
+  { recent = {}, detectionsDown = false, sites = null } = {},
 ) {
   const out = [];
   for (const key of BAND_ORDER) {
     const band = BANDS[key];
     const count = counts?.[key] || 0;
     if (key === 'other' && !count) continue;
+    if (key === 'site') {
+      const row = siteCaption(count, sites);
+      if (row) out.push({ key, ...row, lat: band.lat });
+      continue;
+    }
     let text = `${band.caption} ${count}`;
     let ink = null;
     if (key === 'track' && detectionsDown) {
@@ -1521,4 +1539,12 @@ export function bandCaptions(
     out.push({ key, text, ink, lat: key === 'theater' ? 86 : band.lat });
   }
   return out;
+}
+
+/** The site band caption row ({text, ink}) or null for an empty band. */
+function siteCaption(count, sites) {
+  if (sites?.degraded) return { text: SITES_DEGRADED_TEXT, ink: COLORS.warn };
+  const drawn = Number.isFinite(sites?.count) ? sites.count : count;
+  const text = siteBandCaption({ count: drawn, omitted: sites?.omitted || 0 });
+  return text ? { text, ink: null } : null;
 }

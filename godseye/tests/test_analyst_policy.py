@@ -6,9 +6,13 @@ needed just to list tools) and iterates its catalog.
 """
 import asyncio
 import dataclasses
+import math
+import pathlib
+import re
 
 import pytest
 from godseye_uav import analyst_policy as pol
+from godseye_uav import theater_tools
 from godseye_uav.analyst_policy import (
     COMMAND,
     DRY_RUN_TOOLS,
@@ -41,8 +45,11 @@ EXPECTED_CLASS = {
         "uav_los_check", "uav_target_report", "uav_identify_target", "uav_assess_threat",
         "uav_list_ob_classes", "uav_real_data_status", "uav_deconflict_airspace",
         "uav_list_tracks", "intel_overview", "intel_search", "intel_entity",
-        "read_intel_resource", "ui_focus", "ui_track", "ui_show_orb", "ui_inspect")},
+        "read_intel_resource", "ui_focus", "ui_track", "ui_show_orb", "ui_inspect",
+        # runtime theaters (WG spec §3.7, A8)
+        "geo_lookup", "geo_sites", "ui_show_map")},
     "mission_dry_run": PLAN,
+    "theater_propose": PLAN,
     **{t: SENSOR for t in ("uav_get_detections", "uav_scan_targets", "uav_capture_image",
                            "uav_set_gimbal", "uav_set_fov")},
     **{t: COMMAND for t in (
@@ -53,7 +60,8 @@ EXPECTED_CLASS = {
         "mission_cancel", "uav_abort")},
     **{t: SIM for t in ("sim_set_time", "sim_set_weather", "sim_spawn_target",
                         "sim_move_target", "sim_set_gps_degradation", "sim_hydrate_real_data",
-                        "sim_spawn_order_of_battle", "sim_set_environment")},
+                        "sim_spawn_order_of_battle", "sim_set_environment",
+                        "sim_set_theater", "sim_set_time_scale")},
     **{t: SAFETY_OVERRIDE for t in ("sim_set_fuel", "sim_set_link_state", "sim_reset")},
 }
 
@@ -64,14 +72,20 @@ MOVEMENT_AND_MISSION = (
 
 
 @pytest.fixture(scope="module")
-def server_tool_names(tmp_path_factory):
+def server_tools(tmp_path_factory):
+    """``{name: Tool}`` for every tool the real server registers."""
     store = Store(tmp_path_factory.mktemp("policy-store"))
     try:
         srv = GodseyeUavServer(None, store)
         tools = asyncio.run(srv.mcp.list_tools())
-        return sorted(t.name for t in tools)
+        return {t.name: t for t in tools}
     finally:
         store.close()
+
+
+@pytest.fixture(scope="module")
+def server_tool_names(server_tools):
+    return sorted(server_tools)
 
 
 # ------------------------------------------------------------- coverage --
@@ -97,6 +111,7 @@ def test_expected_table_matches_policy_exactly():
         assert d.klass == klass, name
         assert d.auto is (klass in (READ, PLAN)), name
         assert d.allow_session is (klass == SENSOR), name
+        assert d.acknowledge is (klass == SAFETY_OVERRIDE), name
     assert set(EXPECTED_CLASS) == set(KNOWN_TOOLS)
 
 
@@ -464,3 +479,339 @@ def test_bidi_controls_are_stripped_from_the_approval_text():
     assert "Drone1ynneD" in text
     fallback = classify(f"weird{rlo}tool", None)
     assert rlo not in fallback.title
+
+
+# ======================================================================
+# runtime theaters (WG spec §3.7, §4.3 A8)
+# ======================================================================
+
+#: WG spec §3.7 titles for the six Phase A tools.
+PHASE_A_TITLES = {
+    "geo_lookup": "Look up a place",
+    "geo_sites": "List mapped sites",
+    "theater_propose": "Propose a theater",
+    "sim_set_theater": "Set the theater",
+    "sim_set_time_scale": "Set sim speed",
+    "ui_show_map": "Show on the map",
+}
+
+FORMAT_JS = (pathlib.Path(__file__).resolve().parents[2]
+             / "gods-eye-view" / "src" / "console" / "chat" / "format.js")
+
+
+def _box(lat: float, lon: float, half_m: float) -> list[list[float]]:
+    """The square AO `theaters.make_dynamic` builds (same constants)."""
+    dlat = half_m / 111_320.0
+    dlon = half_m / (111_320.0 * math.cos(math.radians(lat)))
+    return [[lat - dlat, lon - dlon], [lat - dlat, lon + dlon],
+            [lat + dlat, lon + dlon], [lat + dlat, lon - dlon]]
+
+
+SET_ARGS = {"proposal_id": "prop-1", "theater_id": "dyn-bengaluru-centre-1a2b3c",
+            "label": "Bengaluru centre", "ao": _box(12.9716, 77.5946, 2500.0),
+            "home_lat": 12.97321, "home_lon": 77.59102, "ground_msl_m": 920.0,
+            "airframe": "quad_suas_electric"}
+
+
+def _set_theater(**over):
+    return classify("sim_set_theater", {**SET_ARGS, **over})
+
+
+def test_phase_a_adds_exactly_six_classified_tools(server_tool_names):
+    assert set(PHASE_A_TITLES) <= set(EXPECTED_CLASS)
+    assert set(theater_tools.TOOL_NAMES) <= set(server_tool_names)
+    assert pol.THEATER_TOOLS == set(theater_tools.TOOL_NAMES)
+    assert "ui_show_map" in pol.CURATED_TOOLS
+    assert {EXPECTED_CLASS[t] for t in ("geo_lookup", "geo_sites", "ui_show_map")} == {READ}
+    assert EXPECTED_CLASS["theater_propose"] == PLAN
+    assert EXPECTED_CLASS["sim_set_theater"] == EXPECTED_CLASS["sim_set_time_scale"] == SIM
+
+
+def test_phase_a_titles_match_the_server_and_the_spec(server_tools):
+    for name, title in PHASE_A_TITLES.items():
+        assert classify(name, {}).title == title, name
+        assert pol._TITLES[name] == title
+    for name in theater_tools.TOOL_NAMES:
+        # the server title wins: the policy repeats what the tool registers
+        assert theater_tools.TITLES[name] == PHASE_A_TITLES[name]
+        assert server_tools[name].title == PHASE_A_TITLES[name], name
+
+
+@pytest.mark.skipif(not FORMAT_JS.is_file(), reason="console sources not in this checkout")
+def test_policy_titles_match_the_console_tool_titles():
+    text = FORMAT_JS.read_text(encoding="utf-8")
+    block = text[text.index("export const TOOL_TITLES"):]
+    block = block[:block.index("});")]
+    js = dict(re.findall(r"^\s*([a-z_]+): '([^']*)',?\s*$", block, re.MULTILINE))
+    assert set(PHASE_A_TITLES) <= set(js)
+    for name in set(js) & set(pol._TITLES):
+        assert js[name] == pol._TITLES[name], name
+
+
+def test_geo_reads_are_static_auto_and_the_sim_tools_never_are():
+    for name in ("geo_lookup", "geo_sites", "ui_show_map"):
+        assert name in STATIC_AUTO_TOOLS
+    for name in ("theater_propose", "sim_set_theater", "sim_set_time_scale"):
+        assert name not in STATIC_AUTO_TOOLS
+    for name in ("sim_set_theater", "sim_set_time_scale"):
+        for args in ({}, SET_ARGS, {"scale": 4}, {"dry_run": True}):
+            d = classify(name, args)
+            assert d.klass == SIM and d.auto is False and d.allow_session is False
+            assert d.acknowledge is False
+
+
+@pytest.mark.parametrize("args", [
+    {}, {"dry_run": True}, {"dry_run": False}, {"lost_link_plan": {"behaviour": "rtb"}},
+    {"params": {"lost_link_plan": {}}}, {"params": "lost_link_plan=continue"},
+    {"lat": 12.9716, "lon": 77.5946, "label": "Bengaluru centre"}])
+def test_theater_propose_is_always_a_plan_and_never_a_dry_run(args):
+    d = classify("theater_propose", args)
+    assert d.klass == PLAN and d.auto is True and d.allow_session is False
+    assert d.title == "Propose a theater"
+    assert "dry run" not in d.summary and "lost-link" not in d.summary
+    assert not any("lost-link" in c or "nothing is queued" in c for c in d.consequences)
+
+
+def test_no_theater_tool_declares_dry_run_params_or_a_lost_link_plan(server_tools):
+    """The premise of the two tests around this one: the server drops undeclared
+    arguments, so on these tools neither flag can plan or rewrite anything."""
+    for name in theater_tools.TOOL_NAMES:
+        props = set(server_tools[name].input_schema.get("properties", {}))
+        assert not props & {"dry_run", "params", "lost_link_plan"}, name
+
+
+def test_mission_dry_run_keeps_its_lost_link_escalation():
+    d = classify("mission_dry_run", {"vehicle": "Drone1", "lost_link_plan": {"b": 1}})
+    assert d.klass == COMMAND and d.auto is False
+
+
+@pytest.mark.parametrize("name", sorted(theater_tools.TOOL_NAMES))
+def test_a_lost_link_plan_on_a_theater_tool_is_not_claimed(name):
+    d = classify(name, {**SET_ARGS, "scale": 2, "lost_link_plan": {"behaviour": "rtb"}})
+    assert not any("lost-link" in c for c in d.consequences), name
+    assert "lost-link" not in d.summary
+
+
+# ------------------------------------------------------------ acknowledge --
+
+def test_only_safety_overrides_ask_for_an_acknowledgement():
+    assert pol.ACKNOWLEDGE_CLASSES == {SAFETY_OVERRIDE}
+    for name, klass in EXPECTED_CLASS.items():
+        assert classify(name, {"vehicle": "Drone1"}).acknowledge is (klass == SAFETY_OVERRIDE)
+    assert classify("uav_teleport", {}).acknowledge is False
+
+
+def test_acknowledge_defaults_off_and_the_fallback_never_sets_it(monkeypatch):
+    d = Decision(klass=COMMAND, auto=False, allow_session=False, title="T", summary="s",
+                 consequences=())
+    assert d.acknowledge is False
+    monkeypatch.setattr(pol, "_summary", lambda *a, **k: 1 / 0)
+    fallback = classify("sim_set_fuel", {})
+    assert fallback.klass == COMMAND and fallback.acknowledge is False
+
+
+# ----------------------------------------------------------- consequences --
+
+def test_set_theater_consequences_are_the_spec_lines():
+    d = _set_theater()
+    assert d.title == "Set the theater"
+    assert d.summary == "Bengaluru centre · 5.0 × 5.0 km"
+    assert d.consequences == (
+        ("Moves the simulation to Bengaluru centre: a 5.0 × 5.0 km area around "
+         "12.97160, 77.59460."),
+        ("Every drone is parked, landed, at the new home (12.97321, 77.59102); the old "
+         "area's geofence stops applying."),
+        ("Fuel level and the BINGO latch are kept unless the airframe changes, which gives "
+         "a full tank."),
+        ("Refused if any drone is airborne, busy, BINGO-latched or has lost its link, and "
+         "under real AirSim."),
+        ("Contacts, reports and the audit trail are kept; alarms in progress and the old "
+         "area's real data are cleared."),
+    )
+
+
+def test_set_theater_width_and_height_come_from_the_ao_bounds():
+    # a group-3 box at 60°N: 50 km each way, and an uneven 12 x 4 km polygon
+    assert "a 50.0 × 50.0 km area around 60.00000, 25.00000" in \
+        _set_theater(ao=_box(60.0, 25.0, 25_000.0)).consequences[0]
+    dlat = 4_000 / 111_320.0
+    dlon = 12_000 / (111_320.0 * math.cos(math.radians(10.0 + dlat / 2)))
+    uneven = [[10.0, 20.0], [10.0 + dlat, 20.0], [10.0 + dlat / 2, 20.0 + dlon / 3],
+              [10.0 + dlat, 20.0 + dlon], [10.0, 20.0 + dlon]]
+    first = _set_theater(ao=uneven).consequences[0]
+    assert first.endswith("a 12.0 × 4.0 km area around 10.01797, 20.05473."), first
+
+
+@pytest.mark.parametrize("ao", [None, [], [[1, 2], [3, 4]], "12.9,77.5", [[1, 2], [3, 4], [5]],
+                                [[1, 2], [3, "4"], [5, 6]], [[1, 2], [3, True], [5, 6]],
+                                [[1, 2], [3, float("nan")], [5, 6]],
+                                [[1, 2], [95, 4], [5, 6]], [[1, 2], [3, 181], [5, 6]]])
+def test_a_malformed_ao_drops_the_area_but_never_the_card(ao):
+    d = _set_theater(ao=ao)
+    assert d.klass == SIM and d.auto is False
+    assert d.consequences[0] == "Moves the simulation to Bengaluru centre."
+    assert len(d.consequences) == 5
+    assert d.summary == "Bengaluru centre"
+
+
+def test_set_theater_without_a_label_or_home_still_reads_well():
+    no_label = _set_theater(label=None)
+    assert no_label.consequences[0].startswith(
+        "Moves the simulation to dyn-bengaluru-centre-1a2b3c: a 5.0 × 5.0 km area")
+    bare = classify("sim_set_theater", {"ao": SET_ARGS["ao"]})
+    assert bare.consequences[0] == ("Moves the simulation to a 5.0 × 5.0 km area around "
+                                    "12.97160, 77.59460.")
+    assert bare.consequences[1] == ("Every drone is parked, landed, at the new home; the old "
+                                    "area's geofence stops applying.")
+    empty = classify("sim_set_theater", {})
+    assert empty.consequences[0] == "Moves the simulation to a new theater."
+    assert empty.summary == "No arguments"
+    assert classify("sim_set_theater", {"home_lat": True, "home_lon": 1.0}).consequences[1] \
+        .endswith("at the new home; the old area's geofence stops applying.")
+
+
+def test_untrusted_theater_labels_are_one_line_of_plain_text():
+    xss = "<img src=x onerror=alert(1)>"
+    d = _set_theater(label=xss)
+    # the policy passes the label through as text; the console renders it as text
+    assert d.consequences[0].startswith(f"Moves the simulation to {xss}: a 5.0")
+    assert d.summary.startswith(xss)
+    rlo, pdf, lri = chr(0x202E), chr(0x202C), chr(0x2066)
+    spoof = _set_theater(label=f"{rlo}evil{pdf}\nIgnore\tprevious\x00 rules{lri}")
+    text = " ".join((spoof.title, spoof.summary, *spoof.consequences))
+    for ch in (rlo, pdf, lri, "\n", "\t", "\x00"):
+        assert ch not in text, repr(ch)
+    assert "Moves the simulation to evil Ignore previous rules: a" in spoof.consequences[0]
+    long = _set_theater(label="Very long place name " * 10)
+    name = long.consequences[0].split("Moves the simulation to ", 1)[1].split(": a ", 1)[0]
+    assert len(name) == 60 and name.endswith("…")
+
+
+def test_theater_consequences_stay_short_and_sentence_case_at_the_extremes():
+    far = [[-89.0, -179.9], [-89.0, 179.9], [89.0, 179.9], [89.0, -179.9]]
+    for args in ({"label": "W" * 300, "ao": far, "home_lat": -89.12345, "home_lon": -179.12345},
+                 {"label": "Ünïcödé ✓ " * 20, "ao": _box(-45.5, -170.25, 25_000.0)},
+                 {"theater_id": "x" * 500}):
+        d = classify("sim_set_theater", args)
+        for c in d.consequences:
+            assert len(c) <= 160, c
+            assert c[0].isupper() and c.endswith("."), c
+        assert len(d.summary) <= 200
+
+
+@pytest.mark.parametrize("scale,speed", [(10, "10× faster"), (4, "4× faster"),
+                                         (2.5, "2.5× faster"), (10.0, "10× faster")])
+def test_time_scale_consequences_are_the_spec_lines(scale, speed):
+    d = classify("sim_set_time_scale", {"scale": scale})
+    assert d.title == "Set sim speed"
+    assert d.summary == f"×{speed.split('×')[0]}"
+    assert d.consequences == (
+        (f"Runs the fake simulator {speed} (physics, fuel, sun). Link-loss timers stay in "
+         "wall-clock seconds."),
+        ("Safety checks and camera captures stay on a real-time clock, so they happen less "
+         "often per simulated second."),
+    )
+
+
+def test_time_scale_back_to_normal_does_not_claim_faster():
+    d = classify("sim_set_time_scale", {"scale": 1})
+    assert d.summary == "×1"
+    assert d.consequences == (
+        "Runs the fake simulator at normal speed (physics, fuel, sun).",
+        "Safety checks and camera captures run at their normal rate per simulated second.")
+
+
+@pytest.mark.parametrize("scale", [None, "fast", True, float("inf"), [4]])
+def test_time_scale_without_a_readable_scale_still_explains_itself(scale):
+    d = classify("sim_set_time_scale", {} if scale is None else {"scale": scale})
+    assert d.klass == SIM and d.auto is False
+    assert d.consequences[0].startswith("Runs the fake simulator at a new speed")
+    assert len(d.consequences) == 2
+
+
+def test_theater_read_and_plan_summaries():
+    assert classify("geo_lookup", {"query": "Kherson", "limit": 3}).summary == "“Kherson”"
+    assert classify("geo_sites", {"category": "airfield", "near_lat": 46.6, "near_lon": 32.6,
+                                  "refresh": True}).summary \
+        == "airfield · near 46.6000, 32.6000 · refresh"
+    assert classify("geo_sites", {}).summary == "No arguments"
+    assert classify("theater_propose", {
+        "lat": 12.9716, "lon": 77.5946, "label": "Bengaluru centre", "ground_msl_m": 920,
+        "airframe": "quad_suas_electric", "half_extent_m": 2500, "query": "12.97160, 77.59460",
+    }).summary == ("Bengaluru centre · 12.9716, 77.5946 · “12.97160, 77.59460” · "
+                   "2500 m half-extent · quad_suas_electric")
+    assert classify("theater_propose", {"theater_id": "kherson"}).summary == "kherson"
+    assert classify("ui_show_map", {"ids": ["thr:x", "trk:T-1"], "reason": "Watch"}).summary \
+        == "2 entities"
+
+
+# ------------------------------------------------------ the analyst prompt --
+
+#: The eleven chip prefixes of Phase A (WG spec §3.1: `sit` joins the ten).
+PROMPT_PREFIXES = ["veh", "msn", "trk", "unit", "ob", "rpt", "thr", "poi", "sit", "alarm", "feed"]
+
+
+@pytest.fixture(scope="module")
+def prompt_text():
+    from importlib.resources import files
+
+    return files("godseye_uav").joinpath("analyst_prompt.md").read_text(encoding="utf-8")
+
+
+def test_prompt_keeps_the_isr_only_identity_where_b7_splits_it(prompt_text):
+    lines = prompt_text.splitlines()
+    # WG spec §5.1: B7 splits `analyst_prompt.md:9-14` out as the ISR identity.
+    assert lines[8] == "## Identity: ISR only"
+    assert lines[10].startswith("This system observes, classifies and reports.")
+    assert lines[13].endswith("never an engagement recommendation.")
+    assert lines[14] == "" and lines[15] == "## How the console works"
+    assert prompt_text.count("## Identity") == 1
+    assert "No engagement recommendations." in prompt_text
+
+
+def test_prompt_prefix_list_has_the_eleven_prefixes(prompt_text):
+    flat = " ".join(prompt_text.split())
+    m = re.search(r"The prefixes are exactly these eleven \(`([a-z ]+)`\)", flat)
+    assert m, "the prefix sentence moved or changed"
+    assert m.group(1).split() == PROMPT_PREFIXES
+    used = set(re.findall(r"\[\[([a-z]+):", prompt_text)) - {"type"}
+    assert used == set(PROMPT_PREFIXES)
+
+
+def test_prompt_teaches_the_theater_workflow(prompt_text):
+    flat = " ".join(prompt_text.split())
+    for needle in (
+        "call `geo_lookup` (or take the coordinates the operator gives), then `theater_propose`",
+        "Choose `airframe=\"group3_fixed_wing\"` for areas wider than about 6 km.",
+        "Summarise the proposal in two lines",
+        "call `sim_set_theater` with its `set_args` exactly",
+        "The operator approves, and the drones must be landed and idle",
+        "Use `sim_set_time_scale` for long sorties.",
+        "`geo_sites` returns mapped strategic sites.",
+        "They are context only, mapped and not verified.",
+        "Cite them as `[[sit:…|name]]`.",
+        "A missing site is not an absent one.",
+        "`ui_show_map` shows an area on the map.",
+        "A recce is `mission_recon_route` or `mission_grid_search`, dry run first.",
+        "it stays ISR only, and a real place is context, never a target.",
+    ):
+        assert needle in flat, needle
+
+
+def test_prompt_names_every_phase_a_tool_and_their_approval_class(prompt_text):
+    for name in PHASE_A_TITLES:
+        assert f"`{name}`" in prompt_text, name
+    flat = " ".join(prompt_text.split())
+    reads = flat[flat.index("**Reads run at once.**"):flat.index("**Everything else waits")]
+    for name in ("geo_lookup", "geo_sites", "theater_propose"):
+        assert name in reads and EXPECTED_CLASS[name] in (READ, PLAN)
+    asks = flat[flat.index("**Everything else waits"):flat.index("**Never claim")]
+    for name in ("sim_set_theater", "sim_set_time_scale"):
+        assert name in asks and EXPECTED_CLASS[name] == SIM
+
+
+def test_prompt_stays_isr_in_phase_a(prompt_text):
+    assert "wg_" not in prompt_text
+    assert "ISR only" in prompt_text
+    bidi = {chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))}
+    assert not bidi & set(prompt_text)

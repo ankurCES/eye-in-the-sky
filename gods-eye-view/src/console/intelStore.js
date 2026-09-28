@@ -14,6 +14,10 @@
  * - `error` — `{kind:'auth'|'offline'|'timeout'|'http', message, status?, atMs}` or null;
  * - `scope` — `theater|all`.
  *
+ * Every `change` diff carries `theaterChanged`: `{from, to}` (each
+ * `{id, epoch, label, place}`) when `graph.theater.id` or its epoch changed
+ * (WG §4.2.4), else null. The orb runs its theater transition on it.
+ *
  * Alarm ids: graph alarm nodes are `alarm:{seq}` (the hub's publish number).
  * A live SSE alarm has no seq yet, so it is `alarm:live:{fingerprint}` until
  * the next graph carries it; the viewed set is keyed by fingerprint, so
@@ -171,6 +175,35 @@ export function diffNodes(prevIndex, prevPrints, nodes) {
   return { added, removed, updated, statusChanged, prints };
 }
 
+/** `{id, epoch, label, place}` of a graph theater block, or null. */
+function theaterRefOf(theater) {
+  if (!theater || typeof theater !== 'object') return null;
+  if (typeof theater.id !== 'string' || !theater.id) return null;
+  return {
+    id: theater.id,
+    epoch: Number.isInteger(theater.epoch) ? theater.epoch : null,
+    label: typeof theater.label === 'string' ? theater.label : null,
+    place: typeof theater.place === 'string' ? theater.place : null,
+  };
+}
+
+/**
+ * The theater change between two graph theater blocks (WG §4.2.4):
+ * `{from, to}` when the id changed, or when both carry an epoch and the
+ * epochs differ; otherwise null. A missing epoch on either side (an older
+ * server, or the first graph) is not a change by itself, so a server that
+ * starts reporting epochs doesn't fake a transition.
+ */
+export function theaterChangeBetween(prevTheater, nextTheater) {
+  const from = theaterRefOf(prevTheater);
+  const to = theaterRefOf(nextTheater);
+  if (!from || !to) return null;
+  if (from.id !== to.id) return { from, to };
+  if (from.epoch != null && to.epoch != null && from.epoch !== to.epoch)
+    return { from, to };
+  return null;
+}
+
 function errorOf(error, now) {
   const name = error?.name;
   const message = str(error?.message) || 'unknown error';
@@ -303,6 +336,8 @@ export function createIntelStore({
       statusFrom: null,
       statusTo: status,
       scope: false,
+      // Always present, so the orb takes the store's answer (null: none).
+      theaterChanged: null,
       ...diff,
     };
     for (const cb of [...listeners]) {
@@ -361,6 +396,9 @@ export function createIntelStore({
         JSON.stringify(next?.meta ?? null) ||
       JSON.stringify(graph?.theater ?? null) !==
         JSON.stringify(next?.theater ?? null);
+    const theaterChanged = first
+      ? null
+      : theaterChangeBetween(graph?.theater, next?.theater);
     graph = next;
     byId = indexNodes(nodes);
     prints = d.prints;
@@ -404,6 +442,7 @@ export function createIntelStore({
       alarms: alarmsChanged,
       newAlarms,
       scope: scopeChanged,
+      theaterChanged,
     };
   }
 

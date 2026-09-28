@@ -13,7 +13,7 @@
  * import time.
  */
 import { clamp, h, replaceKids, setClass, setHidden } from '../ui/uavDom.js';
-import { glyphSvg } from './orb/glyphs.js';
+import { glyphSvg, isKnownType } from './orb/glyphs.js';
 import {
   ALARM_KIND_LABEL,
   alarmNodeLabel,
@@ -21,6 +21,12 @@ import {
   feedState as orbFeedWord,
 } from './orb/text.js';
 import { kindWords } from './chat/format.js';
+import {
+  SITE_STATUS_TEXT,
+  areaText,
+  safeText,
+  stripBidi,
+} from './orb/placeText.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -40,7 +46,9 @@ export const ICON = Object.freeze({
   critical: 'error',
   focus: 'center_focus_weak',
   info: 'info',
+  map: 'map',
   open: 'open_in_full',
+  recce: 'route',
   retry: 'refresh',
   search: 'search',
   track: 'my_location',
@@ -59,6 +67,7 @@ export const TYPE_WORD = Object.freeze({
   poi: 'Place',
   alarm: 'Alarm',
   feed: 'Feed',
+  site: 'Site',
 });
 
 /** Alarm kind -> label (UX spec §7.2), shared with the orb (orb/text.js).
@@ -103,7 +112,6 @@ const THREAT_WORD = Object.freeze({
   none: 'None',
 });
 
-const NODE_TYPES = new Set(Object.keys(TYPE_WORD));
 const NODE_STATUSES = new Set(['ok', 'warn', 'critical', 'stale', 'unknown']);
 
 export const NOT_IN_PICTURE =
@@ -114,6 +122,8 @@ const NOT_ASSESSED_NOTE = 'Not the same as no threat.';
 const TELEMETRY_STALE_MS = 5000;
 /** "Updated N s ago" turns warn after this long (§7.2). */
 const UPDATED_WARN_MS = 10_000;
+/** How long a new theater title cross-fades in (the CSS animation's length). */
+const TITLE_FADE_MS = 600;
 
 // ---------------------------------------------------------------------------
 // Formatting kit (pure; exported for search.js and inspector.js)
@@ -273,6 +283,10 @@ export function statusWord(node) {
   const type = node?.type;
   const status = node?.status;
   const attrs = node?.attrs || {};
+  // A type the console doesn't know: its status is ignored (WG §4.2.1).
+  if (!isKnownType(type)) return 'Not assessed';
+  // Sites are context: always "Mapped, not verified" (WG §4.2.6).
+  if (type === 'site') return SITE_STATUS_TEXT;
   if (type === 'track' || type === 'unit') {
     if (status === 'stale') return 'Stale';
     if (status === 'unknown' || !isAssessed(attrs.threat))
@@ -301,12 +315,16 @@ export function statusWord(node) {
 
 /**
  * The colour tone for a node (§4.3): contacts and units that are `ok` are an
- * assessed-low film white, never green; equipment classes and places are
- * neutral Pencil. Lets CSS colour by one attribute.
+ * assessed-low film white, never green; equipment classes, places and mapped
+ * sites are neutral Pencil; a type the console doesn't know is lilac
+ * `unknown`. Lets CSS colour by one attribute.
  */
 export function toneOf(type, status) {
   const s = NODE_STATUSES.has(status) ? status : 'unknown';
-  if (type === 'equipment' || type === 'poi') return 'neutral';
+  // An unrecognised type is lilac whatever its status: never green.
+  if (!isKnownType(type)) return 'unknown';
+  if (type === 'equipment' || type === 'poi' || type === 'site')
+    return 'neutral';
   // An info-level alarm is Pencil grey, as the orb draws it, never green.
   if (type === 'alarm' && s === 'ok') return 'neutral';
   if (s === 'ok' && (type === 'track' || type === 'unit')) return 'low';
@@ -508,11 +526,18 @@ export function icon(name) {
 /**
  * An orb glyph (constant SVG from orb/glyphs.js) in its status colour. Type and
  * status are whitelisted before they reach glyphSvg, so the markup set as
- * innerHTML is derived only from constants.
+ * innerHTML is derived only from constants. A type the console doesn't know
+ * draws the lilac "unrecognised" glyph with its status ignored (WG §4.2.1),
+ * never another type's glyph; a site draws its category's glyph.
  */
-export function glyph(type, status, size = 16, phase) {
-  const safeType = NODE_TYPES.has(type) ? type : 'track';
-  const safeStatus = NODE_STATUSES.has(status) ? status : 'unknown';
+export function glyph(type, status, size = 16, phase, { category } = {}) {
+  const known = isKnownType(type);
+  const safeType = known ? type : 'unknown';
+  const safeStatus = !known
+    ? 'unknown'
+    : NODE_STATUSES.has(status)
+      ? status
+      : 'unknown';
   const el = h('span', {
     class: 'ic-kit-glyph',
     'aria-hidden': 'true',
@@ -521,10 +546,11 @@ export function glyph(type, status, size = 16, phase) {
   });
   let svg = '';
   try {
-    svg = glyphSvg(safeType, {
+    svg = glyphSvg(known ? safeType : '', {
       status: safeStatus,
       size,
       phase: typeof phase === 'string' ? phase : undefined,
+      category: typeof category === 'string' ? category : undefined,
     });
   } catch {
     svg = '';
@@ -1179,7 +1205,8 @@ export function displayLabel(node) {
   // rail and the banner; the server labels it with the humanized kind.
   const alarm = alarmNodeLabel(node);
   if (alarm) return alarm;
-  return String(node?.label || bareId(node?.id) || '');
+  // Labels can be OSM or geocoder text: no bidi control reaches a panel.
+  return stripBidi(String(node?.label || bareId(node?.id) || ''));
 }
 
 /**
@@ -1296,6 +1323,180 @@ export function honestyLines(meta) {
   return lines;
 }
 
+// ---------------------------------------------------------------------------
+// Theater words (WG §4.2.5). Pure; shared by the rail and inspectorPlaces.js.
+// Every place string is untrusted (§0.2): it is bidi-stripped here and only
+// ever reaches the DOM as text.
+// ---------------------------------------------------------------------------
+
+/** The airframe a theater gets unless one is chosen (safety.DEFAULT_AIRFRAME_ID). */
+export const DEFAULT_AIRFRAME_ID = 'quad_suas_electric';
+/** A switch the simulator hasn't confirmed after this long turns warn. */
+export const SWITCH_WARN_MS = 20_000;
+export const SWITCH_STUCK_TEXT =
+  "Still switching. The simulator hasn't confirmed the new theater.";
+export const PRESET_THEATER_TEXT = 'Preset theater';
+
+/** A `[s, w, n, e]` bbox of four finite numbers with s < n, else null. */
+export function bboxOf(value) {
+  if (!Array.isArray(value) || value.length !== 4) return null;
+  const box = value.map((v) => num(v));
+  if (box.some((v) => v == null) || !(box[2] > box[0])) return null;
+  return box;
+}
+
+/** A `[lat, lon]` pair of finite numbers, else null. */
+export function latLonOf(value) {
+  if (!Array.isArray(value) || value.length !== 2) return null;
+  const lat = num(value[0]);
+  const lon = num(value[1]);
+  return lat == null || lon == null ? null : [lat, lon];
+}
+
+/** "46.63512, 32.61670" (5 dp), or '' when either is missing. */
+export function coordText(lat, lon, dp = 5) {
+  const a = num(lat);
+  const b = num(lon);
+  return a == null || b == null ? '' : `${a.toFixed(dp)}, ${b.toFixed(dp)}`;
+}
+
+/** The sim time scale when it isn't 1 (a positive finite number), else null. */
+export function timeScaleOf(theater) {
+  const s = num(theater?.time_scale);
+  return s != null && s > 0 && Math.abs(s - 1) > 1e-9 ? s : null;
+}
+
+/** "×4", "×2.5". */
+export function scaleText(scale) {
+  const s = num(scale);
+  return s == null ? '' : `×${Number(s.toFixed(2))}`;
+}
+
+/** "Sim running at ×4 speed". */
+export function simSpeedLine(scale) {
+  return `Sim running at ${scaleText(scale)} speed`;
+}
+
+/**
+ * " in sim time (≈ 28 s real)" for a sim-derived duration while the sim runs
+ * at `scale` ≠ 1 (WG §4.2.5, Appendix B), else ''.
+ */
+export function simTimeSuffix(seconds, scale) {
+  const n = num(seconds);
+  const s = num(scale);
+  if (n == null || n < 0 || s == null || s <= 0 || Math.abs(s - 1) < 1e-9)
+    return '';
+  return ` in sim time (≈ ${duration(n / s)} real)`;
+}
+
+/** "14 min in sim time (≈ 3 min 30 s real)", or the plain duration at ×1. */
+export function simDuration(seconds, scale) {
+  const d = duration(seconds);
+  return d ? `${d}${simTimeSuffix(seconds, scale)}` : '';
+}
+
+/**
+ * How the running theater was set (WG §4.2.5 rail line 3):
+ * - approved in this console: "Set from chat at 14:01Z, approved by you";
+ * - a preset: "Preset theater";
+ * - a chat theater set by an MCP client: "Set by an MCP client at 14:01Z";
+ * - a chat theater restored at boot: "Set from chat before the last restart";
+ * - otherwise "Set from chat". Null without a block.
+ */
+export function theaterSetLine(theater) {
+  const t = theater && typeof theater === 'object' ? theater : null;
+  if (!t) return null;
+  const at = num(t.set_at_ms);
+  const z = at != null ? ` at ${zulu(at)}` : '';
+  if (t.set_via === 'console') return `Set from chat${z}, approved by you`;
+  const chat = t.source === 'chat' || t.dynamic === true;
+  if (!chat)
+    return t.source === 'preset' || t.dynamic === false
+      ? PRESET_THEATER_TEXT
+      : null;
+  if (t.set_via === 'mcp') return `Set by an MCP client${z}`;
+  if (t.set_via === 'boot') return 'Set from chat before the last restart';
+  return 'Set from chat';
+}
+
+/**
+ * "Geocoded by Photon (OpenStreetMap)" for a chat theater, or "Placed from
+ * coordinates, not geocoded" when the operator gave coordinates; null for a
+ * preset or when the block names no geocoder.
+ */
+export function geocoderLine(theater) {
+  const t = theater || {};
+  const chat = t.source === 'chat' || t.dynamic === true;
+  const name = safeText(t.geocoder, 60);
+  if (!chat || !name) return null;
+  if (name === 'Coordinates') return 'Placed from coordinates, not geocoded';
+  return `Geocoded by ${name}`;
+}
+
+/** "5.0 × 5.0 km area", or null. */
+export function theaterAreaText(theater) {
+  const area = areaText(theater || {});
+  return area ? `${area} area` : null;
+}
+
+/** The home's name (bidi-safe), else its coordinates, else ''. */
+export function homeText(home) {
+  const name = safeText(home?.name, 80);
+  return name || coordText(home?.lat, home?.lon);
+}
+
+/**
+ * "Switching to Kherson, Ukraine…"; "Switching to the new theater…" while
+ * the block still describes the theater being left.
+ */
+export function switchingText(label) {
+  const name = safeText(label, 80);
+  return name ? `Switching to ${name}…` : 'Switching to the new theater…';
+}
+
+/** The airframe to name in the Fleet caption: `{id, label}` or null (default). */
+export function fleetAirframe(graph) {
+  const pick = (a) =>
+    a && typeof a === 'object' && typeof a.id === 'string' ? a : null;
+  let af = pick(graph?.theater?.airframe);
+  if (!af && Array.isArray(graph?.nodes)) {
+    for (const n of graph.nodes) {
+      if (n?.type !== 'vehicle') continue;
+      af = pick(n.attrs?.airframe);
+      if (af) break;
+    }
+  }
+  if (!af || af.id === DEFAULT_AIRFRAME_ID) return null;
+  return { id: af.id, label: safeText(af.label, 60) || humanize(af.id) };
+}
+
+/**
+ * The `map:request` payload for an operator's Show on map over a place
+ * (WG §4.2.3; mode.js opens the map at once): a theater's bbox, a site's
+ * bounds, or a point with a 1 km box. Null when there is no location.
+ * @param {string} id graph id
+ * @param {{bbox?:unknown, lat?:unknown, lon?:unknown, label?:unknown}} where
+ */
+export function showOnMapRequest(id, where = {}) {
+  let bbox = bboxOf(where.bbox);
+  if (!bbox) {
+    const lat = num(where.lat);
+    const lon = num(where.lon);
+    if (lat == null || lon == null) return null;
+    const dLat = 500 / 111_320;
+    const dLon = dLat / Math.max(0.05, Math.cos((lat * Math.PI) / 180));
+    bbox = [lat - dLat, lon - dLon, lat + dLat, lon + dLon];
+  }
+  const label = safeText(where.label, 80);
+  return {
+    ids: [id],
+    bbox,
+    label: label || undefined,
+    source: 'operator',
+    countdown: false,
+  };
+}
+
 /**
  * Mount the situation rail.
  * @param {object} host element the rail renders into
@@ -1343,6 +1544,13 @@ export function createSituation(host, ctx, opts = {}) {
     drawerClose,
   );
   let updatedEl = null;
+  // Theater block state (WG §4.2.5): the last theater drawn, when its title
+  // last changed (it cross-fades), and a switch in progress.
+  let theaterKey = null;
+  let titleFreshUntil = 0;
+  let lastActiveId = null;
+  /** {since, fromId} while `theater.state === 'switching'`, else null. */
+  let switching = null;
 
   strip.addEventListener('click', () => openDrawer());
   drawer.addEventListener('keydown', (event) => {
@@ -1429,19 +1637,124 @@ export function createSituation(host, ctx, opts = {}) {
     };
   }
 
+  /**
+   * Follow the theater block across renders: a new id or epoch makes the
+   * title cross-fade; `state: "switching"` starts the switch clock. Returns
+   * whether the title is still fresh.
+   */
+  function noteTheater(t) {
+    const id = typeof t?.id === 'string' && t.id ? t.id : null;
+    const key = id ? `${id}|${Number.isInteger(t.epoch) ? t.epoch : ''}` : null;
+    if (key && theaterKey && key !== theaterKey)
+      titleFreshUntil = now() + TITLE_FADE_MS;
+    if (key) theaterKey = key;
+    if (t?.state === 'switching') {
+      if (!switching) switching = { since: now(), fromId: lastActiveId };
+    } else {
+      switching = null;
+      if (id) lastActiveId = id;
+    }
+    return now() < titleFreshUntil;
+  }
+
+  /** Lines 3–5 of the block, after the switching and integrity states. */
+  function theaterDetailLines(t) {
+    const out = [];
+    if (switching) {
+      const elapsed = Math.max(0, now() - switching.since);
+      // Until the block's id moves, it still describes the theater being left.
+      const label =
+        switching.fromId && t.id !== switching.fromId ? t.label : null;
+      out.push(
+        h(
+          'p',
+          { class: 'ic-rail__line ic-rail__switching', 'data-status': 'info' },
+          h('span', {}, switchingText(label)),
+          h(
+            'span',
+            { class: 'ic-rail__elapsed' },
+            ` ${Math.round(elapsed / 1000)} s`,
+          ),
+        ),
+      );
+      if (elapsed >= SWITCH_WARN_MS)
+        out.push(
+          textLine(SWITCH_STUCK_TEXT, 'ic-rail__line', {
+            'data-status': 'warn',
+          }),
+        );
+    }
+    if (t.integrity_error)
+      out.push(
+        textLine(safeText(t.integrity_error, 240), 'ic-rail__line', {
+          'data-status': 'critical',
+        }),
+      );
+    const set = theaterSetLine(t);
+    if (set) out.push(textLine(set, 'ic-rail__line ic-rail__set'));
+    const area = theaterAreaText(t);
+    const home = homeText(t.home);
+    if (area || home)
+      out.push(
+        h(
+          'p',
+          { class: 'ic-rail__line ic-rail__area' },
+          area ? h('span', { class: 'ic-rail__size' }, area) : null,
+          home ? h('span', { class: 'ic-rail__home' }, `Home ${home}`) : null,
+        ),
+      );
+    const geo = geocoderLine(t);
+    if (geo) out.push(textLine(geo, 'ic-rail__line'));
+    return out;
+  }
+
+  /** "Previous" and a chip for the theater before this one, or null. */
+  function previousChip(prev) {
+    const id = typeof prev?.id === 'string' && prev.id ? prev.id : null;
+    if (!id) return null;
+    const label = safeText(prev.label, 80) || id;
+    const chip = h(
+      'button',
+      {
+        type: 'button',
+        class: 'ic-kit-chip ic-rail__previous-chip',
+        'data-key': 'theater:previous',
+        'aria-label': `Inspect the previous theater, ${label}`,
+      },
+      glyph('theater', 'ok', 10),
+      h('span', { class: 'ic-kit-chip__label' }, label),
+    );
+    chip.addEventListener('click', () => inspect(`thr:${id}`));
+    return h(
+      'p',
+      { class: 'ic-rail__line ic-rail__previous' },
+      h('span', { class: 'ic-rail__previous-word' }, 'Previous'),
+      chip,
+    );
+  }
+
   function theaterSection(st) {
     const g = st.graph;
     const t = g?.theater || {};
-    const known = Boolean(t.label) && t.known !== false;
+    // A chat theater counts as known even though the static table lacks it.
+    const known = Boolean(t.label) && (t.known !== false || t.dynamic === true);
+    const fresh = noteTheater(t);
     const kids = [
       h(
         'h2',
-        { class: 'ic-rail__theater' },
-        known ? t.label : g ? 'No active theater' : 'Theater not known yet',
+        { class: fresh ? 'ic-rail__theater is-changed' : 'ic-rail__theater' },
+        known
+          ? safeText(t.label, 120)
+          : g
+            ? 'No active theater'
+            : 'Theater not known yet',
       ),
     ];
-    if (known && t.place) kids.push(textLine(t.place, 'ic-rail__place'));
+    if (known && t.place)
+      kids.push(textLine(safeText(t.place, 160), 'ic-rail__place'));
     if (!known && t.reason) kids.push(textLine(t.reason, 'ic-rail__place'));
+    if (known) kids.push(...theaterDetailLines(t));
+    const scale = timeScaleOf(t);
     const sim = nodeOf(st, 'feed:sim');
     if (sim) {
       // A picture that is no longer live (the host stopped answering) must
@@ -1451,19 +1764,41 @@ export function createSituation(host, ctx, opts = {}) {
         (sim.status === 'ok' || sim.status === 'warn');
       kids.push(
         textLine(
-          up ? 'Sim running' : 'Sim host not responding',
+          up
+            ? scale
+              ? simSpeedLine(scale)
+              : 'Sim running'
+            : 'Sim host not responding',
           'ic-rail__line',
           {
             'data-status': up ? 'ok' : 'critical',
           },
         ),
       );
+    } else if (scale) {
+      kids.push(textLine(`Sim speed set to ${scaleText(scale)}`));
     }
     const upd = updatedLine(st);
     updatedEl = textLine(upd.text, 'ic-rail__updated', {
       'data-status': upd.status,
     });
     kids.push(updatedEl);
+    const mapReq = known
+      ? showOnMapRequest(`thr:${t.id}`, { bbox: t.bbox, label: t.label })
+      : null;
+    if (mapReq) {
+      kids.push(
+        h(
+          'div',
+          { class: 'ic-rail__actions' },
+          button('Show on map', {
+            icon: ICON.map,
+            key: 'theater:map',
+            onClick: () => emit('map:request', mapReq),
+          }),
+        ),
+      );
+    }
     if (typeof store?.setScope === 'function' && g) {
       const scope = g.scope === 'all' ? 'all' : 'theater';
       const more = num(
@@ -1495,9 +1830,17 @@ export function createSituation(host, ctx, opts = {}) {
         ),
       );
     }
+    if (known) {
+      const prev = previousChip(t.previous);
+      if (prev) kids.push(prev);
+    }
     return h(
       'section',
-      { class: 'ic-rail__section', 'data-section': 'theater' },
+      {
+        class: 'ic-rail__section',
+        'data-section': 'theater',
+        'data-state': switching ? 'switching' : 'active',
+      },
       ...kids,
     );
   }
@@ -1594,7 +1937,9 @@ export function createSituation(host, ctx, opts = {}) {
 
   function fleetSection(st) {
     const vehicles = nodesOfType(st, 'vehicle');
-    const kids = [sectionHead('Fleet')];
+    // A non-default airframe is named in the Fleet caption (WG §4.2.5).
+    const af = fleetAirframe(st.graph);
+    const kids = [sectionHead('Fleet', af ? af.label : null)];
     if (!st.graph) kids.push(noGraphLine(st));
     else if (!vehicles.length) {
       kids.push(
@@ -1656,7 +2001,10 @@ export function createSituation(host, ctx, opts = {}) {
     if (wpIndex != null && wpOf != null)
       detail.push(`Waypoint ${wpIndex} of ${wpOf}`);
     const eta = duration(a.eta_s);
-    if (eta && running) detail.push(`≈ ${eta} left`);
+    if (eta && running)
+      detail.push(
+        `≈ ${eta} left${simTimeSuffix(a.eta_s, timeScaleOf(state().graph?.theater))}`,
+      );
     if (detail.length) kids.push(textLine(detail.join('   '), 'ic-rail__line'));
     if (a.incomplete_reason)
       kids.push(
@@ -2010,7 +2358,13 @@ export function createSituation(host, ctx, opts = {}) {
   }
 
   function tick() {
-    if (!updatedEl || destroyed) return;
+    if (destroyed) return;
+    // A switch in progress counts its seconds (and turns warn at 20 s).
+    if (switching) {
+      render();
+      return;
+    }
+    if (!updatedEl) return;
     const upd = updatedLine(state());
     replaceKids(updatedEl, [upd.text]);
     updatedEl.setAttribute('data-status', upd.status);
