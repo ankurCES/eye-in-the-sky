@@ -139,6 +139,14 @@ offer claude.ai login or its rate limits without prior approval, and to use API-
 authentication instead. This project uses the owner's own Claude login only for local use; see
 `godseye/INTEL_CONSOLE.md`, "Analyst sign-in and Anthropic's policy".
 
+The analyst can also be pointed at other model providers (Analyst settings; the catalog is
+`godseye/mcp/godseye_uav/llm_providers.py`). Nothing from those providers is bundled: the app sends
+requests to the endpoint the user picks, with the user's own key, and that provider's terms govern
+that use. Anthropic states that it doesn't support routing Claude Code to non-Claude models through
+any gateway; OpenRouter says Claude Code is only guaranteed to work with its Anthropic first-party
+provider; and Z.ai limits its GLM Coding Plan to officially supported tools. See "Analyst
+providers" in the repository `README.md`.
+
 ## 7. pywebview: BSD 3-Clause
 
 The native window (`--window` and the desktop app) uses `pywebview` (6.2.1, `app` extra), frozen

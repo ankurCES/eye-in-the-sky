@@ -780,5 +780,9 @@
   "src/console/reset.css",
   "src/console/panels.css",
   "src/console/chat/chat.css",
-  "src/console/orb/orb.css"
+  "src/console/orb/orb.css",
+  "src/console/settings/client.test.mjs",
+  "src/console/settings/model.test.mjs",
+  "src/console/settings/view.test.mjs",
+  "src/console/settings/settings.css"
 ]

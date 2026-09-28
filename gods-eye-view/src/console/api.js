@@ -29,6 +29,7 @@ export const DEFAULT_SSE_EVENTS = Object.freeze([
   'usage',
   'turn_end',
   'error',
+  'provider_changed',
 ]);
 
 export class AuthError extends Error {
@@ -78,6 +79,23 @@ export const ERROR_WORDS = Object.freeze({
   invalid_scope: "the picture scope wasn't recognized",
   unknown_session: 'the analyst session has ended',
   not_available_in_app_host: "this data source isn't available in the app",
+  // Analyst settings (BYOK spec §7).
+  invalid_settings: "the host didn't accept these settings",
+  settings_conflict: 'these settings changed in another window',
+  locked_by_environment: 'that setting comes from the environment',
+  needs_check: 'the settings changed after the connection check',
+  needs_ack: 'this model needs your acknowledgement first',
+  cross_origin: 'analyst settings only open from the app host',
+  test_busy: 'another connection check is running',
+  settings_unavailable: "analyst settings aren't available in this app",
+  if_match_required: 'the settings were reloaded; try again',
+  read_only: 'these settings were written by a newer version of Eye in the Sky',
+  key_store_failed: "the key couldn't be saved",
+  unknown_provider: "that provider isn't in the list",
+  not_found: "the host doesn't have that page",
+  json_required: 'the host only accepts JSON here',
+  too_large: 'the request was too large',
+  token_in_url: 'the access token must not be in the address',
 });
 
 /** A `{error: "snake_case_code"}` body's code, or null. */
@@ -307,6 +325,9 @@ export function createApi({
   const post = (path, body, opts) =>
     request('POST', path, { ...(opts || {}), body: body ?? {} });
   const del = (path, opts) => request('DELETE', path, opts);
+  /** PUT a JSON body; `opts.headers` carries e.g. `If-Match`. */
+  const put = (path, body, opts) =>
+    request('PUT', path, { ...(opts || {}), body: body ?? {} });
 
   /**
    * Subscribe to an SSE stream with reconnect and Last-Event-ID replay.
@@ -483,5 +504,5 @@ export function createApi({
     });
   }
 
-  return { base, token, url, get, post, del, sse, abortVehicle };
+  return { base, token, url, get, post, put, del, sse, abortVehicle };
 }

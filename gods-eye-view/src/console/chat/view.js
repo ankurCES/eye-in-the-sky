@@ -29,6 +29,8 @@ import {
   activeGrants,
   approvedSince,
   availabilityOf,
+  costBasis,
+  currentProvider,
   initialState,
   latestCommandRow,
   pendingApprovals,
@@ -38,6 +40,15 @@ import {
   statusWord,
 } from './reducer.js';
 import { assess, vehicleFacts } from './validate.js';
+import {
+  USE_API_KEY,
+  costNote,
+  costUnreliable,
+  modelVia,
+  providerChangedText,
+  providerHint,
+  providerUnavailableCopy,
+} from '../settings/model.js';
 import { createSlip, grantPhrase, segmentNodes } from './slip.js';
 import { chipRefs, renderDom } from './markdown.js';
 import { createChip, createTether, lookupNode, wireRoving } from './chips.js';
@@ -517,10 +528,17 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     { type: 'button', class: 'ic-menu__item' },
     'Stop the analyst',
   );
+  // BYOK spec §10: analyst settings, after New session.
+  const settingsItem = h(
+    'button',
+    { type: 'button', class: 'ic-menu__item' },
+    'Analyst settings…',
+  );
   const menuEl = h(
     'div',
     { class: 'ic-menu', id: menuId, hidden: true },
     newSessionItem,
+    settingsItem,
     stopItem,
   );
   const header = h(
@@ -619,6 +637,23 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     icon(ICON.refresh),
     'Check again',
   );
+  // Provider reasons (BYOK spec §10): open analyst settings; for the Claude
+  // sign-in failure, a secondary "Use an API key instead".
+  const settingsBtn = h(
+    'button',
+    {
+      type: 'button',
+      class: 'ic-btn',
+      'data-variant': 'primary',
+      hidden: true,
+    },
+    h('span', { class: 'ic-btn__label' }, 'Open analyst settings'),
+  );
+  const apiKeyBtn = h(
+    'button',
+    { type: 'button', class: 'ic-btn', 'data-variant': 'quiet', hidden: true },
+    USE_API_KEY,
+  );
   const unavailableEl = h(
     'div',
     { class: 'ic-unavailable', role: 'status', hidden: true },
@@ -626,7 +661,13 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     unavailTitle,
     unavailBody,
     unavailHint,
-    checkAgainBtn,
+    h(
+      'div',
+      { class: 'ic-unavailable__actions' },
+      settingsBtn,
+      checkAgainBtn,
+      apiKeyBtn,
+    ),
   );
 
   const column = h(
@@ -1495,7 +1536,14 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
         `${tokens(u.input_tokens ?? 0)} in, ${tokens(u.output_tokens ?? 0)} out`,
       );
     }
-    if (Number.isFinite(u.cost_usd)) parts.push(usd(u.cost_usd));
+    if (costUnreliable(u.costBasis || costBasis(state))) {
+      // Dollars from a non-Anthropic price table would be invented (§8):
+      // tokens only, and say why on the latest turn (its own provider).
+      if (turn.id === lastTurnId())
+        parts.push(
+          costNote(u.provider || turn.provider || currentProvider(state)),
+        );
+    } else if (Number.isFinite(u.cost_usd)) parts.push(usd(u.cost_usd));
     return parts;
   }
 
@@ -1611,7 +1659,11 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
 
   function dividerLine(item, index) {
     const text =
-      item.reason === 'lost' ? COPY.dividerLost : COPY.dividerOperator;
+      item.reason === 'provider'
+        ? providerChangedText(item)
+        : item.reason === 'lost'
+          ? COPY.dividerLost
+          : COPY.dividerOperator;
     return cached(`div:${index}`, text, () =>
       h('p', { class: 'ic-divider', role: 'separator' }, text),
     );
@@ -1782,7 +1834,14 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
 
   // ---- header, banners, approval bar, composer ----
   function renderHeader(t) {
-    setText(modelEl, state.session?.model || state.availability?.model || '');
+    // "{model} via {label}" (BYOK spec §10); the console never writes a `·`.
+    setText(
+      modelEl,
+      modelVia(
+        state.session?.model || state.availability?.model || '',
+        currentProvider(state),
+      ),
+    );
     const word = serviceDown ? 'Reconnecting' : statusWord(state, t);
     setText(statusText, word);
     rootEl.setAttribute(
@@ -1790,7 +1849,8 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
       word.toLowerCase().replace(/[^a-z]+/g, '-'),
     );
     const hasCost =
-      state.usage.serverSessionCost != null || state.usage.sessionCost > 0;
+      !costUnreliable(costBasis(state)) &&
+      (state.usage.serverSessionCost != null || state.usage.sessionCost > 0);
     setText(costEl, hasCost ? `Session ${usd(sessionCost(state))}` : '');
     stopItem.setAttribute('aria-disabled', state.running ? 'false' : 'true');
     menuBtn.setAttribute('aria-expanded', menuOpen ? 'true' : 'false');
@@ -2005,7 +2065,7 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     );
     setHidden(unavailableEl, !off);
     setHidden(composerEl, off);
-    const key = `${off}|${av.reason}|${av.hint}`;
+    const key = `${off}|${av.reason}|${av.hint}|${av.provider?.label ?? ''}`;
     if (key !== lastAvailKey) {
       lastAvailKey = key;
       if (av.available != null) {
@@ -2013,10 +2073,28 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
           available: !off,
           reason: off ? (av.reason ?? null) : null,
           hint: off ? (av.hint ?? null) : null,
+          ...(av.provider ? { provider: av.provider } : {}),
         });
       }
     }
     if (!off) return;
+    const provider = providerUnavailableCopy(av.reason, av.provider);
+    setHidden(settingsBtn, !provider);
+    setHidden(apiKeyBtn, av.reason !== 'auth');
+    settingsBtn.__icProvider = provider?.provider ?? null;
+    checkAgainBtn.setAttribute('data-variant', provider ? 'quiet' : 'primary');
+    if (provider) {
+      setText(settingsBtn.children?.[0] || settingsBtn, provider.action);
+      setText(unavailTitle, provider.title);
+      replaceKids(unavailBody, [provider.body]);
+      setHidden(unavailBody, false);
+      const said = providerHint(av.hint);
+      const hint = said && said !== provider.title ? said : null;
+      setText(unavailHint, hint || '');
+      setHidden(unavailHint, !hint);
+      setHidden(checkAgainBtn, false);
+      return;
+    }
     const copy = UNAVAILABLE[av.reason] || {
       title: "The analyst isn't available right now.",
       body: 'Search, the orb and the situation rail still work.',
@@ -2275,6 +2353,8 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
       reason: st.reason ?? null,
       hint: st.hint ?? null,
       model: st.model ?? null,
+      provider: st.provider ?? null,
+      cost_basis: st.cost_basis ?? null,
       // A fresh check that says "available" lets the operator try again
       // after signing in; the next turn re-detects a sign-in failure.
       clearAuth: st.available === true,
@@ -2326,6 +2406,8 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
         reason: null,
         hint: null,
         model: st.model ?? null,
+        provider: st.provider ?? null,
+        cost_basis: st.cost_basis ?? null,
         clearAuth: true,
       });
       if (!booted) boot();
@@ -2404,6 +2486,9 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     // tool gets its Revoke.
     if (name === 'approval_resolved' && data?.scope === 'session')
       refreshGrants();
+    // A turn refused for missing provider settings: the host's status names
+    // the exact reason (no key, or no provider) for the unavailable panel.
+    if (name === 'error' && data?.code === 'config') chat?.status?.();
     if (name === 'approval_request') {
       const a = state.approvals[String(data.approval_id)];
       if (a && !announced.has(a.id)) {
@@ -2496,6 +2581,25 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     schedule();
   });
   newSessionItem.addEventListener('click', () => newSession());
+  settingsItem.addEventListener('click', () => {
+    menuOpen = false;
+    schedule();
+    bus?.emit?.('settings:open', { section: 'llm', invoker: menuBtn });
+  });
+  settingsBtn.addEventListener('click', () =>
+    bus?.emit?.('settings:open', {
+      section: 'llm',
+      provider: settingsBtn.__icProvider || undefined,
+      invoker: settingsBtn,
+    }),
+  );
+  apiKeyBtn.addEventListener('click', () =>
+    bus?.emit?.('settings:open', {
+      section: 'llm',
+      provider: 'anthropic_api',
+      invoker: apiKeyBtn,
+    }),
+  );
   stopItem.addEventListener('click', () => {
     menuOpen = false;
     interrupt();

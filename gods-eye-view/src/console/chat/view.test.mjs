@@ -2193,3 +2193,209 @@ test('chat.css pins: narrow slip stacking, registers, checkbox ink, one-line thi
     /width:\s*max\(40px, var\(--ic-target/,
   );
 });
+
+// ---- BYOK providers (BYOK spec §10) --------------------------------------------------------
+
+const MINIMAX = {
+  id: 'minimax',
+  label: 'MiniMax',
+  kind: 'anthropic_compatible',
+};
+
+test('the header reads "{model} via {label}" and follows provider_changed', async () => {
+  const { chat, host } = await mountView({
+    status: {
+      available: true,
+      model: 'claude-opus-5-5',
+      provider: { id: 'anthropic_login', label: 'Claude login (this Mac)' },
+    },
+  });
+  await flush();
+  const model = find(host, cls('ic-chat__model'));
+  assert.equal(
+    model.textContent,
+    'claude-opus-5-5 via Claude login (this Mac)',
+  );
+  seq = 0;
+  chat.event(
+    'session',
+    {
+      session_id: 's1',
+      model: 'claude-opus-5-5',
+      provider: { id: 'anthropic_login', label: 'Claude login (this Mac)' },
+    },
+    0,
+  );
+  chat.event('turn_start', { turn_id: 't1', text: 'x' }, next());
+  chat.event('turn_end', { turn_id: 't1', stop: 'end' }, next());
+  chat.event(
+    'provider_changed',
+    {
+      from: { id: 'anthropic_login' },
+      to: { ...MINIMAX, model: 'MiniMax-M3[1m]' },
+      memory: 'cleared',
+    },
+    next(),
+  );
+  await flush();
+  assert.equal(model.textContent, 'MiniMax-M3[1m] via MiniMax');
+  assert.doesNotMatch(model.textContent, /·/);
+  const div = findAll(host, cls('ic-divider')).at(-1);
+  assert.equal(
+    textOf(div),
+    "The analyst now uses MiniMax (MiniMax-M3[1m]). It doesn't remember the conversation above.",
+  );
+  chat.event(
+    'provider_changed',
+    { to: { ...MINIMAX, model: 'MiniMax-M2.7' }, memory: 'kept' },
+    next(),
+  );
+  await flush();
+  assert.equal(
+    textOf(findAll(host, cls('ic-divider')).at(-1)),
+    'The analyst now uses MiniMax (MiniMax-M2.7).',
+  );
+});
+
+test('the analyst menu opens analyst settings, after New session', async () => {
+  const { host, emitted } = await mountView();
+  const menuBtn = find(
+    host,
+    (el) => el.attrs?.['aria-label'] === 'Analyst menu',
+  );
+  menuBtn.fire('click');
+  const menu = find(host, cls('ic-menu'));
+  const items = menu.children.map((c) => textOf(c));
+  assert.deepEqual(items, [
+    'New session',
+    'Analyst settings…',
+    'Stop the analyst',
+  ]);
+  buttonNamed(menu, 'Analyst settings…').fire('click');
+  const [name, payload] = emitted.find(([e]) => e === 'settings:open');
+  assert.equal(name, 'settings:open');
+  assert.equal(payload.section, 'llm');
+  assert.equal(payload.invoker, menuBtn);
+});
+
+test('no provider set up: the panel offers Open analyst settings', async () => {
+  const { host, emitted } = await mountView({
+    status: {
+      available: false,
+      reason: 'provider_not_configured',
+      hint: 'Open analyst settings.',
+    },
+  });
+  await flush();
+  const panel = find(host, cls('ic-unavailable'));
+  assert.equal(
+    find(panel, cls('ic-unavailable__title')).textContent,
+    'The analyst has no model provider set up.',
+  );
+  assert.equal(
+    textOf(find(panel, cls('ic-unavailable__body'))),
+    'Add a key for Claude or another provider.',
+  );
+  const choose = buttonNamed(panel, 'Open analyst settings');
+  assert.ok(choose && !isHidden(choose));
+  assert.equal(choose.attrs['data-variant'], 'primary');
+  assert.equal(
+    buttonNamed(panel, 'Check again').attrs['data-variant'],
+    'quiet',
+  );
+  choose.fire('click');
+  const open = emitted.filter(([e]) => e === 'settings:open').at(-1)[1];
+  assert.equal(open.section, 'llm');
+  assert.equal(open.provider, undefined);
+});
+
+test('a missing key names the provider; the Claude sign-in offers an API key instead', async () => {
+  const { host, emitted, chat } = await mountView({
+    status: {
+      available: false,
+      reason: 'provider_key_missing',
+      provider: MINIMAX,
+    },
+  });
+  await flush();
+  let panel = find(host, cls('ic-unavailable'));
+  assert.equal(
+    find(panel, cls('ic-unavailable__title')).textContent,
+    'The analyst has no key for MiniMax.',
+  );
+  buttonNamed(panel, 'Open analyst settings').fire('click');
+  assert.equal(
+    emitted.filter(([e]) => e === 'settings:open').at(-1)[1].provider,
+    'minimax',
+  );
+  assert.equal(
+    emitted.filter(([e]) => e === 'analyst:availability').at(-1)[1].provider
+      .label,
+    'MiniMax',
+  );
+  assert.ok(isHidden(buttonNamed(panel, 'Use an API key instead')));
+  // The Claude login failing sign-in: keep its copy, add the way out.
+  chat.statusValue = { available: false, reason: 'auth' };
+  await chat.status();
+  await flush();
+  panel = find(host, cls('ic-unavailable'));
+  assert.equal(
+    find(panel, cls('ic-unavailable__title')).textContent,
+    "The analyst isn't signed in.",
+  );
+  const apiKey = buttonNamed(panel, 'Use an API key instead');
+  assert.ok(!isHidden(apiKey));
+  apiKey.fire('click');
+  assert.equal(
+    emitted.filter(([e]) => e === 'settings:open').at(-1)[1].provider,
+    'anthropic_api',
+  );
+});
+
+test('an unreliable cost basis hides dollars and says why', async () => {
+  const { chat, host } = await mountView({
+    status: {
+      available: true,
+      model: 'MiniMax-M3[1m]',
+      provider: MINIMAX,
+      cost_basis: 'unreliable',
+    },
+  });
+  turn(chat);
+  chat.event('text_delta', { turn_id: 't1', text: 'Done.' }, next());
+  chat.event(
+    'usage',
+    {
+      turn_id: 't1',
+      input_tokens: 1200,
+      output_tokens: 80,
+      cost_basis: 'unreliable',
+    },
+    next(),
+  );
+  chat.event('turn_end', { turn_id: 't1', stop: 'end' }, next());
+  await flush();
+  const usage = textOf(find(host, cls('ic-msg__usage')));
+  assert.match(usage, /in, 80 out/);
+  assert.match(usage, /Cost isn't shown: MiniMax bills you directly\./);
+  assert.doesNotMatch(usage, /\$/);
+  assert.equal(find(host, cls('ic-chat__cost')).textContent, '');
+  // Back on the Claude login: the header follows the live status, and the
+  // turn that ran on MiniMax still says MiniMax billed it.
+  chat.statusValue = {
+    available: true,
+    model: 'claude-opus-5',
+    provider: { id: 'anthropic_login', label: 'Claude login (this Mac)' },
+    cost_basis: 'anthropic_list',
+  };
+  await chat.status();
+  await flush();
+  assert.equal(
+    find(host, cls('ic-chat__model')).textContent,
+    'claude-opus-5 via Claude login (this Mac)',
+  );
+  assert.match(
+    textOf(find(host, cls('ic-msg__usage'))),
+    /Cost isn't shown: MiniMax bills you directly\./,
+  );
+});

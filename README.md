@@ -20,6 +20,7 @@ the operator.
 
 - [Quick start](#quick-start)
 - [What you get](#what-you-get)
+- [Analyst providers](#analyst-providers)
 - [Running modes and options](#running-modes-and-options)
 - [Desktop app (macOS)](#desktop-app-macos)
 - [Classic dev stack](#classic-dev-stack)
@@ -54,9 +55,10 @@ WKWebView on macOS) when pywebview is installed and a display is available, and 
 otherwise.
 
 **Analyst sign-in.** The analyst uses the Claude Code CLI. On your own machine, sign in once with
-`claude` then `/login`, or set `ANTHROPIC_API_KEY` in the app's environment. A build you give to
-anyone else must use API-key authentication, not your Claude login; see
-[`godseye/INTEL_CONSOLE.md`](godseye/INTEL_CONSOLE.md#analyst-sign-in-and-anthropics-policy).
+`claude` then `/login`; or pick another provider (an Anthropic API key, Bedrock, Vertex, Foundry,
+OpenRouter and others) and enter its key in **Analyst settings** (⌘,). A build you give to anyone
+else must use API-key authentication, not your Claude login; see
+[Analyst providers](#analyst-providers).
 
 ## What you get
 
@@ -78,6 +80,74 @@ anyone else must use API-key authentication, not your Claude login; see
 
 The full HTTP and SSE contract, approval classes, order-slip rules and data-honesty rules are in
 [`godseye/INTEL_CONSOLE.md`](godseye/INTEL_CONSOLE.md).
+
+## Analyst providers
+
+The analyst runs the Claude Code CLI, and you choose which model provider that CLI talks to in the
+app: **Analyst settings…** in the analyst's menu, or ⌘, (Ctrl+, off macOS). The default is the
+Claude login on this Mac. To switch, pick a provider, fill in what it needs, press **Test
+connection**, then **Use {provider}**. For every provider but the Claude login, Use first runs one
+tiny turn through the analyst's own engine, and a model that isn't Claude also needs "I understand;
+use it anyway" ticked. The change applies from your next message.
+
+| Provider | What it needs | Models |
+|---|---|---|
+| Claude login (this Mac) | `claude` then `/login`, once, on this Mac | Claude; `claude-opus-5` unless `--model` says otherwise |
+| Anthropic API key | An Anthropic API key | Claude; `claude-opus-5` unless `--model` says otherwise |
+| Amazon Bedrock | AWS region; a Bedrock API key, or your AWS credentials (an optional profile, else the default chain) | Claude; `us.anthropic.claude-opus-5-5` |
+| Google Cloud Agent Platform (Vertex AI) | Google Cloud project; region (default `global`); a credentials file, or gcloud application-default credentials | Claude; `claude-opus-5-5` |
+| Microsoft Foundry | Foundry resource name; an API key, or Microsoft Entra ID | Claude; your deployment names |
+| OpenRouter | OpenRouter API key | Many; `anthropic/claude-opus-5.5` |
+| MiniMax | MiniMax API key; International or China endpoint | Not Claude; `MiniMax-M3[1m]` |
+| DeepSeek | DeepSeek API key | Not Claude; `deepseek-flash[1m]` |
+| Moonshot Kimi | Moonshot API key; International or China endpoint | Not Claude; `kimi-k3[1m]` |
+| Z.ai GLM | Z.ai API key | Not Claude; `glm-5.3[1m]` |
+| Zhipu BigModel (China) | Zhipu API key | Not Claude; `glm-5.3` |
+| Alibaba Model Studio (Qwen) | Model Studio API key matching its endpoint; the endpoint (region presets, some with a workspace ID) | Not Claude; `qwen3.7-max`, extended thinking off |
+| Ollama | A local Ollama server (no key) or Ollama Cloud (a key); a model name | Not Claude; a model with at least 64k of context |
+| LM Studio | LM Studio 0.4.1 or later, running; a model name; a token only if Require Authentication is on | Not Claude; more than 25k of context |
+| Custom Anthropic-compatible endpoint | The API root URL (without `/v1`) serving `POST /v1/messages` with streaming; Bearer, x-api-key or no auth; the key; a model; whether it serves Claude models | Whatever it serves |
+
+The catalog is `godseye/mcp/godseye_uav/llm_providers.py`, with every fact's source; the sheet shows
+each provider's notes, and anything not confirmed is marked "Unverified:". Every provider other than
+the Claude login was tested only offline, against a local stub with fake keys.
+
+**Keys.** A key you enter is stored on this machine: in your macOS Keychain (service
+`eye-in-the-sky.llm`), or in `llm-secrets.json` beside the store, readable only by you (mode 0600),
+off macOS, when the Keychain refuses the write, or with `GODSEYE_LLM_SECRET_STORE=file`. A key is
+never sent to the browser: the page can store one but not read it back, and it shows only the last
+four characters. It reaches the analyst's CLI through that process's environment, never its command
+line, and the host scrubs it from every answer, event and log line it writes. Keys can also come
+from the launch environment (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY` and the like); those are used
+for that run only.
+
+**Where your data goes.** The analyst's messages, the intel picture it reads and every tool result
+go to the provider you choose, at the host the sheet names ("Requests go to …"). With the Claude
+login or an Anthropic key that is Anthropic; with Bedrock, Vertex or Foundry, your cloud account;
+otherwise, that provider's servers, or your own machine for Ollama and LM Studio on this Mac. For
+every provider but the Claude login, the CLI runs with Claude Code's non-essential traffic,
+telemetry and error reporting off and with its own config directory. Dollar costs are shown only for
+Claude (from Anthropic or your cloud); the other providers bill you directly, and the console shows
+no figure for them.
+
+**Terms to know before you pick one:**
+
+- **Non-Claude models.** Anthropic doesn't support routing Claude Code to non-Claude models through
+  any gateway, and the analyst is built and tested with Claude. Other models may misuse tools or
+  skip parts of the doctrine; every command, sensor tasking and sim change still waits for your
+  approval.
+- **OpenRouter** says Claude Code is only guaranteed to work with the Anthropic first-party
+  provider.
+- **Z.ai**: the GLM Coding Plan is limited to officially supported tools. Whether this app counts,
+  and whether pay-as-you-go keys work on that endpoint, is unverified.
+- **The Claude login is for your own local use.** Anthropic's Agent SDK documentation says that,
+  unless previously approved, third-party developers may not offer claude.ai login or its rate
+  limits for products built on the SDK. A build you give to anyone else should have its user enter
+  their own Anthropic API key (or a cloud provider), not use your login. See
+  [`godseye/INTEL_CONSOLE.md`](godseye/INTEL_CONSOLE.md#analyst-sign-in-and-anthropics-policy).
+
+The settings routes, status fields and events are in
+[`godseye/INTEL_CONSOLE.md`](godseye/INTEL_CONSOLE.md#analyst-providers-and-keys).
 
 ## Running modes and options
 
@@ -103,7 +173,7 @@ command). The main options:
 | `--ui-dir <dir>` | `$GODSEYE_UI_DIR`, else `gods-eye-view/dist` | The built UI |
 | `--real`, `--sim-port <n>` | fake sim on a free port | Connect to a real AirSim instead (port 41451 with `--real`) |
 | `--no-chat` | analyst on | Turn the analyst off |
-| `--model <id>`, `--effort <level>` | `$GODSEYE_CHAT_MODEL` or `claude-opus-5`; `$GODSEYE_CHAT_EFFORT` or the model's default | Analyst model and reasoning effort (`low`, `medium`, `high`, `xhigh`, `max`) |
+| `--model <id>`, `--effort <level>` | `$GODSEYE_CHAT_MODEL` or `claude-opus-5`; `$GODSEYE_CHAT_EFFORT` or the model's default | Analyst model (Claude login and Anthropic API key only; other providers take theirs from Analyst settings) and reasoning effort (`low`, `medium`, `high`, `xhigh`, `max`; Claude providers only) |
 | `--debug` | off | Web inspector in window mode |
 | `--selftest` | off | Packaging check; see the desktop section |
 
@@ -139,8 +209,8 @@ How it is put together:
 - The Agent SDK's bundled Claude CLI is copied to `Contents/Helpers/claude` after PyInstaller, so it
   keeps Anthropic's signature, and the app points the analyst at it. Only the outer app is re-signed,
   ad hoc, then checked with `codesign --verify --deep --strict`.
-- Measured on the build machine: 61–66 s for a full build (the DMG adds about 14 s), 329 MB for the
-  app (115 MB without the CLI), 165 MB for the DMG.
+- Measured on the build machine: 58–66 s for a full build (the DMG adds about 14 s), 329–330 MB for
+  the app (115 MB without the CLI), 165 MB for the DMG.
 
 What the build is and is not:
 
@@ -154,8 +224,11 @@ What the build is and is not:
   Its store is `~/Library/Application Support/EyeInTheSky/store` and its harness config
   `~/Library/Application Support/EyeInTheSky/mcp.json`. WebKit keeps page data in
   `~/Library/WebKit/io.eyeinthesky.console` and `~/Library/Caches/io.eyeinthesky.console`.
-- A Finder launch does not see variables from your shell profile. To give the packaged app an
-  `ANTHROPIC_API_KEY`, start `"dist/Eye in the Sky.app/Contents/MacOS/EyeInTheSky"` from a terminal.
+- A Finder launch does not see variables from your shell profile. Keys entered in Analyst settings
+  don't need it; to pass a launch variable such as `ANTHROPIC_API_KEY`, start
+  `"dist/Eye in the Sky.app/Contents/MacOS/EyeInTheSky"` from a terminal. The app keeps its provider
+  settings in `~/Library/Application Support/EyeInTheSky/llm-settings.json` and keys in the
+  Keychain.
 - The UI inside the app is a snapshot of `gods-eye-view/` at build time; rebuild after UI changes.
 - Voice input is not available in the app: it depends on God's Eye View's Node dev server.
 
@@ -237,10 +310,11 @@ async with httpx2.AsyncClient(headers={"Authorization": "Bearer dev-token"}) as 
  python -m godseye_uav.app   (./eye-in-the-sky, godseye-app, the .app, start.sh)
  ┌──────────────────── one FastAPI app, one asyncio loop, 127.0.0.1 only ────────────────────┐
  │  /                  console UI (gods-eye-view build), token injected into index.html       │
- │  /app/config /intel/* /chat/*                     host routes                              │
+ │  /app/config /intel/* /chat/* /settings/llm*      host routes                              │
  │  /mcp               godseye MCP server (46 tools, 8 resources)   <── external agents        │
  │  /health /snapshot /mission-overlay /theaters /events /tracks /control/* /camera/*  bridge │
- │  analyst: one Claude CLI child per chat session, tools called in-process                   │
+ │  analyst: one Claude CLI child per chat session, tools called in-process, talking to the   │
+ │  model provider chosen in Analyst settings (the Claude login by default)                   │
  └──────────────┬──────────────────────────────────────────────────────────────────────────────┘
                 │ msgpack-rpc, loopback only
         fake AirSim (in-process threads)  or  a real AirSim with --real
@@ -326,13 +400,12 @@ cd gods-eye-view && npm run check:boundaries && npm run format:check && npm run 
 
 Final runs for this release:
 
-- **Python**: 1,522 tests. The full run gave 1,515 passed, 1 skipped (the opt-in desktop test) and
-  6 failed while it shared the machine with a UI build, `npm test` and a live host: two window-mode
-  signal tests, two timing tests in `test_server.py` and two in `test_tasking.py`. All six pass on
-  their own, and a rerun of those three files passed in full (300 passed, 1 skipped). The full suite
-  takes about 40 minutes, most of it `test_server.py`.
-- **JavaScript**: 4,883 tests, 4,882 passed, 1 skipped, in about 2 minutes. The run used Node 22,
-  so two allocation microbenchmarks calibrated for Node 24 were skipped.
+- **Python**: 1,767 tests. The full run, alone on the machine, gave 1,765 passed and 2 skipped (the
+  opt-in desktop-app test and the opt-in throwaway-Keychain test) in 40 minutes, most of it
+  `test_server.py`. It includes the provider checks that run the real bundled CLI against a local
+  stub behind a deny-all proxy, with fake keys.
+- **JavaScript**: 4,983 tests, 4,982 passed, 1 skipped. The run used Node 22, so two allocation
+  microbenchmarks calibrated for Node 24 were skipped.
 
 ## Layout
 
@@ -344,6 +417,7 @@ Final runs for this release:
 | `godseye/mcp/godseye_uav/app.py`, `host.py` | Entry point and the single-process host |
 | `godseye/mcp/godseye_uav/intel_graph.py` | The intel graph behind the orb, search, inspector and analyst |
 | `godseye/mcp/godseye_uav/chat.py`, `analyst_policy.py`, `analyst_toolbelt.py`, `analyst_prompt.md` | The analyst: sessions and SSE, approval policy, tools, system prompt |
+| `godseye/mcp/godseye_uav/llm_settings.py`, `llm_providers.py` | The analyst's model providers: settings routes, key storage, connection checks, the provider catalog |
 | `godseye/mcp/godseye_uav/server.py`, `bridge.py` | MCP server and telemetry bridge |
 | `godseye/mcp/godseye_uav/` (rest) | Safety envelope, tasking, missions, targets, threat, geo, store, theaters, fake AirSim |
 | `godseye/packaging/macos/` | PyInstaller spec, entry point and icon for the app |
@@ -368,7 +442,10 @@ Final runs for this release:
 - Geo-registration is certified to a measured ~900 m radius from the origin; beyond that, re-anchor
   the origin.
 - Chat sessions and session grants live in memory and end with the host. The Claude CLI keeps its
-  own transcripts under `~/.claude/projects/` (see `godseye/INTEL_CONSOLE.md`).
+  own transcripts: under `~/.claude/projects/` on the Claude login, and under
+  `<store>/analyst/claude-home/projects/` on every other provider (see `godseye/INTEL_CONSOLE.md`).
+- Analyst providers other than the Claude login were tested offline only, against a local stub;
+  the analyst is built and tested with Claude.
 - Fonts load from Google Fonts; offline, the browser falls back to other fonts.
 - The desktop app is ad-hoc signed, not notarized and arm64 only; it needs the macOS version its
   Python was built for (macOS 26 on the build machine).

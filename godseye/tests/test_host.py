@@ -55,6 +55,14 @@ INDEX_HTML = (
 )
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _llm_keys_in_memory():
+    """The hosts built here keep analyst keys in memory: no test reads or
+    writes a keychain (BYOK spec §11)."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("GODSEYE_LLM_SECRET_STORE", "memory")
+        yield
+
 def _make_ui(root: Path) -> Path:
     ui = root / "ui"
     (ui / "assets").mkdir(parents=True)
@@ -883,3 +891,249 @@ def test_start_sh_passes_the_token_in_the_environment_not_on_argv():
     assert appmod.resolve_token(None, {"GODSEYE_TOKEN": "t-env"}) == ("t-env", "GODSEYE_TOKEN")
     subprocess.run(["bash", "-n", str(Path(__file__).resolve().parents[1] / "start.sh")],
                    check=True)
+
+
+# ---------------------------------------------------------------------------
+# BYOK analyst settings (spec §7, §8, §12 PY-HOST): a fake llm_settings module
+# ---------------------------------------------------------------------------
+# Fake keys only; nothing here reads or writes a keychain.
+
+FAKE_KEY = "test-key-123-host"
+
+
+class _LlmRec:
+    def __init__(self) -> None:
+        self.settings_args: tuple = ()
+        self.settings_kwargs: dict = {}
+        self.guard_kwargs: dict = {}
+        self.router_args: tuple = ()
+
+
+def _fake_llm_module(rec: _LlmRec, *, settings_fails: bool = False,
+                     guard_needs: str | None = None) -> types.ModuleType:
+    mod = types.ModuleType("godseye_uav.llm_settings")
+
+    class LlmSettings:
+        def __init__(self, settings_dir, llm_env=None, *, store_dir=None, model=None,
+                     effort=None, app_port=None, cli_path=None):
+            if settings_fails:
+                raise RuntimeError(f"broken settings {FAKE_KEY}")
+            rec.settings_args = (settings_dir, dict(llm_env or {}))
+            rec.settings_kwargs = {"store_dir": store_dir, "model": model, "effort": effort,
+                                   "app_port": app_port, "cli_path": cli_path}
+            self.generation = 1
+
+        def status(self):
+            return {"provider": {"id": "openrouter", "label": "OpenRouter",
+                                 "kind": "anthropic_compatible", "model_family": "mixed",
+                                 "host": "openrouter.ai", "key_source": "environment",
+                                 "configured": True, "secret": FAKE_KEY},
+                    "cost_basis": "unreliable", "settings_rev": 4, "ready": True,
+                    "model": "anthropic/claude-opus-5.5"}
+
+    class SettingsGuardMiddleware:
+        def __init__(self, app, port: int, **kw):
+            if guard_needs:
+                raise TypeError(f"missing {guard_needs}")
+            rec.guard_kwargs = {"port": port, **kw}
+            self.app, self.port = app, port
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http" and scope["path"].startswith("/settings/"):
+                headers = dict(scope.get("headers") or [])
+                origin = headers.get(b"origin", b"").decode()
+                if origin and origin != f"http://127.0.0.1:{self.port}":
+                    from starlette.responses import JSONResponse
+                    await JSONResponse({"error": "cross_origin"}, status_code=403)(
+                        scope, receive, send)
+                    return
+            await self.app(scope, receive, send)
+
+    def llm_settings_router(svc, auth, chat):
+        rec.router_args = (svc, auth, chat)
+        r = APIRouter()
+
+        @r.get("/settings/llm")
+        def get_settings(_: bool = Depends(auth)):
+            return {"schema": "eye-in-the-sky.llm-settings/1", "rev": 4}
+
+        return r
+
+    mod.LlmSettings = LlmSettings
+    mod.SettingsGuardMiddleware = SettingsGuardMiddleware
+    mod.llm_settings_router = llm_settings_router
+    return mod
+
+
+@pytest.fixture
+def fake_llm(monkeypatch, fake_modules):
+    def install(**kw):
+        rec = _LlmRec()
+        mod = _fake_llm_module(rec, **kw)
+        monkeypatch.setitem(sys.modules, "godseye_uav.llm_settings", mod)
+        monkeypatch.setattr(godseye_uav, "llm_settings", mod, raising=False)
+        return rec, fake_modules()
+    return install
+
+
+def test_settings_are_built_before_the_chat_and_their_routes_are_guarded(tmp_path, fake_llm):
+    rec, chat_rec = fake_llm()
+    host = _boot(tmp_path, ui_dir=_make_ui(tmp_path), mcp_port=False, chat=True,
+                 model="m-1", effort="high", llm_env={"OPENROUTER_API_KEY": FAKE_KEY})
+    try:
+        assert rec.settings_args == (host.store_dir.parent, {"OPENROUTER_API_KEY": FAKE_KEY})
+        assert rec.settings_kwargs["store_dir"] == host.store_dir
+        assert rec.settings_kwargs["model"] == "m-1" and rec.settings_kwargs["effort"] == "high"
+        assert rec.settings_kwargs["app_port"] == host.port
+        assert chat_rec.chat_kwargs["llm"] is host.llm         # the chat resolves through it
+        assert rec.router_args[0] is host.llm and rec.router_args[2] is host.chat
+        assert rec.guard_kwargs["port"] == host.port
+        assert FAKE_KEY not in repr(host.config)                # llm_env is kept out of repr
+        auth = {"Authorization": f"Bearer {TOKEN}"}
+        with TestClient(host.app, base_url="http://127.0.0.1") as c:
+            assert c.get("/settings/llm").status_code == 401
+            assert c.get(f"/settings/llm?token={TOKEN}").status_code == 401   # header only
+            ok = c.get("/settings/llm", headers=auth)
+            assert ok.status_code == 200 and ok.json()["rev"] == 4  # not the static mount
+            evil = c.get("/settings/llm", headers={**auth, "Origin": "http://localhost:5173"})
+            assert evil.status_code == 403 and evil.json() == {"error": "cross_origin"}
+            same = c.get("/settings/llm",
+                         headers={**auth, "Origin": f"http://127.0.0.1:{host.port}"})
+            assert same.status_code == 200
+            assert c.get("/settings/llm", headers={**auth, "Host": "evil.example"}
+                         ).status_code == 400                    # the Host guard is outside
+    finally:
+        host.close()
+
+
+def test_a_broken_settings_module_leaves_the_app_up_on_the_claude_login(tmp_path, fake_llm):
+    _, chat_rec = fake_llm(settings_fails=True)
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, chat=True)
+    try:
+        assert host.llm is None and host.llm_error == "RuntimeError"   # never the message
+        assert chat_rec.chat_kwargs["llm"] is None
+        auth = {"Authorization": f"Bearer {TOKEN}"}
+        with TestClient(host.app, base_url="http://127.0.0.1") as c:
+            assert c.get("/settings/llm").status_code == 401
+            r = c.get("/settings/llm", headers=auth)
+            assert r.status_code == 503 and r.json() == {"error": "settings_unavailable"}
+            assert c.get("/chat/status", headers=auth).json()["available"] is True
+    finally:
+        host.close()
+
+
+def test_a_guard_that_cannot_be_built_keeps_the_settings_routes_closed(tmp_path, fake_llm):
+    """Starlette builds middleware at the first request: an unusable guard
+    must not take every route down, and no settings route may run unguarded."""
+    fake_llm(guard_needs="allowed_hosts")
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, chat=True)
+    try:
+        auth = {"Authorization": f"Bearer {TOKEN}"}
+        with TestClient(host.app, base_url="http://127.0.0.1") as c:
+            assert c.get("/health").status_code == 200
+            r = c.get("/settings/llm", headers=auth)
+            assert r.status_code == 503 and r.json() == {"error": "settings_unavailable"}
+    finally:
+        host.close()
+
+
+def test_the_fallback_status_and_app_config_name_the_provider_without_secrets(
+        tmp_path, fake_llm, fake_modules):
+    fake_llm()
+    fake_modules(chat_fails=True)
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, chat=True)
+    try:
+        assert host.chat is None and host.llm is not None
+        auth = {"Authorization": f"Bearer {TOKEN}"}
+        with TestClient(host.app, base_url="http://127.0.0.1") as c:
+            st = c.get("/chat/status", headers=auth)
+            assert st.json()["provider"] == {
+                "id": "openrouter", "label": "OpenRouter", "kind": "anthropic_compatible",
+                "model_family": "mixed", "host": "openrouter.ai",
+                "key_source": "environment", "configured": True}
+            cfg = c.get("/app/config")
+            assert cfg.json()["chat"]["provider"] == {"id": "openrouter", "label": "OpenRouter"}
+            for body in (st.text, cfg.text):
+                assert FAKE_KEY not in body
+            assert "openrouter.ai" not in cfg.text               # no host on the open route
+    finally:
+        host.close()
+
+
+def test_chat_summary_passes_only_id_and_label_from_the_chat_status():
+    host = hostmod.Host(config=HostConfig(theater=None, model="m"))
+    host.chat = types.SimpleNamespace(status=lambda: {
+        "available": True, "model": "glm-5.3", "cost_basis": "unreliable",
+        "provider": {"id": "zai", "label": "Z.ai GLM", "host": "api.z.ai",
+                     "key_source": "keychain", "configured": True}})
+    assert host.chat_summary() == {"available": True, "model": "glm-5.3",
+                                   "provider": {"id": "zai", "label": "Z.ai GLM"}}
+    host.chat = types.SimpleNamespace(status=lambda: {"available": True, "model": "x"})
+    assert host.chat_summary() == {"available": True, "model": "x"}
+
+
+def _real_llm_settings():
+    try:
+        import godseye_uav.llm_settings as mod
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"llm_settings does not import: {type(exc).__name__}")
+    for name in ("LlmSettings", "llm_settings_router", "SettingsGuardMiddleware"):
+        if not hasattr(mod, name):
+            pytest.skip(f"llm_settings has no {name} yet")
+    return mod
+
+
+def test_the_real_settings_module_is_wired_guarded_and_never_echoes_a_key(tmp_path):
+    """The real llm_settings + chat on one host: a launch-env key is locked
+    in, named by source only, and on no answer (spec §7, §8, §9.1)."""
+    _real_llm_settings()
+    host = _boot(tmp_path, ui_dir=_make_ui(tmp_path), mcp_port=False, chat=True,
+                 llm_env={"OPENROUTER_API_KEY": FAKE_KEY,
+                          "GODSEYE_LLM_PROVIDER": "openrouter"})
+    try:
+        assert host.llm is not None and host.llm_error is None
+        auth = {"Authorization": f"Bearer {TOKEN}"}
+        with TestClient(host.app, base_url="http://127.0.0.1") as c:
+            assert c.get("/settings/llm").status_code == 401
+            view = c.get("/settings/llm", headers=auth)
+            assert view.status_code == 200, view.text
+            assert view.json()["active"] == "openrouter"
+            assert view.headers["cache-control"] == "no-store"
+            assert c.get(f"/settings/llm?token={TOKEN}").status_code in (400, 401)
+            cross = c.get("/settings/llm",
+                          headers={**auth, "Origin": "http://localhost:5173"})
+            assert cross.status_code == 403
+            assert "access-control-allow-origin" not in cross.headers
+            st = c.get("/chat/status", headers=auth).json()
+            assert st["provider"]["id"] == "openrouter"
+            assert st["provider"]["key_source"] == "environment"
+            assert st["cost_basis"] == "unreliable"
+            cfg = c.get("/app/config").json()
+            assert cfg["chat"]["provider"] == {"id": "openrouter", "label": "OpenRouter"}
+            for r in (view, cross):
+                assert FAKE_KEY not in r.text
+            assert FAKE_KEY not in json.dumps(st) and FAKE_KEY not in json.dumps(cfg)
+            assert "openrouter.ai" not in json.dumps(cfg)
+    finally:
+        host.close()
+
+
+def test_the_real_settings_default_to_the_claude_login(tmp_path):
+    _real_llm_settings()
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, chat=True)
+    try:
+        auth = {"Authorization": f"Bearer {TOKEN}"}
+        with TestClient(host.app, base_url="http://127.0.0.1") as c:
+            st = c.get("/chat/status", headers=auth).json()
+            assert st["provider"]["id"] == "anthropic_login"
+            assert st["provider"]["key_source"] == "login"
+            assert c.get("/app/config").json()["chat"]["provider"] == {
+                "id": "anthropic_login", "label": "Claude login (this Mac)"}
+        # nothing was written until the operator saves (spec §3.4)
+        assert not (host.store_dir.parent / "llm-settings.json").exists()
+        # The full check builds its options with the analyst's own builder
+        # (spec §6.2), and a temp store never defaults to the login keychain.
+        assert host.llm._options_builder == host.chat.check_options
+        assert host.llm.key_store["kind"] in ("file", "memory")
+    finally:
+        host.close()

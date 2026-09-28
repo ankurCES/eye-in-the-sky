@@ -106,6 +106,55 @@ def apply_sanitized_env(environ: MutableMapping[str, str]) -> list[str]:
     return removed
 
 
+#: BYOK spec §3.3: every provider, credential and model variable the analyst's
+#: CLI would read. Captured at launch for the settings, then popped: the SDK
+#: can only SET child variables, never unset them, and a stray base URL with no
+#: key sends the Claude login to that host. The AWS/Google credential chains,
+#: proxies and NODE_EXTRA_CA_CERTS stay (inert without a CLAUDE_CODE_USE_* switch).
+LLM_ENV_VARS = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_AUTH_TOKEN", "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_FOUNDRY_BASE_URL", "ANTHROPIC_AWS_API_KEY",
+    "OPENROUTER_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "MOONSHOT_API_KEY",
+    "ZAI_API_KEY", "ZHIPU_API_KEY", "DASHSCOPE_API_KEY", "OLLAMA_API_KEY",
+    "GODSEYE_LLM_PROVIDER",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+    "ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID", "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL", "CLAUDE_CODE_USE_GATEWAY", "CLAUDE_CODE_GATEWAY_TOKEN",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "ANTHROPIC_UNIX_SOCKET",
+)
+
+
+def capture_llm_env(environ: MutableMapping[str, str]) -> dict[str, str]:
+    """Take the model-provider variables out of ``environ`` (spec §3.3).
+
+    Runs after ``sanitize_env`` and before anything can spawn the CLI.
+    ``llm_settings.capture_llm_env`` does the capture; whatever it leaves,
+    and everything when that module cannot load, is popped from
+    ``LLM_ENV_VARS`` here (fail closed). Returns name -> value for
+    ``HostConfig.llm_env``: it holds secrets, so print names only.
+    """
+    captured: dict[str, str] = {}
+    try:
+        from .llm_settings import capture_llm_env as settings_capture
+    except Exception:  # noqa: BLE001 - a broken settings module must not keep keys around
+        settings_capture = None
+    if settings_capture is not None:
+        got = settings_capture(environ)
+        if isinstance(got, Mapping):
+            captured.update({str(k): str(v) for k, v in got.items()})
+    for name in LLM_ENV_VARS:
+        if name in environ:
+            captured.setdefault(name, environ.pop(name))
+    return captured
+
+
 def resolve_token(arg: str | None, env: Mapping[str, str]) -> tuple[str, str]:
     """(token, source): ``--token`` > ``$GODSEYE_TOKEN`` > random per launch."""
     if arg:
@@ -698,13 +747,16 @@ def _describe(host, *, token_source: str, harness_file: Path | None) -> None:
     ui = "built" if host.ui_built else f"NOT BUILT (looked in {host.ui_dir})"
     _say(f"ui       : {ui}")
     chat = host.chat_summary()
+    # The provider is named by its catalog label; its key is never printed.
+    provider = chat.get("provider") if isinstance(chat.get("provider"), dict) else {}
+    via = f" via {provider['label']}" if provider.get("label") else ""
     if chat.get("available"):
-        _say(f"analyst  : available (model {chat.get('model')})")
+        _say(f"analyst  : available (model {chat.get('model')}{via})")
     else:
-        _say(f"analyst  : unavailable ({chat.get('reason', 'unknown')})")
+        _say(f"analyst  : unavailable ({chat.get('reason', 'unknown')}){via}")
 
 
-def _config_from_args(args, token: str):
+def _config_from_args(args, token: str, *, llm_env: Mapping[str, str] | None = None):
     from .host import HostConfig, default_ui_dir
 
     sim_backend = "real" if args.real else "fake"
@@ -714,7 +766,8 @@ def _config_from_args(args, token: str):
         port=DEFAULT_PORT if args.port is None else args.port, mcp_port=args.mcp_port,
         host=args.host, token=token, store_dir=resolve_store(args.store),
         ui_dir=Path(args.ui_dir).expanduser().resolve() if args.ui_dir else default_ui_dir(),
-        chat=not args.no_chat, model=args.model, effort=args.effort)
+        chat=not args.no_chat, model=args.model, effort=args.effort,
+        llm_env=dict(llm_env or {}))
 
 
 def _build(cfg, *, port_explicit: bool, mode: str):
@@ -943,6 +996,8 @@ def main(argv: list[str] | None = None) -> int:
         selftest.app = {"frozen": is_frozen(), "executable": sys.executable}
         start_selftest_watchdog(selftest)
     removed = apply_sanitized_env(os.environ)
+    # Before anything can spawn the analyst's CLI (BYOK spec §3.3).
+    llm_env = capture_llm_env(os.environ)
     token, token_source = resolve_token(args.token, os.environ)
     # The token never lives in our environment: the analyst's CLI inherits it.
     os.environ.pop("GODSEYE_TOKEN", None)
@@ -963,13 +1018,16 @@ def main(argv: list[str] | None = None) -> int:
             mode = "browser"
 
     ensure_airsim_client()
-    cfg = _config_from_args(args, token)
+    cfg = _config_from_args(args, token, llm_env=llm_env)
     log_file = redirect_output_to_log(cfg.store_dir.parent / "logs" / LOG_NAME)
     if log_file:
         _say(f"output is logged to {log_file}")
     if removed:
         _say(f"launched from a Claude Code session; dropped {len(removed)} "
              f"session variable(s): {', '.join(removed)}")
+    if llm_env:
+        _say(f"analyst provider settings from the environment (names only): "
+             f"{', '.join(sorted(llm_env))}")
     try:
         host = _build(cfg, port_explicit=args.port is not None, mode=mode)
     except KeyboardInterrupt:

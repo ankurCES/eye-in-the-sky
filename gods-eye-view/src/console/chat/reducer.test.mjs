@@ -1052,3 +1052,274 @@ test('unknown actions and events leave the state alone', () => {
   assert.equal(t.lastSeq, 1, 'its id still counts');
   assert.equal(t.items.length, 0);
 });
+
+// ---- BYOK providers (BYOK spec §5, §8) ------------------------------------------------------
+
+test('error.code drives availability: the words are never matched', async () => {
+  const { currentProvider } = await import('./reducer.js');
+  const start = foldAll([
+    SESSION,
+    ev('turn_start', { turn_id: 't1', text: 'x' }, 1),
+  ]);
+  // A provider's 401: its label, never "not signed in".
+  let s = reduce(
+    start,
+    ev(
+      'error',
+      {
+        code: 'auth',
+        provider: { id: 'minimax', label: 'MiniMax' },
+        message: 'MiniMax rejected the key.',
+        hint: 'Open analyst settings to replace the key.',
+      },
+      2,
+    ),
+  );
+  assert.equal(s.auth, 'provider');
+  assert.deepEqual(availabilityOf(s), {
+    available: false,
+    reason: 'provider_auth',
+    hint: null,
+    provider: { id: 'minimax', label: 'MiniMax' },
+  });
+  assert.equal(statusWord(s), 'Unavailable');
+  assert.equal(s.turns.t1.blocks.at(-1).code, 'auth');
+  // The Claude login's auth code keeps today's sign-in state.
+  s = reduce(
+    start,
+    ev(
+      'error',
+      {
+        code: 'auth',
+        provider: { id: 'anthropic_login', label: 'Claude login (this Mac)' },
+        message: 'x',
+      },
+      2,
+    ),
+  );
+  assert.equal(availabilityOf(s).reason, 'auth');
+  // Sign-in words with another code change nothing.
+  s = reduce(
+    start,
+    ev(
+      'error',
+      {
+        code: 'network',
+        message: "Couldn't reach the login server to authenticate.",
+      },
+      2,
+    ),
+  );
+  assert.equal(s.auth, null);
+  // A turn refused for settings: the status names the exact reason.
+  s = reduce(
+    start,
+    ev(
+      'error',
+      {
+        code: 'config',
+        provider: { id: 'deepseek', label: 'DeepSeek' },
+        message: 'x',
+      },
+      2,
+    ),
+  );
+  assert.equal(availabilityOf(s).reason, 'provider_not_configured');
+  s = reduce(s, {
+    type: 'availability',
+    available: false,
+    reason: 'provider_key_missing',
+    hint: 'Open analyst settings.',
+  });
+  assert.equal(availabilityOf(s).reason, 'provider_key_missing');
+  assert.equal(availabilityOf(s).provider.label, 'DeepSeek');
+  s = reduce(s, {
+    type: 'availability',
+    available: true,
+    clearAuth: true,
+    provider: { id: 'deepseek', label: 'DeepSeek' },
+  });
+  assert.equal(availabilityOf(s).available, true);
+  assert.equal(currentProvider(s)?.label, 'DeepSeek');
+});
+
+test('provider_changed: a divider (kept or cleared) and the header follows the new provider', async () => {
+  const { currentProvider } = await import('./reducer.js');
+  let s = foldAll([
+    ev(
+      'session',
+      {
+        session_id: 's1',
+        model: 'claude-opus-5-5',
+        provider: { id: 'anthropic_login', label: 'Claude login (this Mac)' },
+      },
+      1,
+    ),
+    ev('turn_start', { turn_id: 't1', text: 'x' }, 2),
+    ev('turn_end', { turn_id: 't1', stop: 'end' }, 3),
+  ]);
+  assert.equal(currentProvider(s).id, 'anthropic_login');
+  s = reduce(
+    s,
+    ev(
+      'provider_changed',
+      {
+        from: {
+          id: 'anthropic_login',
+          label: 'Claude login (this Mac)',
+          model: 'claude-opus-5-5',
+        },
+        to: { id: 'minimax', label: 'MiniMax', model: 'MiniMax-M3[1m]' },
+        memory: 'cleared',
+        at_ms: T0,
+      },
+      4,
+    ),
+  );
+  const div = s.items.at(-1);
+  assert.equal(div.kind, 'divider');
+  assert.equal(div.reason, 'provider');
+  assert.equal(div.memory, 'cleared');
+  assert.equal(div.to.label, 'MiniMax');
+  assert.equal(s.session.model, 'MiniMax-M3[1m]');
+  assert.equal(currentProvider(s).label, 'MiniMax');
+  s = reduce(
+    s,
+    ev(
+      'provider_changed',
+      {
+        to: { id: 'minimax', label: 'MiniMax', model: 'MiniMax-M2.7' },
+        memory: 'kept',
+      },
+      5,
+    ),
+  );
+  assert.equal(s.items.at(-1).memory, 'kept');
+  assert.equal(s.session.model, 'MiniMax-M2.7');
+});
+
+test('a live status after a settings change moves the header to the new provider', async () => {
+  const { currentProvider } = await import('./reducer.js');
+  let s = foldAll([
+    ev(
+      'session',
+      {
+        session_id: 's1',
+        model: 'claude-opus-5',
+        provider: { id: 'anthropic_login', label: 'Claude login (this Mac)' },
+      },
+      1,
+    ),
+  ]);
+  s = reduce(s, {
+    type: 'availability',
+    available: true,
+    model: 'stub-model-1',
+    provider: { id: 'custom', label: 'Custom Anthropic-compatible endpoint' },
+  });
+  assert.equal(s.session.model, 'stub-model-1');
+  assert.equal(currentProvider(s).id, 'custom');
+  assert.equal(s.session.id, 's1');
+  // An unavailable status leaves what the session last used on screen.
+  s = reduce(s, {
+    type: 'availability',
+    available: false,
+    reason: 'provider_key_missing',
+    model: 'MiniMax-M3[1m]',
+    provider: { id: 'minimax', label: 'MiniMax' },
+  });
+  assert.equal(s.session.model, 'stub-model-1');
+  assert.equal(currentProvider(s).id, 'custom');
+});
+
+test('usage: an unreliable cost basis is never summed into dollars', async () => {
+  const { costBasis } = await import('./reducer.js');
+  let s = foldAll([SESSION, ev('turn_start', { turn_id: 't1', text: 'x' }, 1)]);
+  s = reduce(
+    s,
+    ev(
+      'usage',
+      {
+        turn_id: 't1',
+        input_tokens: 10,
+        output_tokens: 5,
+        cost_basis: 'unreliable',
+        cost_usd: 0.5,
+        session_cost_usd: 0.5,
+      },
+      2,
+    ),
+  );
+  assert.equal(costBasis(s), 'unreliable');
+  assert.equal(s.usage.sessionCost, 0);
+  assert.equal(s.usage.serverSessionCost, null);
+  assert.equal(s.usage.turns.t1.input_tokens, 10);
+  assert.equal(s.usage.turns.t1.costBasis, 'unreliable');
+});
+
+test('review: a switch mid-turn leaves the running turn on its own provider', async () => {
+  const { currentProvider } = await import('./reducer.js');
+  const custom = {
+    id: 'custom',
+    label: 'Custom Anthropic-compatible endpoint',
+  };
+  const minimax = { id: 'minimax', label: 'MiniMax' };
+  let s = foldAll([
+    ev(
+      'session',
+      { session_id: 's1', model: 'stub-model-1', provider: custom },
+      1,
+    ),
+    ev('turn_start', { turn_id: 't1', text: 'x' }, 2),
+  ]);
+  assert.equal(s.turns.t1.provider.id, 'custom');
+  // Analyst settings switch to MiniMax while t1 runs.
+  s = reduce(s, {
+    type: 'availability',
+    available: true,
+    model: 'MiniMax-M3[1m]',
+    provider: minimax,
+  });
+  assert.equal(
+    currentProvider(s).id,
+    'custom',
+    'the header waits for the turn',
+  );
+  assert.equal(s.session.model, 'stub-model-1');
+  assert.equal(s.availability.provider.id, 'minimax');
+  s = reduce(
+    s,
+    ev(
+      'usage',
+      { turn_id: 't1', input_tokens: 3, cost_basis: 'unreliable' },
+      3,
+    ),
+  );
+  assert.equal(s.usage.turns.t1.provider.id, 'custom');
+  s = reduce(s, ev('turn_end', { turn_id: 't1', stop: 'end' }, 4));
+  assert.equal(currentProvider(s).id, 'minimax');
+  assert.equal(s.session.model, 'MiniMax-M3[1m]');
+  // A provider_changed event supersedes a deferred status.
+  s = reduce(s, ev('turn_start', { turn_id: 't2', text: 'y' }, 5));
+  assert.equal(s.turns.t2.provider.id, 'minimax');
+  s = reduce(s, {
+    type: 'availability',
+    available: true,
+    model: 'stub-model-1',
+    provider: custom,
+  });
+  s = reduce(
+    s,
+    ev('provider_changed', { to: { ...minimax, model: 'MiniMax-M2.7' } }, 6),
+  );
+  s = reduce(s, ev('turn_end', { turn_id: 't2', stop: 'end' }, 7));
+  assert.equal(currentProvider(s).id, 'minimax');
+  assert.equal(s.session.model, 'MiniMax-M2.7');
+  // A usage event that names its provider wins.
+  s = reduce(s, ev('turn_start', { turn_id: 't3', text: 'z' }, 8));
+  s = reduce(
+    s,
+    ev('usage', { turn_id: 't3', provider: custom, input_tokens: 1 }, 9),
+  );
+  assert.equal(s.usage.turns.t3.provider.id, 'custom');
+});

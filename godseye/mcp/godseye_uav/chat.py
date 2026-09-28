@@ -22,14 +22,32 @@ The SDK is imported lazily (``claude_agent_sdk`` is an optional extra); tests
 inject a fake module through ``sdk=``.
 
 Transcripts: the Claude CLI writes each conversation to
-``~/.claude/projects/<encoded cwd>/<session>.jsonl`` whatever the options say;
-the analyst's cwd is ``<store>/analyst``, so they land under that encoded path.
+``<config dir>/projects/<encoded cwd>/<session>.jsonl`` whatever the options
+say; the analyst's cwd is ``<store>/analyst``, so they land under that encoded
+path. The config dir is ``~/.claude`` for the Claude login and
+``<store>/analyst/claude-home`` for every other provider (BYOK spec §4.2).
+
+Model provider (BYOK spec §4.4, §5, §8, §9): with ``llm=`` (an
+``llm_settings.LlmSettings``) every turn resolves the active provider first.
+Only ``model``, ``thinking``, ``effort`` and ``env`` come from it; every other
+option is the same for every provider (``provider_options`` is the one place
+those four are computed). A settings change bumps the provider generation: the
+running turn finishes on the old provider, and the session reconnects on its
+next message, fresh when the provider identity changed (``provider_changed``).
+Every event goes through one redaction choke point (``_Session.emit``) so no
+provider key can reach SSE; streamed text and thinking go through
+``_Session.stream`` first, which redacts across deltas (a key split into short
+chunks). A turn whose events or final blocks needed redacting also gets its
+CLI transcript scrubbed. Before a CLI is spawned, ``llm.preflight(rp)`` may
+refuse the provider (an endpoint that now redirects). Without ``llm`` the
+service runs exactly as before this spec (Claude login, no ``env`` option).
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -40,7 +58,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -109,7 +127,402 @@ _ASSISTANT_ERRORS = {
     "unknown": ("The analyst hit an unknown error.", None, True),
 }
 
-_GATE_KEYS = ("ok", "required_pct", "available_pct", "plan_fuel_pct", "return_fuel_pct",
+# ------------------------------------------------------- model providers --
+
+#: The provider kind that is today's default: the owner's Claude login.
+LOGIN_KIND = "anthropic_login"
+#: The login provider as events name it when no settings module is wired.
+LOGIN_PROVIDER = {"id": "anthropic_login", "label": "Claude login (this Mac)"}
+#: Kinds whose model precedence starts with ``ChatService(model=)`` and then
+#: ``GODSEYE_CHAT_MODEL`` (spec §3.4); every other kind takes the settings.
+FIRST_PARTY_KINDS = frozenset({"anthropic_login", "anthropic_key"})
+#: Kinds that accept ``effort`` (spec §2): Claude on Anthropic or a cloud.
+EFFORT_KINDS = frozenset({"anthropic_login", "anthropic_key", "bedrock", "vertex", "foundry"})
+ADAPTIVE_THINKING = {"type": "adaptive", "display": "summarized"}
+COST_LIST = "anthropic_list"
+#: The CLI prices unknown models from its own table: the dollars are invented.
+COST_UNRELIABLE = "unreliable"
+#: ``ResolvedProvider.env`` names whose values are credentials (redacted everywhere).
+SECRET_ENV_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AWS_BEARER_TOKEN_BEDROCK",
+                   "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+                   "ANTHROPIC_AWS_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+REDACTED = "[redacted key]"
+#: A secret is redacted wherever any run of this many of its characters shows up.
+REDACT_MIN_RUN = 12
+#: Sent in place of a key to a keyless local server (``llm_settings``' list; a
+#: test pins them equal). The only values of 8+ characters never redacted.
+PLACEHOLDER_TOKENS = frozenset({"ollama", "lmstudio", "unused"})
+#: ``status.reason`` values that mean "the provider settings need attention".
+PROVIDER_REASONS = ("provider_not_configured", "provider_key_missing", "provider_auth",
+                    "settings_error")
+PROVIDER_HINTS = {
+    "provider_not_configured": "Open analyst settings.",
+    "provider_key_missing": "Open analyst settings.",
+    "provider_auth": "Open analyst settings to replace the key.",
+    "settings_error": "Open analyst settings.",
+}
+#: ``error.code`` values (spec §5).
+ERROR_CODES = ("auth", "billing", "model", "rate_limit", "invalid_request", "server",
+               "network", "config", "unknown")
+
+_STATUS_IN_TEXT_RX = re.compile(r"(?i)\b(?:API Error|status(?: code)?)[:\s]+([1-5]\d\d)\b")
+_NETWORK_RX = re.compile(r"(?i)ECONNREFUSED|Connection refused|ENOTFOUND|timed out|certificate")
+_THINKING_RX = re.compile(r"(?i)thinking|adaptive")
+_CODE_BY_STATUS = {401: "auth", 403: "auth", 402: "billing", 404: "model", 429: "rate_limit",
+                   400: "invalid_request", 422: "invalid_request"}
+_CODE_BY_ASSISTANT_ERROR = {
+    "authentication_failed": "auth", "billing_error": "billing", "model_not_found": "model",
+    "rate_limit": "rate_limit", "invalid_request": "invalid_request", "server_error": "server",
+}
+
+
+def classify_provider_error(status: int | None, assistant_error: str | None,
+                            text: str | None) -> str:
+    """The ``error.code`` for a failed turn (spec §5).
+
+    ``ResultMessage.api_error_status`` wins, then ``AssistantMessage.error``,
+    then the text: gateway-style 401s carry ``invalid_request`` as their
+    error string, and ``model_not_found`` is outside the SDK's Literal.
+    """
+    text = text or ""
+    if not isinstance(status, int) or isinstance(status, bool):
+        status = None
+    if status is None:
+        m = _STATUS_IN_TEXT_RX.search(text)
+        if m and assistant_error in (None, "unknown", "invalid_request"):
+            status = int(m.group(1))
+    if status is not None:
+        if status in _CODE_BY_STATUS:
+            return _CODE_BY_STATUS[status]
+        if 500 <= status <= 599:
+            return "server"
+    # The CLI reports a refused connection as ``server_error`` with no
+    # status; §5 counts ``server_error`` as a server error only with one.
+    if (assistant_error == "server_error" and _NETWORK_RX.search(text)
+            and not _STATUS_IN_TEXT_RX.search(text)):
+        return "network"
+    code = _CODE_BY_ASSISTANT_ERROR.get(assistant_error or "")
+    if code:
+        return code
+    if _NETWORK_RX.search(text):
+        return "network"
+    if _AUTH_RX.search(text):
+        return "auth"
+    return "unknown"
+
+
+def provider_error_copy(code: str, *, label: str, host: str | None = None,
+                        model: str | None = None, status: int | None = None,
+                        detail: str | None = None) -> tuple[str, str | None, bool]:
+    """(message, hint, retryable) for a provider other than the Claude login
+    (spec §5). ``detail`` must already be redacted; it is cut to 300 chars.
+    """
+    detail = (detail or "").strip()[:300] or "no detail given"
+    where = host or label
+    if code == "auth" and status == 403:
+        return (f"{label} refused access for this key.",
+                f"Check the key's permissions or plan in your {label} account.", False)
+    if code == "auth":
+        return f"{label} rejected the key.", "Open analyst settings to replace the key.", False
+    if code == "billing":
+        return (f"{label} reports a billing problem.",
+                f"Check the credits or plan in your {label} account.", False)
+    if code == "model":
+        return (f"{label} doesn't recognize the model {model or 'you picked'}.",
+                "Pick another model in analyst settings.", False)
+    if code == "rate_limit":
+        return f"{label} is rate-limiting this key.", "Wait a minute, then retry.", True
+    if code == "invalid_request":
+        hint = ("Turn off extended thinking for this model in analyst settings."
+                if _THINKING_RX.search(detail) else "Run a full check in analyst settings.")
+        return f"{label} rejected the request: {detail}", hint, False
+    if code == "server":
+        return f"{label} had a server error.", "Retry in a moment.", True
+    if code == "network":
+        return f"Couldn't reach {where}.", "Check the endpoint URL and your connection.", True
+    return f"The analyst hit an error with {label}: {detail}", None, True
+
+
+def _config_copy(reason: str | None, label: str) -> tuple[str, str]:
+    """(message, hint) for a turn refused because the provider is not ready."""
+    if reason == "provider_key_missing":
+        return f"The analyst has no key for {label}.", "Open analyst settings."
+    if reason == "settings_error":
+        return "The analyst's model settings could not be read.", "Open analyst settings."
+    return f"The analyst isn't set up to use {label}.", "Open analyst settings."
+
+
+class _Redactor:
+    """Replaces every run of ``REDACT_MIN_RUN`` or more characters of a known
+    secret with ``[redacted key]`` (spec §9.5). A secret shorter than that is
+    redacted where it appears whole, whatever its characters (``validate_key``
+    accepts ``abcdefghij``); only the placeholder tokens (``lmstudio``) are
+    never added. Secrets are only ever added: a key replaced in settings may
+    still be echoed by a turn that started with it.
+    """
+
+    def __init__(self) -> None:
+        self._secrets: set[str] = set()
+        self._grams: set[str] = set()
+        self._whole: set[str] = set()
+
+    def add(self, secret: Any) -> None:
+        if (not isinstance(secret, str) or len(secret) < 8 or secret in PLACEHOLDER_TOKENS
+                or secret in self._secrets):
+            return
+        self._secrets.add(secret)
+        # The raw form, and the form a JSON transcript stores it in.
+        for form in {secret, json.dumps(secret)[1:-1]}:
+            if len(form) >= REDACT_MIN_RUN:
+                self._grams.update(form[i:i + REDACT_MIN_RUN]
+                                   for i in range(len(form) - REDACT_MIN_RUN + 1))
+            else:
+                self._whole.add(form)
+
+    @property
+    def active(self) -> bool:
+        return bool(self._grams or self._whole)
+
+    def spans(self, value: str) -> list[tuple[int, int]]:
+        """Sorted, merged ``(start, end)`` spans of ``value`` to redact."""
+        if not isinstance(value, str) or not self.active or len(value) < 8:
+            return []
+        found: list[tuple[int, int]] = []
+        for needles, width in ((self._grams, REDACT_MIN_RUN), (self._whole, 0)):
+            for needle in needles:
+                start = value.find(needle)
+                while start >= 0:
+                    found.append((start, start + (width or len(needle))))
+                    start = value.find(needle, start + 1)
+        found.sort()
+        merged: list[tuple[int, int]] = []
+        for a, b in found:
+            if merged and a <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+            else:
+                merged.append((a, b))
+        return merged
+
+    @staticmethod
+    def render(value: str, spans: list[tuple[int, int]]) -> str:
+        """``value`` with each span replaced by ``[redacted key]``."""
+        out, pos = [], 0
+        for a, b in spans:
+            out += [value[pos:a], REDACTED]
+            pos = b
+        out.append(value[pos:])
+        return "".join(out)
+
+    def text(self, value: str) -> str:
+        spans = self.spans(value)
+        return self.render(value, spans) if spans else value
+
+    def value(self, value: Any) -> Any:
+        """``value`` with every string inside it redacted (dicts, lists, tuples)."""
+        if isinstance(value, str):
+            return self.text(value)
+        if isinstance(value, dict):
+            return {k: self.value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return type(value)(self.value(v) for v in value)
+        return value
+
+
+#: One registry per process: the analyst's log records, events and stderr are
+#: all redacted against every key any ChatService has handed to a CLI.
+_REDACTOR = _Redactor()
+
+
+class _RedactLogFilter(logging.Filter):
+    """Redacts this module's log records (a logger's own filters only see
+    records created on it, so it sits on ``godseye_uav.chat`` itself)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if _REDACTOR.active:
+            try:
+                message = record.getMessage()
+            except Exception:  # noqa: BLE001 -- a bad format string: leave it to logging
+                return True
+            clean = _REDACTOR.text(message)
+            if clean != message:
+                record.msg, record.args = clean, None
+        return True
+
+
+log.addFilter(_RedactLogFilter())
+
+
+def scrub_transcripts(config_dir: pathlib.Path, *, session_ids: Iterable[str],
+                      redact: Callable[[str], str]) -> list[pathlib.Path]:
+    """Rewrite one session's CLI transcripts with ``redact`` applied (spec §9.6).
+
+    Rewrites ``<config_dir>/projects/*/<session id>.jsonl`` (and any
+    ``*.jsonl`` under a ``<session id>/`` folder beside it) for each of
+    ``session_ids``, and nothing else: another analyst session's CLI may be
+    appending to its own file in the same folder, and a replace under it would
+    lose its writes. Atomic (same-directory temp file, mode 0600,
+    ``os.replace``). Returns the files rewritten. The session's CLI must not
+    be running.
+    """
+    projects = pathlib.Path(config_dir) / "projects"
+    if not projects.is_dir():
+        return []
+    ids = {sid for sid in session_ids if isinstance(sid, str) and re.fullmatch(r"[\w.-]+", sid)}
+    files: set[pathlib.Path] = set()
+    for folder in projects.iterdir():
+        if not folder.is_dir():
+            continue
+        for sid in ids:
+            own = folder / f"{sid}.jsonl"
+            if own.is_file():
+                files.add(own)
+            side = folder / sid
+            if side.is_dir():
+                files.update(q for q in side.rglob("*.jsonl") if q.is_file())
+    rewritten = []
+    for path in sorted(files):
+        try:
+            raw = path.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            continue
+        clean = redact(raw)
+        if clean == raw:
+            continue
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.scrub")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as fh:
+                fd = -1
+                fh.write(clean)
+                fh.flush()
+                os.fsync(fh.fileno())
+        finally:
+            if fd != -1:
+                os.close(fd)
+        os.replace(tmp, path)
+        rewritten.append(path)
+    return rewritten
+
+
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    """A ResolvedProvider attribute (or mapping key), else ``default``."""
+    if isinstance(obj, Mapping):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+@dataclass(frozen=True)
+class _LegacyProvider:
+    """The provider without a settings module: today's Claude login.
+
+    ``env`` is None, so the options carry no ``env`` at all (exactly the
+    option set from before the BYOK spec).
+    """
+
+    model: str
+    effort: str | None
+    id: str = LOGIN_PROVIDER["id"]
+    label: str = LOGIN_PROVIDER["label"]
+    kind: str = LOGIN_KIND
+    model_family: str = "claude"
+    host: str | None = None
+    thinking: dict = field(default_factory=lambda: dict(ADAPTIVE_THINKING))
+    env: Mapping[str, str] | None = None
+    cost_basis: str = COST_LIST
+    identity: str = "legacy-login"
+    generation: int = 0
+    ready: bool = True
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _UnresolvedProvider:
+    """Stands in for a provider ``resolve()`` could not produce."""
+
+    label: str = "the model provider"
+    id: str = "unknown"
+    kind: str = "unknown"
+    model: str = ""
+    ready: bool = False
+    reason: str = "settings_error"
+    generation: int = -1
+    identity: str = ""
+    env: Mapping[str, str] | None = None
+
+
+def provider_options(rp: Any, *, model_override: str | None = None,
+                     effort_override: str | None = None) -> dict:
+    """The four ``ClaudeAgentOptions`` fields a provider decides (spec §4.4).
+
+    ``model``, ``thinking``, ``effort`` (only for kinds that allow it) and
+    ``env`` (only when the provider has one: the legacy login has none). The
+    model precedence of spec §3.4: ``model_override`` (``ChatService(model=)``,
+    then ``GODSEYE_CHAT_MODEL``) wins only for the first-party Claude kinds.
+    Every other option is the same for every provider and is never set here.
+    """
+    kind = _field(rp, "kind", LOGIN_KIND)
+    model = _field(rp, "model") or None
+    if kind in FIRST_PARTY_KINDS:
+        model = model_override or model or DEFAULT_MODEL
+    thinking = _field(rp, "thinking")
+    out: dict[str, Any] = {
+        "model": model,
+        "thinking": dict(thinking) if isinstance(thinking, Mapping) else dict(ADAPTIVE_THINKING),
+    }
+    if kind in EFFORT_KINDS:
+        effort = effort_override or _field(rp, "effort")
+        if effort in EFFORT_LEVELS:
+            out["effort"] = effort
+    env = _field(rp, "env")
+    if isinstance(env, Mapping):
+        out["env"] = {str(k): str(v) for k, v in env.items()}
+    return out
+
+
+def _ready(rp: Any) -> bool:
+    return bool(_field(rp, "ready", True))
+
+
+def _conn_key(rp: Any) -> tuple:
+    """What a connected CLI was built from: a change means reconnect (spec §8)."""
+    return (_field(rp, "generation"), _field(rp, "identity"))
+
+
+def _provider_ref(rp: Any) -> dict:
+    """``{id, label}``: all an event or ``/app/config`` may say about a provider."""
+    return {"id": str(_field(rp, "id", LOGIN_PROVIDER["id"])),
+            "label": str(_field(rp, "label", LOGIN_PROVIDER["label"]))}
+
+
+#: Keys ``status()`` may copy out of a provider summary (a whitelist: nothing
+#: else, and never ``env``, can reach ``/chat/status``).
+_SUMMARY_KEYS = ("id", "label", "kind", "model_family", "host", "key_source", "configured",
+                 "cost_basis", "settings_rev", "rev", "ready", "reason", "model", "generation",
+                 "identity", "effort")
+
+
+def _summary_fields(raw: Any) -> dict:
+    """A provider summary (a mapping, possibly with a nested ``provider``
+    block, or a ``ResolvedProvider``) flattened to ``_SUMMARY_KEYS``."""
+    out: dict = {}
+    if raw is None:
+        return out
+    if isinstance(raw, Mapping):
+        nested = raw.get("provider")
+        for src in (nested if isinstance(nested, Mapping) else {}, raw):
+            for key in _SUMMARY_KEYS:
+                if key in src and not isinstance(src[key], Mapping):
+                    out.setdefault(key, src[key])
+        return out
+    for key in _SUMMARY_KEYS:
+        value = getattr(raw, key, None)
+        if value is not None:
+            out[key] = value
+    return out
+
+
+_GATE_KEYS =("ok", "required_pct", "available_pct", "plan_fuel_pct", "return_fuel_pct",
               "reserve_pct", "bingo_latched", "bingo_fuel_pct", "envelope_violations",
               "warnings", "est_time_s", "est_distance_m")
 
@@ -174,11 +587,34 @@ class _Turn:
     errors_emitted: set = field(default_factory=set)
     got_result: bool = False
     ended: bool = False
+    #: An AssistantMessage error waiting for the ResultMessage's HTTP status:
+    #: ``{"error": str, "text": str}`` (spec §5: the status decides the code).
+    pending_error: dict | None = None
+    started_at: float = field(default_factory=time.time)
 
 
 class _Session:
-    def __init__(self, sid: str):
+    def __init__(self, sid: str, redactor: _Redactor | None = None):
         self.sid = sid
+        self._redactor = redactor
+        #: Set when the redaction choke point replaced something during a turn:
+        #: the CLI transcript then holds the key and gets scrubbed (spec §9.6).
+        self.needs_scrub = False
+        #: Streamed text not sent yet, per kind ("text" / "thinking"): its
+        #: tail could be the start of a key the next delta completes.
+        self.held: dict[str, str] = {}
+        #: Provider generation / identity the session last ran a turn on, and
+        #: ``{id, label, model}`` for ``provider_changed.from`` (spec §8).
+        self.gen: int | None = None
+        self.identity: str | None = None
+        self.provider: dict | None = None
+        #: kind / endpoint host of that provider (error copy, spec §5).
+        self.kind: str = LOGIN_KIND
+        self.host: str | None = None
+        self.cost_basis = COST_LIST
+        #: The CLI config dir of the connected client (for the transcript scrub).
+        self.config_dir: pathlib.Path | None = None
+        self.seen_session_ids: set[str] = set()
         self.log: deque = deque(maxlen=EVENT_LOG_SIZE)
         self.seq = 0
         self.changed = asyncio.Event()
@@ -208,7 +644,59 @@ class _Session:
         self.cost_base = 0.0
         self.cost_total = 0.0
 
+    def redact(self, value: Any) -> Any:
+        """``value`` with every known key redacted; flags a transcript scrub
+        (done after the turn) when anything was replaced."""
+        red = self._redactor
+        if red is None or not red.active:
+            return value
+        clean = red.value(value)
+        if clean != value:
+            self.needs_scrub = True
+        return clean
+
+    def stream(self, kind: str, delta: str) -> str:
+        """The settled, redacted part of the ``kind`` stream after ``delta``.
+
+        ``emit`` redacts each event on its own, so a key split over deltas
+        shorter than ``REDACT_MIN_RUN`` would pass it. Redaction runs on the
+        held text plus the delta instead; the last ``REDACT_MIN_RUN - 1``
+        characters (and a match that reaches into them) wait for the next
+        delta or ``flush_stream``. Nothing is held while no key is known.
+        """
+        raw = self.held.pop(kind, "") + delta
+        red = self._redactor
+        if red is None or not red.active:
+            return raw
+        spans = red.spans(raw)
+        cut = len(raw) - (REDACT_MIN_RUN - 1)
+        for a, b in spans:
+            if a < cut < b:
+                cut = a  # the match may grow: keep all of it for the next round
+                break
+        if cut <= 0:
+            self.held[kind] = raw
+            return ""
+        self.held[kind] = raw[cut:]
+        done = [(a, b) for a, b in spans if b <= cut]
+        if done:
+            self.needs_scrub = True
+        return red.render(raw[:cut], done)
+
+    def flush_stream(self, kind: str) -> str:
+        """Whatever the ``kind`` stream still holds, redacted."""
+        raw = self.held.pop(kind, "")
+        return self.redact(raw) if raw else ""
+
+    def stderr_line(self, line: str) -> None:
+        """The CLI's stderr sink: redacted before it is kept."""
+        self.stderr_tail.append(self.redact(line))
+
     def emit(self, name: str, data: dict) -> int:
+        # The one choke point every event passes: no string in any event may
+        # carry a provider key (a provider that echoes the key in a 401 puts
+        # it into the error text; spec §9.5).
+        data = self.redact(data)
         self.seq += 1
         self.log.append((self.seq, name, data))
         self.last_active = time.monotonic()
@@ -439,11 +927,21 @@ class ChatService:
     def __init__(self, *, server: Any, intel: Any, store_dir: pathlib.Path,
                  model: str | None = None, effort: str | None = None,
                  cli_path: str | None = None, sdk: Any = None,
-                 approval_timeout_s: float = 600.0, enabled: bool = True):
+                 approval_timeout_s: float = 600.0, enabled: bool = True,
+                 llm: Any = None):
         self._server = server
         self._intel = intel
         self._store_dir = pathlib.Path(store_dir)
-        self.model = model or os.environ.get(MODEL_ENV) or DEFAULT_MODEL
+        #: ``llm_settings.LlmSettings`` (or None: today's Claude login, no ``env``).
+        self._llm = llm
+        self._redactor = _REDACTOR
+        #: The last provider ``resolve()`` produced (never logged: its env holds the key).
+        self._last_rp: Any = None
+        #: Provider generation at which a non-login provider rejected its key.
+        self._auth_failure: int | None = None
+        #: ChatService(model=) then GODSEYE_CHAT_MODEL: wins for the Claude kinds only.
+        self._model_override = model or os.environ.get(MODEL_ENV) or None
+        self.model = self._model_override or DEFAULT_MODEL
         raw_effort = effort or os.environ.get(EFFORT_ENV) or None
         self.effort = raw_effort if raw_effort in EFFORT_LEVELS else None
         if raw_effort and self.effort is None:
@@ -513,15 +1011,110 @@ class ChatService:
         return True, None, None
 
     def status(self) -> dict:
+        """``GET /chat/status``. Never touches the keychain and never carries
+        a secret: the provider block is built from a whitelist (spec §8)."""
         ok, reason, hint = self._availability()
         out: dict = {"available": ok, "model": self.model}
+        if self._llm is None:
+            if reason:
+                out["reason"] = reason
+            if hint:
+                out["hint"] = hint
+            if self.effort:
+                out["effort"] = self.effort
+            return out
+        info = self._provider_summary()
+        kind = info.get("kind") or LOGIN_KIND
+        model = info.get("model") or None
+        if kind in FIRST_PARTY_KINDS:
+            model = self._model_override or model or DEFAULT_MODEL
+        out["model"] = model
+        ready = bool(info.get("ready", True))
+        out["provider"] = {
+            "id": str(info.get("id") or "unknown"), "label": str(info.get("label") or ""),
+            "kind": kind, "model_family": info.get("model_family"),
+            "host": info.get("host"),
+            "key_source": info.get("key_source") or ("login" if kind == LOGIN_KIND else None),
+            "configured": bool(info.get("configured", ready)),
+        }
+        out["cost_basis"] = info.get("cost_basis") or (
+            COST_LIST if kind in EFFORT_KINDS else COST_UNRELIABLE)
+        rev = info.get("settings_rev", info.get("rev"))
+        if isinstance(rev, int) and not isinstance(rev, bool):
+            out["settings_rev"] = rev
+        if ok and not ready:
+            ok, reason = False, str(info.get("reason") or "provider_not_configured")
+            hint = PROVIDER_HINTS.get(reason, PROVIDER_HINTS["provider_not_configured"])
+        elif ok and self._auth_failure is not None and (
+                self._auth_failure == self._current_generation(info)):
+            # the key was rejected, and the settings haven't changed since
+            ok, reason, hint = False, "provider_auth", PROVIDER_HINTS["provider_auth"]
+        out["available"] = ok
         if reason:
             out["reason"] = reason
         if hint:
             out["hint"] = hint
-        if self.effort:
-            out["effort"] = self.effort
+        effort = self.effort or info.get("effort")
+        if kind in EFFORT_KINDS and effort in EFFORT_LEVELS:
+            out["effort"] = effort
         return out
+
+    def _current_generation(self, info: Mapping) -> Any:
+        """The settings' provider generation now (the summary's, else
+        ``llm.generation``), without resolving."""
+        gen = info.get("generation")
+        if gen is None:
+            gen = getattr(self._llm, "generation", None)
+        return gen
+
+    def _provider_summary(self) -> dict:
+        """The active provider without touching the keychain: the settings'
+        own summary (``provider_status()``, else ``status()``), else the last
+        resolved provider. Only ``_SUMMARY_KEYS`` survive."""
+        raw = None
+        for name in ("provider_status", "status"):
+            fn = getattr(self._llm, name, None)
+            if callable(fn):
+                try:
+                    raw = fn()
+                except Exception as exc:  # noqa: BLE001 -- status must not 500
+                    log.warning("analyst: the provider summary failed: %s", type(exc).__name__)
+                    return {"id": "unknown", "label": "the model provider", "ready": False,
+                            "reason": "settings_error"}
+                break
+        if inspect.isawaitable(raw):  # an async summary cannot serve a sync status
+            with contextlib.suppress(Exception):
+                raw.close()
+            raw = None
+        info = _summary_fields(raw)
+        if not info and self._last_rp is not None:
+            info = _summary_fields(self._last_rp)
+        return info
+
+    async def _resolve_provider(self) -> Any:
+        """The provider for the next turn (``llm.resolve()``, sync or async).
+        Registers its credentials with the redactor. Never raises."""
+        if self._llm is None:
+            return _LegacyProvider(model=self._model_override or DEFAULT_MODEL,
+                                   effort=self.effort)
+        try:
+            # aresolve reads the keychain off the event loop (spec §3.2).
+            fn = getattr(self._llm, "aresolve", None)
+            rp = fn() if callable(fn) else self._llm.resolve()
+            if inspect.isawaitable(rp):
+                rp = await rp
+        except Exception as exc:  # noqa: BLE001 -- the turn fails with settings_error
+            log.warning("analyst: could not resolve the model provider: %s",
+                        type(exc).__name__)
+            rp = _UnresolvedProvider()
+        env = _field(rp, "env")
+        if isinstance(env, Mapping):
+            for name in SECRET_ENV_VARS:
+                self._redactor.add(env.get(name))
+        self._last_rp = rp
+        if _ready(rp):
+            self.model = provider_options(rp, model_override=self._model_override)["model"]
+        return rp
 
     def _get(self, sid: str) -> _Session:
         s = self._sessions.get(sid)
@@ -548,7 +1141,7 @@ class ChatService:
                 raise Busy(None, "too many analyst sessions are running")
             await self.close_session(idle[0].sid)
         sid = uuid.uuid4().hex
-        self._sessions[sid] = _Session(sid)
+        self._sessions[sid] = _Session(sid, self._redactor)
         return sid
 
     async def post_message(self, sid: str, text: str, context: dict | None = None) -> str:
@@ -564,15 +1157,44 @@ class ChatService:
         if s.turn is not None:
             raise Busy(s.turn.turn_id)
         turn_id = f"turn-{uuid.uuid4().hex[:12]}"
-        s.turn = _Turn(turn_id)
+        s.turn = _Turn(turn_id)  # reserved before the await: a second post is Busy
         s.last_turn_id = turn_id
         s.interrupt_evt = asyncio.Event()
+        rp = await self._resolve_provider()
+        if s.closed:
+            s.turn = None
+            raise NotFound(f"no chat session {sid!r}")
+        if _ready(rp):
+            self._note_provider(s, rp)  # provider_changed goes out before turn_start
         s.emit("turn_start", {"turn_id": turn_id, "text": text})
         prompt = self._compose_prompt(text, context)
         if s.actor is None or s.actor.done():
             s.actor = asyncio.create_task(self._actor(s), name=f"godseye-analyst-{sid[:8]}")
-        s.inbox.put_nowait((turn_id, prompt))
+        s.inbox.put_nowait((turn_id, prompt, rp))
         return turn_id
+
+    def _note_provider(self, s: _Session, rp: Any) -> None:
+        """Generation / identity bookkeeping before a turn (spec §8).
+
+        A change since the session's last turn emits ``provider_changed``.
+        A different identity (provider id, kind, endpoint, fields) also drops
+        the CLI conversation: no resume across providers (another config dir,
+        another provider's thinking signatures). The actor reconnects the CLI
+        itself, because it compares each turn's provider with its client's.
+        """
+        gen, identity = _field(rp, "generation"), _field(rp, "identity")
+        opts = provider_options(rp, model_override=self._model_override)
+        info = {**_provider_ref(rp), "model": opts["model"]}
+        if s.gen is not None and (gen != s.gen or identity != s.identity):
+            memory = "kept" if identity == s.identity else "cleared"
+            if memory == "cleared":
+                s.claude_session_id = None
+            s.emit("provider_changed", {"from": s.provider, "to": info, "memory": memory,
+                                        "at_ms": _now_ms()})
+        s.gen, s.identity, s.provider = gen, identity, info
+        s.kind = str(_field(rp, "kind", LOGIN_KIND))
+        s.host = _field(rp, "host")
+        s.cost_basis = _field(rp, "cost_basis") or COST_LIST
 
     @staticmethod
     def _compose_prompt(text: str, context: dict | None) -> str:
@@ -668,10 +1290,14 @@ class ChatService:
                       heartbeat_s: float | None) -> AsyncIterator[tuple[int, str, dict] | None]:
         cursor = last_event_id if isinstance(last_event_id, int) and last_event_id > 0 else 0
         oldest = s.log[0][0] if s.log else s.seq + 1
-        yield (0, "session", {
-            "session_id": s.sid, "model": self.model, "available": self.status()["available"],
+        st = self.status()
+        provider = st.get("provider") or LOGIN_PROVIDER
+        yield (0, "session", self._redactor.value({
+            "session_id": s.sid, "model": st.get("model", self.model),
+            "available": st["available"],
+            "provider": {"id": provider.get("id"), "label": provider.get("label")},
             "last_seq": s.seq, "history_truncated": cursor < oldest - 1,
-        })
+        }))
         while True:
             waiter = s.changed  # grabbed BEFORE the scan: an emit during a yield wakes us
             for seq, name, data in list(s.log):
@@ -705,6 +1331,7 @@ class ChatService:
     # ---------------------------------------------------------------- actor --
     async def _actor(self, s: _Session) -> None:
         client = None
+        client_key: tuple | None = None  # the provider the connected CLI was built from
         try:
             while True:
                 if client is not None and self.idle_disconnect_s > 0:
@@ -722,14 +1349,29 @@ class ChatService:
                     item = await s.inbox.get()
                 if item is _CLOSE:
                     return
-                turn_id, prompt = item
+                turn_id, prompt, rp = item
                 try:
                     if s.interrupt_evt.is_set():
                         if s.turn is not None:
                             s.turn.stop = "interrupted"
                         continue
+                    if client is not None and client_key != _conn_key(rp):
+                        # The settings changed since this CLI started: the
+                        # running turn finished on the old provider; this one
+                        # gets a CLI built from the new one (spec §8).
+                        await self._disconnect(client)
+                        client = None
+                    opts = provider_options(rp, model_override=self._model_override)
+                    if not _ready(rp) or not opts.get("model"):
+                        self._fail_config(s, rp)  # never spawn a CLI without a provider
+                        continue
                     if client is None:
-                        client = await self._connect(s)
+                        refusal = await self._preflight(rp)
+                        if refusal:
+                            self._fail_preflight(s, rp, refusal)  # no CLI is spawned
+                            continue
+                        client = await self._connect(s, rp)
+                        client_key = _conn_key(rp)
                     await self._run_turn(s, client, prompt)
                 except asyncio.CancelledError:
                     if s.turn is not None and s.turn.stop is None:
@@ -742,50 +1384,175 @@ class ChatService:
                         client = None
                 finally:
                     self._finish_turn(s, turn_id)
+                if s.needs_scrub:
+                    # A key showed up in this turn's events: the CLI wrote it
+                    # into its transcript too. Stop the CLI, scrub, resume
+                    # from the clean transcript on the next turn (spec §9.6).
+                    if client is not None:
+                        await self._disconnect(client)
+                        client = None
+                    await self._scrub(s)
         finally:
             for approval_id in list(s.pending):
                 self._resolve(s, approval_id, "cancelled")
             if client is not None:
                 await self._disconnect(client)
+            if s.needs_scrub:
+                await self._scrub(s)
 
-    async def _connect(self, s: _Session) -> Any:
+    async def _preflight(self, rp: Any) -> dict | None:
+        """The settings' last check before a CLI is spawned for ``rp``
+        (``LlmSettings.preflight``: an endpoint that now redirects, where the
+        CLI would re-send the key to the new host). A refusal dict, or None.
+        A preflight that raises refuses too (fail closed)."""
+        fn = getattr(self._llm, "preflight", None)
+        if not callable(fn):
+            return None
+        try:
+            out = fn(rp)
+            if inspect.isawaitable(out):
+                out = await out
+        except Exception as exc:  # noqa: BLE001 -- refused, never a crash
+            log.warning("analyst: the provider preflight failed: %s", type(exc).__name__)
+            message, hint = _config_copy("settings_error", str(_field(rp, "label", "")))
+            return {"code": "config", "message": message, "hint": hint}
+        if isinstance(out, Mapping) and out.get("message"):
+            return dict(out)
+        return None
+
+    def _fail_preflight(self, s: _Session, rp: Any, refusal: Mapping) -> None:
+        message = str(refusal["message"])
+        self._emit_error(s, message, refusal.get("hint"), False, key="config",
+                         code=str(refusal.get("code") or "config"), provider=_provider_ref(rp))
+        if s.turn is not None:
+            s.turn.stop = "error"
+            s.turn.error = message
+
+    async def _connect(self, s: _Session, rp: Any = None) -> Any:
         sdk = self._sdk
+        if rp is None:
+            rp = await self._resolve_provider()
         toolbelt = await build_toolbelt(self._server, self._intel,
                                         lambda directive: self._emit_ui(s, directive), sdk)
         s.tool_defaults = dict(getattr(toolbelt, "defaults", None) or {})
         s.stderr_tail.clear()  # a failure below must be judged on THIS process's stderr
-        options = self._options(s, toolbelt)
+        options = self._options(s, toolbelt, rp)  # never logged: its env holds the key
+        s.config_dir = self._config_dir(rp)
         client = sdk.ClaudeSDKClient(options=options)
         await client.connect()
         s.cost_base = 0.0  # a new CLI process starts its cumulative cost at zero
         return client
 
-    def _options(self, s: _Session, toolbelt: Any) -> Any:
+    @staticmethod
+    def _config_dir(rp: Any) -> pathlib.Path:
+        """The CLI config dir a provider's CLI writes its transcripts under:
+        the env's ``CLAUDE_CONFIG_DIR`` (created 0700 for a BYOK provider),
+        else the login's ``~/.claude``."""
+        env = _field(rp, "env")
+        raw = env.get("CLAUDE_CONFIG_DIR") if isinstance(env, Mapping) else None
+        if not raw:
+            raw = os.environ.get("CLAUDE_CONFIG_DIR") or str(pathlib.Path.home() / ".claude")
+        path = pathlib.Path(raw)
+        if _field(rp, "kind", LOGIN_KIND) != LOGIN_KIND:
+            with contextlib.suppress(OSError):
+                path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return path
+
+    def _base_options(self, *, allowed_tools: list, disallowed_tools: list,
+                      mcp_servers: dict, can_use_tool: Callable, max_turns: int,
+                      stderr: Callable[[str], None]) -> dict[str, Any]:
+        """Every option that is the SAME for every provider (spec §0.1, §9.9).
+        The BYOK code never touches these: only ``provider_options`` varies."""
         kw: dict[str, Any] = {
-            "model": self.model,
             "system_prompt": self._prompt_text(),
             "tools": [],
-            "allowed_tools": list(toolbelt.allowed_tools),
-            "disallowed_tools": list(toolbelt.disallowed_tools),
-            "mcp_servers": {SDK_SERVER_NAME: toolbelt.server_config},
+            "allowed_tools": list(allowed_tools),
+            "disallowed_tools": list(disallowed_tools),
+            "mcp_servers": dict(mcp_servers),
             "strict_mcp_config": True,
             "setting_sources": [],
             "verbatim_prompts": True,
             "permission_mode": "default",
-            "can_use_tool": self._can_use_tool_for(s),
+            "can_use_tool": can_use_tool,
             "include_partial_messages": True,
-            "thinking": {"type": "adaptive", "display": "summarized"},
-            "max_turns": MAX_TURNS,
+            "max_turns": max_turns,
             "cwd": str(self._analyst_dir()),
-            "stderr": s.stderr_tail.append,
+            "stderr": stderr,
         }
-        if self.effort:
-            kw["effort"] = self.effort
         if self._cli_path:
             kw["cli_path"] = self._cli_path
+        return kw
+
+    def _options(self, s: _Session, toolbelt: Any, rp: Any = None) -> Any:
+        if rp is None:
+            rp = _LegacyProvider(model=self._model_override or DEFAULT_MODEL, effort=self.effort)
+        kw = self._base_options(
+            allowed_tools=toolbelt.allowed_tools, disallowed_tools=toolbelt.disallowed_tools,
+            mcp_servers={SDK_SERVER_NAME: toolbelt.server_config},
+            can_use_tool=self._can_use_tool_for(s), max_turns=MAX_TURNS,
+            stderr=s.stderr_line)
+        kw.update(provider_options(rp, model_override=self._model_override,
+                                   effort_override=self.effort))
         if s.claude_session_id:
             kw["resume"] = s.claude_session_id
         return self._sdk.ClaudeAgentOptions(**kw)
+
+    def sdk_module(self) -> Any:
+        """The Agent SDK module (or None when it cannot be imported)."""
+        return self._ensure_sdk()
+
+    def check_options(self, rp: Any, *, env_extra: Mapping[str, str] | None = None,
+                      mcp_servers: dict | None = None, allowed_tools: Iterable[str] = (),
+                      max_turns: int = 1, stderr: Callable[[str], None] | None = None) -> Any:
+        """``ClaudeAgentOptions`` for the settings' full check (spec §6.2).
+
+        The analyst's own option builder (``_base_options`` +
+        ``provider_options``) with the check's changes only: ``env_extra``
+        merged over the provider's env (``CLAUDE_CODE_MAX_RETRIES=0``, the
+        check's config dir, ...), the caller's dummy tool server instead of
+        the toolbelt, ``max_turns=1`` and a ``can_use_tool`` that refuses
+        everything (the dummy tool is pre-allowed). The real ``thinking``.
+        """
+        sdk = self._ensure_sdk()
+        if sdk is None:
+            raise Unavailable("sdk_missing", SDK_MISSING_HINT)
+        env = _field(rp, "env")
+        if isinstance(env, Mapping):
+            for name in SECRET_ENV_VARS:
+                self._redactor.add(env.get(name))
+
+        async def refuse(tool_name: str, input_data: dict, ctx: Any) -> Any:
+            # No interrupt: the turn then ends normally at max_turns=1.
+            return sdk.PermissionResultDeny(message="Not available in a connection check.",
+                                            interrupt=False)
+
+        tail: deque = deque(maxlen=30)
+        kw = self._base_options(
+            allowed_tools=list(allowed_tools), disallowed_tools=[],
+            mcp_servers=mcp_servers or {}, can_use_tool=refuse, max_turns=max_turns,
+            stderr=stderr or (lambda line: tail.append(self._redactor.text(line))))
+        kw.update(provider_options(rp, model_override=self._model_override,
+                                   effort_override=self.effort))
+        if env_extra:
+            kw["env"] = {**kw.get("env", {}), **{str(k): str(v) for k, v in env_extra.items()}}
+        return sdk.ClaudeAgentOptions(**kw)
+
+    async def _scrub(self, s: _Session) -> None:
+        """Rewrite the session's CLI transcripts without the keys (spec §9.6)."""
+        s.needs_scrub = False
+        if s.config_dir is None:
+            return
+        ids = set(s.seen_session_ids)
+        if s.claude_session_id:
+            ids.add(s.claude_session_id)
+        try:
+            files = await asyncio.to_thread(scrub_transcripts, s.config_dir, session_ids=ids,
+                                            redact=self._redactor.text)
+        except Exception as exc:  # noqa: BLE001 -- best effort, never fatal
+            log.warning("analyst transcript scrub failed: %s", type(exc).__name__)
+            return
+        if files:
+            log.info("analyst: removed a provider key from %d transcript file(s)", len(files))
 
     @staticmethod
     async def _disconnect(client: Any) -> None:
@@ -810,6 +1577,8 @@ class ChatService:
                     log.exception("analyst: could not map %s", type(msg).__name__)
         finally:
             watcher.cancel()
+        if turn is not None:
+            self._flush_pending_error(s, turn, None)  # no ResultMessage came: no status
         if turn is not None and not turn.got_result and turn.stop is None:
             raise RuntimeError("the analyst process ended the turn without a result")
 
@@ -822,32 +1591,90 @@ class ChatService:
             log.warning("analyst interrupt failed: %s", exc)
 
     def _emit_error(self, s: _Session, message: str, hint: str | None, retryable: bool,
-                    key: str | None = None) -> None:
+                    key: str | None = None, *, code: str = "unknown",
+                    provider: dict | None = None) -> None:
+        """One ``error`` event: ``{message, hint?, retryable, code, provider}``
+        (spec §5). ``provider`` defaults to the session's current one."""
         turn = s.turn
         if turn is not None and key is not None:
             if key in turn.errors_emitted:
                 return
             turn.errors_emitted.add(key)
+        ref = provider or ({"id": s.provider["id"], "label": s.provider["label"]}
+                           if s.provider else dict(LOGIN_PROVIDER))
         s.emit("error", _drop_none({"message": message, "hint": hint,
-                                    "retryable": bool(retryable)}))
+                                    "retryable": bool(retryable),
+                                    "code": code if code in ERROR_CODES else "unknown",
+                                    "provider": ref}))
+
+    def _provider_copy(self, s: _Session, code: str, status: int | None,
+                       detail: str) -> tuple[str, str | None, bool]:
+        """Copy for a provider other than the Claude login (spec §5); an auth
+        failure also marks the provider for ``status.reason=provider_auth``."""
+        if code == "auth":
+            self._auth_failure = s.gen  # cleared by the next settings change
+        label = (s.provider or LOGIN_PROVIDER)["label"]
+        model = (s.provider or {}).get("model")
+        return provider_error_copy(code, label=label, host=s.host, model=model,
+                                   status=status, detail=detail)
+
+    def _flush_pending_error(self, s: _Session, turn: _Turn, status: Any) -> None:
+        """Emit the AssistantMessage error held for the ResultMessage's HTTP
+        status (``api_error_status`` decides the code first, spec §5)."""
+        pending, turn.pending_error = turn.pending_error, None
+        if not pending:
+            return
+        error, text = pending["error"], pending["text"]
+        status = status if isinstance(status, int) and not isinstance(status, bool) else None
+        code = classify_provider_error(status, error, text)
+        if s.kind == LOGIN_KIND:
+            if code == "auth":
+                message, hint, retryable = _ASSISTANT_ERRORS["authentication_failed"]
+            else:
+                message, hint, retryable = _ASSISTANT_ERRORS.get(error,
+                                                                 _ASSISTANT_ERRORS["unknown"])
+        else:
+            message, hint, retryable = self._provider_copy(s, code, status, text[:300])
+        self._emit_error(s, message, hint, retryable, key=f"assistant:{error}", code=code)
+
+    def _fail_config(self, s: _Session, rp: Any) -> None:
+        """A turn refused before any CLI starts: the provider isn't ready."""
+        reason = str(_field(rp, "reason", None) or "provider_not_configured")
+        label = str(_field(rp, "label", None) or "the model provider")
+        message, hint = _config_copy(reason, label)
+        self._emit_error(s, message, hint, False, key="config", code="config",
+                         provider=_provider_ref(rp))
+        if s.turn is not None:
+            s.turn.stop = "error"
+            s.turn.error = reason
 
     def _fail_turn(self, s: _Session, exc: BaseException) -> None:
+        if s.turn is not None:
+            self._flush_streams(s, s.turn)
+            self._flush_pending_error(s, s.turn, None)
         sdk = self._sdk
         not_found = getattr(sdk, "CLINotFoundError", None)
         tail = " ".join(s.stderr_tail)
+        what = s.redact(f"{type(exc).__name__}: {exc}")
+        code = "unknown"
         if isinstance(not_found, type) and isinstance(exc, not_found):
             message, hint, retryable = "The Claude CLI was not found.", CLI_MISSING_HINT, False
         elif s.claude_session_id and _NO_CONVERSATION_RX.search(f"{exc} {tail}"):
             s.claude_session_id = None  # never resume it again: start fresh next turn
             message, hint, retryable = RESUME_LOST_MESSAGE, None, True
+        elif s.kind != LOGIN_KIND:
+            code = classify_provider_error(None, None, f"{exc} {tail}")
+            message, hint, retryable = self._provider_copy(s, code, None, what[:300])
+            message = message[:400]
         elif _AUTH_RX.search(f"{exc} {tail}"):
             message = "The analyst could not sign in to Claude."
-            hint, retryable = SIGN_IN_HINT, False
+            hint, retryable, code = SIGN_IN_HINT, False, "auth"
         else:
-            message = f"The analyst failed: {type(exc).__name__}: {exc}"[:400]
+            message = f"The analyst failed: {what}"[:400]
             hint, retryable = None, True
-        log.warning("analyst turn failed: %s: %s", type(exc).__name__, exc)
-        self._emit_error(s, message, hint, retryable, key="fail")
+            code = classify_provider_error(None, None, f"{exc} {tail}")
+        log.warning("analyst turn failed: %s", what)
+        self._emit_error(s, message, hint, retryable, key="fail", code=code)
         if s.turn is not None:
             s.turn.stop = "error"
             s.turn.error = message
@@ -857,6 +1684,7 @@ class ChatService:
         if turn is None or turn.turn_id != turn_id or turn.ended:
             return
         turn.ended = True
+        self._flush_streams(s, turn)
         stop = turn.stop or ("end" if turn.got_result else "error")
         data: dict = {"turn_id": turn_id, "stop": stop}
         if stop == "error":
@@ -896,12 +1724,24 @@ class ChatService:
         elif self._is(msg, "SystemMessage"):
             self._on_system(s, turn, msg)
 
+    #: stream kind -> the event its text goes out as.
+    _STREAM_EVENTS = (("text", "text_delta"), ("thinking", "thinking"))
+
+    def _flush_streams(self, s: _Session, turn: _Turn) -> None:
+        """Send the streamed text ``_Session.stream`` still holds (a block
+        ended, another event follows, or the turn ends)."""
+        for kind, event in self._STREAM_EVENTS:
+            rest = s.flush_stream(kind)
+            if rest:
+                s.emit(event, {"turn_id": turn.turn_id, "text": rest})
+
     def _on_stream_event(self, s: _Session, turn: _Turn, msg: Any) -> None:
         if getattr(msg, "parent_tool_use_id", None):
             return
         ev = getattr(msg, "event", None) or {}
         kind = ev.get("type")
         if kind == "content_block_start":
+            self._flush_streams(s, turn)
             block = ev.get("content_block") or {}
             if block.get("type") == "text":
                 turn.text_chars = 0
@@ -910,22 +1750,35 @@ class ChatService:
             elif block.get("type") == "thinking":
                 turn.thinking_chars = 0
         elif kind == "content_block_delta":
+            # Through the session's stream redactor: a key split over short
+            # deltas is caught across them (spec §9.5; secrets review).
             delta = ev.get("delta") or {}
             if delta.get("type") == "text_delta" and delta.get("text"):
                 turn.text_chars += len(delta["text"])
                 turn.any_text = True
-                s.emit("text_delta", {"turn_id": turn.turn_id, "text": delta["text"]})
+                out = s.stream("text", delta["text"])
+                if out:
+                    s.emit("text_delta", {"turn_id": turn.turn_id, "text": out})
             elif delta.get("type") == "thinking_delta" and delta.get("thinking"):
                 turn.thinking_chars += len(delta["thinking"])
-                s.emit("thinking", {"turn_id": turn.turn_id, "text": delta["thinking"]})
+                out = s.stream("thinking", delta["thinking"])
+                if out:
+                    s.emit("thinking", {"turn_id": turn.turn_id, "text": out})
+        elif kind in ("content_block_stop", "message_stop"):
+            self._flush_streams(s, turn)
 
     def _on_assistant(self, s: _Session, turn: _Turn, msg: Any) -> None:
         if getattr(msg, "parent_tool_use_id", None):
             return
+        self._flush_streams(s, turn)
         error = getattr(msg, "error", None)
         if error:
-            message, hint, retryable = _ASSISTANT_ERRORS.get(error, _ASSISTANT_ERRORS["unknown"])
-            self._emit_error(s, message, hint, retryable, key=f"assistant:{error}")
+            # Held until the ResultMessage: its api_error_status decides the
+            # code (a gateway 401 arrives as "invalid_request"; spec §5).
+            text = " ".join(str(getattr(b, "text", "") or "")
+                            for b in getattr(msg, "content", None) or []).strip()
+            if turn.pending_error is None:
+                turn.pending_error = {"error": str(error), "text": s.redact(text)}
             turn.stop = "error"
             turn.error = str(error)
             return  # the blocks are the CLI's own error text; the error event replaces them
@@ -936,10 +1789,14 @@ class ChatService:
                     text = f"\n\n{block.text}" if turn.any_text else block.text
                     s.emit("text_delta", {"turn_id": turn.turn_id, "text": text})
                     turn.any_text = True
+                else:
+                    s.redact(block.text)  # a key in it flags the transcript scrub
                 turn.text_chars = 0
             elif self._is(block, "ThinkingBlock"):
                 if turn.thinking_chars == 0 and block.thinking:
                     s.emit("thinking", {"turn_id": turn.turn_id, "text": block.thinking})
+                else:
+                    s.redact(block.thinking)
                 turn.thinking_chars = 0
             elif self._is(block, "ToolUseBlock"):
                 self._on_tool_use(s, turn, block)
@@ -1025,6 +1882,8 @@ class ChatService:
         # only after init, so a CLI that dies in between left an id that every
         # later turn tried (and failed) to resume. ResultMessage carries it
         # once the transcript exists (see _on_result).
+        if isinstance(data.get("session_id"), str):
+            s.seen_session_ids.add(data["session_id"])  # the scrub's target, never resumed
         servers = data.get("mcp_servers")
         status = None
         if isinstance(servers, list):
@@ -1041,9 +1900,13 @@ class ChatService:
             s.interrupt_evt.set()
 
     def _on_result(self, s: _Session, turn: _Turn, msg: Any) -> None:
+        self._flush_streams(s, turn)
         turn.got_result = True
+        status = getattr(msg, "api_error_status", None)
+        self._flush_pending_error(s, turn, status)
         if isinstance(getattr(msg, "session_id", None), str):
             s.claude_session_id = msg.session_id
+            s.seen_session_ids.add(msg.session_id)
         usage = getattr(msg, "usage", None) or {}
         input_tokens = None
         if isinstance(usage, dict):
@@ -1058,10 +1921,14 @@ class ChatService:
             s.cost_base = float(total)
             s.cost_total += cost
             cost = round(cost, 6)
+        # The CLI prices a model it doesn't know from its own table: for any
+        # provider but Claude's the dollars would be invented (spec §8).
+        priced = s.cost_basis != COST_UNRELIABLE
         s.emit("usage", _drop_none({
             "turn_id": turn.turn_id,
-            "cost_usd": cost,
-            "session_cost_usd": round(s.cost_total, 6) if cost is not None else None,
+            "cost_usd": cost if priced else None,
+            "session_cost_usd": round(s.cost_total, 6) if priced and cost is not None else None,
+            "cost_basis": s.cost_basis,
             "input_tokens": input_tokens,
             "output_tokens": usage.get("output_tokens") if isinstance(usage, dict) else None,
             "rate_limit": s.rate_limit,
@@ -1077,21 +1944,28 @@ class ChatService:
         elif getattr(msg, "is_error", False) or subtype != "success":
             errors = getattr(msg, "errors", None) or []
             detail = "; ".join(str(e) for e in errors) or getattr(msg, "result", None) or subtype
-            detail = str(detail)[:400]
-            status = getattr(msg, "api_error_status", None)
+            detail = s.redact(str(detail))[:400]  # redacted BEFORE the cut
+            if not isinstance(status, int) or isinstance(status, bool):
+                status = None
+            code = classify_provider_error(status, None, detail)
             if _NO_CONVERSATION_RX.search(detail):
                 s.claude_session_id = None  # the resumed transcript is gone
                 self._emit_error(s, RESUME_LOST_MESSAGE, None, True, key="fail")
+            elif s.kind != LOGIN_KIND:
+                message, hint, retryable = self._provider_copy(s, code, status, detail[:300])
+                self._emit_error(s, message, hint, retryable, key="result", code=code)
             elif _AUTH_RX.search(detail) or status == 401:
                 self._emit_error(s, "The analyst could not sign in to Claude.", SIGN_IN_HINT,
-                                 False, key="assistant:authentication_failed")
+                                 False, key="assistant:authentication_failed", code="auth")
             else:
                 self._emit_error(s, f"The analyst turn failed: {detail}", None,
-                                 status in (429, 500, 502, 503, 529), key="result")
+                                 status in (429, 500, 502, 503, 529), key="result", code=code)
             turn.stop = "error"
             turn.error = detail
         else:
             turn.stop = "end"
+            if self._auth_failure is not None and self._auth_failure == s.gen:
+                self._auth_failure = None  # the provider took the key after all
 
     # ------------------------------------------------------------- approvals --
     def _can_use_tool_for(self, s: _Session):
@@ -1386,5 +2260,6 @@ def chat_router(service: ChatService, auth: Any, sse_auth: Any):
 
 __all__ = [
     "DEFAULT_MODEL", "Busy", "ChatError", "ChatService", "NotAllowed", "NotFound",
-    "Unavailable", "chat_router",
+    "Unavailable", "chat_router", "classify_provider_error", "provider_error_copy",
+    "provider_options", "scrub_transcripts",
 ]

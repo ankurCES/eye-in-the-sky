@@ -11,11 +11,14 @@ ports 52200-52299) through the real toolbelt with the fake client.
 """
 import asyncio
 import contextlib
+import dataclasses
 import itertools
 import json
 import os
+import stat
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import airsim
@@ -1053,8 +1056,11 @@ def test_auth_failure_emits_a_sign_in_hint_once(tmp_path):
         end = await rec.wait_name("turn_end")
         assert end["stop"] == "error"
         errors = rec.of("error")
+        # BYOK spec §5: every error names its code and provider.
         assert errors == [{"message": "The analyst could not sign in to Claude.",
-                           "hint": SIGN_IN_HINT, "retryable": False}]
+                           "hint": SIGN_IN_HINT, "retryable": False, "code": "auth",
+                           "provider": {"id": "anthropic_login",
+                                        "label": "Claude login (this Mac)"}}]
         assert rec.of("text_delta") == []  # the CLI's error text is replaced, not echoed
         await svc.shutdown()
     asyncio.run(main())
@@ -1937,3 +1943,859 @@ def test_shutdown_closes_sessions_in_parallel(tmp_path):
     took = asyncio.run(main())
     assert all(c.disconnected for c in sdk.clients)
     assert took < 1.4, f"shutdown took {took:.2f}s: the three 0.6 s closes ran one after another"
+
+
+# ======================================================================
+# BYOK model providers (spec §4.4, §5, §8, §9): a fake llm_settings
+# ======================================================================
+# Fake keys only (spec §11): nothing here reaches a network or a keychain.
+
+KEY_A, KEY_B = "test-key-123", "test-key-456"
+BLANK = {"ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": "", "CLAUDE_CODE_USE_BEDROCK": "",
+         "CLAUDE_CODE_USE_VERTEX": "", "CLAUDE_CODE_USE_FOUNDRY": "",
+         "CLAUDE_CODE_USE_MANTLE": "", "CLAUDE_CODE_USE_ANTHROPIC_AWS": ""}
+ADAPTIVE = {"type": "adaptive", "display": "summarized"}
+LOGIN_REF = {"id": "anthropic_login", "label": "Claude login (this Mac)"}
+
+
+@dataclass(frozen=True)
+class FakeRP:
+    """Shaped like llm_settings.ResolvedProvider (spec §2)."""
+    id: str = "anthropic_login"
+    label: str = "Claude login (this Mac)"
+    kind: str = "anthropic_login"
+    model_family: str = "claude"
+    host: str | None = None
+    model: str = "claude-opus-5"
+    thinking: dict = field(default_factory=lambda: dict(ADAPTIVE))
+    effort: str | None = None
+    env: dict = field(default_factory=lambda: dict(BLANK), repr=False)
+    cost_basis: str = "anthropic_list"
+    identity: str = "ident-login"
+    generation: int = 1
+    ready: bool = True
+    reason: str | None = None
+
+
+def _harden(tmp_path) -> dict:
+    return {"CLAUDE_CONFIG_DIR": str(tmp_path / "store" / "analyst" / "claude-home"),
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_TELEMETRY": "1",
+            "CLAUDE_CODE_MAX_RETRIES": "2"}
+
+
+def provider(name: str, tmp_path, key: str = KEY_A, **kw) -> FakeRP:
+    """One ResolvedProvider per catalog kind, env shaped per spec §4.3."""
+    h = _harden(tmp_path)
+    table = {
+        "login": FakeRP(),
+        "anthropic_api": FakeRP(id="anthropic_api", label="Anthropic API key",
+                                kind="anthropic_key", identity="ident-api",
+                                env={**BLANK, **h, "ANTHROPIC_API_KEY": key}),
+        "openrouter": FakeRP(
+            id="openrouter", label="OpenRouter", kind="anthropic_compatible",
+            model_family="mixed", host="openrouter.ai", model="anthropic/claude-opus-5.5",
+            cost_basis="unreliable", identity="ident-openrouter",
+            env={**BLANK, **h, "ANTHROPIC_BASE_URL": "https://openrouter.ai/api",
+                 "ANTHROPIC_AUTH_TOKEN": key, "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+                 "ANTHROPIC_DEFAULT_OPUS_MODEL": "anthropic/claude-opus-5.5"}),
+        "custom": FakeRP(
+            id="custom", label="Custom Anthropic-compatible endpoint", kind="custom",
+            model_family="non_claude", host="127.0.0.1", model="stub-model",
+            thinking={"type": "disabled"}, cost_basis="unreliable", identity="ident-custom",
+            env={**BLANK, **h, "ANTHROPIC_BASE_URL": "http://127.0.0.1:53999",
+                 "ANTHROPIC_AUTH_TOKEN": key, "CLAUDE_CODE_DISABLE_THINKING": "1"}),
+        "bedrock": FakeRP(id="bedrock", label="Amazon Bedrock", kind="bedrock",
+                          host="us-east-1", model="us.anthropic.claude-opus-5-5",
+                          identity="ident-bedrock",
+                          env={**BLANK, **h, "CLAUDE_CODE_USE_BEDROCK": "1",
+                               "AWS_REGION": "us-east-1", "AWS_BEARER_TOKEN_BEDROCK": key}),
+        "vertex": FakeRP(id="vertex", label="Google Cloud Agent Platform (Vertex AI)",
+                         kind="vertex", host="global", model="claude-opus-5-5",
+                         identity="ident-vertex",
+                         env={**BLANK, **h, "CLAUDE_CODE_USE_VERTEX": "1",
+                              "ANTHROPIC_VERTEX_PROJECT_ID": "proj-12345"}),
+        "foundry": FakeRP(id="foundry", label="Microsoft Foundry", kind="foundry",
+                          host="res-1", model="claude-opus-5-5", identity="ident-foundry",
+                          env={**BLANK, **h, "CLAUDE_CODE_USE_FOUNDRY": "1",
+                               "ANTHROPIC_FOUNDRY_RESOURCE": "res-1",
+                               "ANTHROPIC_FOUNDRY_API_KEY": key}),
+    }
+    rp = table[name]
+    return dataclasses.replace(rp, **kw) if kw else rp
+
+
+PROVIDER_NAMES = ("login", "anthropic_api", "openrouter", "custom", "bedrock", "vertex",
+                  "foundry")
+
+
+class FakeLlm:
+    """Stands in for llm_settings.LlmSettings: ``aresolve()``/``resolve()``, the
+    keychain-free ``status()`` (same shape as the real one) and
+    ``generation``. Tests swap ``rp`` to simulate a settings change."""
+
+    def __init__(self, rp: FakeRP, *, key_source: str = "keychain", rev: int = 3):
+        self.rp = rp
+        self.key_source = key_source
+        self.rev = rev
+        self.resolves = 0
+
+    @property
+    def generation(self):
+        return self.rp.generation
+
+    def resolve(self):
+        self.resolves += 1
+        return self.rp
+
+    async def aresolve(self):
+        return self.resolve()
+
+    def status(self):
+        rp = self.rp
+        out = {"provider": {"id": rp.id, "label": rp.label, "kind": rp.kind,
+                            "model_family": rp.model_family, "host": rp.host,
+                            "key_source": "login" if rp.kind == "anthropic_login"
+                            else self.key_source, "configured": rp.ready},
+               "cost_basis": rp.cost_basis, "settings_rev": self.rev, "ready": rp.ready,
+               "model": rp.model}
+        if rp.reason:
+            out["reason"] = rp.reason
+        return out
+
+
+def ok_turn_factory(session_id="claude-sess-1", text="OK."):
+    async def turn(client, prompt):
+        yield init(session_id=session_id)
+        for m in streamed_text(text):
+            yield m
+        yield ResultMessage(session_id=session_id, total_cost_usd=0.02,
+                            usage={"input_tokens": 3, "output_tokens": 2})
+    return turn
+
+
+def run_one_turn(tmp_path, llm=None, turn=None, **kw):
+    """One turn on a fresh service; returns (sdk, events, svc)."""
+    sdk = FakeSdk(turn or ok_turn_factory())
+    svc = make_service(tmp_path, sdk, llm=llm, **kw)
+
+    async def main():
+        _, rec, tid = await start_turn(svc)
+        await rec.wait(lambda e: e[1] == "turn_end" and e[2]["turn_id"] == tid)
+        await svc.shutdown()
+        rec.stop()
+        return list(rec.events)
+    return sdk, asyncio.run(main()), svc
+
+
+#: The option set ``_options()`` built before the BYOK spec (Claude login, no
+#: effort, no cli_path, no resume). Callables are compared by kind.
+def _pre_byok_options(tmp_path) -> dict:
+    return {"model": DEFAULT_MODEL, "tools": [], "strict_mcp_config": True,
+            "setting_sources": [], "verbatim_prompts": True, "permission_mode": "default",
+            "include_partial_messages": True, "thinking": dict(ADAPTIVE), "max_turns": 40,
+            "cwd": str(tmp_path / "store" / "analyst")}
+
+
+def _comparable(kw: dict) -> dict:
+    out = {}
+    for k, v in kw.items():
+        if callable(v):
+            out[k] = "<callable>"
+        elif k == "mcp_servers":
+            out[k] = sorted(v)
+        elif k == "system_prompt":
+            out[k] = len(v)
+        else:
+            out[k] = v
+    return out
+
+
+def test_the_login_provider_keeps_the_pre_byok_options_and_adds_only_env(tmp_path, monkeypatch):
+    """Spec §4.4: the default path is today's option set; the only addition is
+    ``env`` (credentials and switches blanked, spec §4.1)."""
+    monkeypatch.delenv("GODSEYE_CHAT_MODEL", raising=False)
+    monkeypatch.delenv("GODSEYE_CHAT_EFFORT", raising=False)
+    legacy_sdk, _, _ = run_one_turn(tmp_path / "a")
+    login_sdk, _, _ = run_one_turn(tmp_path / "b", llm=FakeLlm(provider("login", tmp_path)))
+    legacy = legacy_sdk.clients[0].options.kw
+    login = login_sdk.clients[0].options.kw
+    for key, value in _pre_byok_options(tmp_path / "a").items():
+        assert legacy[key] == value, key
+    assert set(legacy) == {*_pre_byok_options(tmp_path), "system_prompt", "allowed_tools",
+                           "disallowed_tools", "mcp_servers", "can_use_tool", "stderr"}
+    assert "env" not in legacy
+    assert login["env"] == BLANK                       # no base URL, no config dir, no pins
+    assert {k: v for k, v in _comparable(login).items() if k not in ("env", "cwd")} == {
+        k: v for k, v in _comparable(legacy).items() if k != "cwd"}
+    assert login["cwd"] == str(tmp_path / "b" / "store" / "analyst")
+
+
+@pytest.mark.parametrize("name", PROVIDER_NAMES)
+def test_options_differ_across_providers_only_in_model_thinking_effort_and_env(
+        tmp_path, monkeypatch, name):
+    """Spec §9.9: the invariant, over every catalog kind."""
+    monkeypatch.delenv("GODSEYE_CHAT_MODEL", raising=False)
+    monkeypatch.delenv("GODSEYE_CHAT_EFFORT", raising=False)
+    base_sdk, _, _ = run_one_turn(tmp_path, llm=FakeLlm(provider("login", tmp_path)),
+                                  effort="high")
+    rp = provider(name, tmp_path)
+    sdk, _, _ = run_one_turn(tmp_path, llm=FakeLlm(rp), effort="high")
+    base = _comparable(base_sdk.clients[0].options.kw)
+    kw = sdk.clients[0].options.kw
+    varying = {"model", "thinking", "effort", "env"}
+    assert {k: v for k, v in _comparable(kw).items() if k not in varying} == {
+        k: v for k, v in base.items() if k not in varying}
+    for fixed in ("permission_mode", "allowed_tools", "tools", "setting_sources",
+                  "verbatim_prompts", "strict_mcp_config", "disallowed_tools"):
+        assert kw[fixed] == base_sdk.clients[0].options.kw[fixed], fixed
+    assert callable(kw["can_use_tool"])
+    assert kw["model"] == rp.model and kw["thinking"] == rp.thinking
+    assert kw["env"] == rp.env                        # the key travels only here
+    assert ("effort" in kw) == (rp.kind in chat_mod.EFFORT_KINDS)
+    for key, value in kw.items():
+        if key != "env" and isinstance(value, str):
+            assert KEY_A not in value, key            # never argv-bound options
+
+
+def test_provider_options_precedence():
+    """Spec §3.4: model flag/env win only for the first-party Claude kinds;
+    effort only where the kind allows it; thinking and env pass through."""
+    po = chat_mod.provider_options
+    login = FakeRP(model="")
+    assert po(login)["model"] == DEFAULT_MODEL
+    assert po(login, model_override="claude-x")["model"] == "claude-x"
+    assert po(FakeRP(kind="anthropic_key", model="m"), model_override="o")["model"] == "o"
+    compat = FakeRP(kind="anthropic_compatible", model="MiniMax-M3[1m]")
+    assert po(compat, model_override="claude-x")["model"] == "MiniMax-M3[1m]"
+    assert "effort" not in po(compat, effort_override="high")
+    assert po(FakeRP(kind="bedrock"), effort_override="high")["effort"] == "high"
+    assert po(FakeRP(effort="low"))["effort"] == "low"
+    assert "effort" not in po(FakeRP(effort="turbo"))
+    off = po(FakeRP(kind="custom", thinking={"type": "disabled"}))
+    assert off["thinking"] == {"type": "disabled"}
+    assert "env" not in po(chat_mod._LegacyProvider(model="m", effort=None))
+    env = po(FakeRP(env={"A": "1"}))["env"]
+    assert env == {"A": "1"}
+
+
+def test_check_options_reuse_the_analyst_builder_with_the_checks_changes(tmp_path):
+    """Spec §6.2: the full check gets the same builder: only env extras, the
+    dummy tool server, max_turns=1 and a refuse-all permission callback."""
+    sdk = FakeSdk()
+    svc = make_service(tmp_path, sdk)
+    rp = provider("custom", tmp_path)
+    opts = svc.check_options(rp, env_extra={"CLAUDE_CODE_MAX_RETRIES": "0"},
+                             mcp_servers={"check": {"type": "sdk"}},
+                             allowed_tools=["mcp__check__check_echo"])
+    kw = opts.kw
+    assert kw["env"] == {**rp.env, "CLAUDE_CODE_MAX_RETRIES": "0"}
+    assert kw["max_turns"] == 1 and kw["thinking"] == {"type": "disabled"}
+    assert kw["model"] == "stub-model" and kw["tools"] == []
+    assert kw["permission_mode"] == "default" and kw["setting_sources"] == []
+    assert list(kw["mcp_servers"]) == ["check"]
+    assert kw["allowed_tools"] == ["mcp__check__check_echo"]
+    denied = asyncio.run(kw["can_use_tool"]("mcp__godseye__uav_takeoff", {}, None))
+    assert isinstance(denied, PermissionResultDeny)
+    assert rp.env == provider("custom", tmp_path).env   # the provider's env is not mutated
+
+
+def _ends(rec, tid):
+    return rec.wait(lambda e: e[1] == "turn_end" and e[2]["turn_id"] == tid)
+
+
+def test_an_identity_change_starts_fresh_and_says_so_before_turn_start(tmp_path):
+    """Spec §8: a new provider identity disconnects, drops the resume id and
+    emits provider_changed{memory:"cleared"} just before the next turn_start."""
+    llm = FakeLlm(provider("login", tmp_path))
+    sdk = FakeSdk(ok_turn_factory("sess-a"), ok_turn_factory("sess-b"))
+    svc = make_service(tmp_path, sdk, llm=llm)
+
+    async def main():
+        sid, rec, t1 = await start_turn(svc)
+        await _ends(rec, t1)
+        llm.rp = provider("openrouter", tmp_path, generation=2)
+        t2 = await svc.post_message(sid, "again")
+        await _ends(rec, t2)
+        await svc.shutdown()
+        rec.stop()
+        return rec
+    rec = asyncio.run(main())
+    names = rec.names()
+    i = names.index("provider_changed")
+    assert names[i + 1] == "turn_start" and rec.events[i + 1][2]["text"] == "again"
+    changed = rec.of("provider_changed")[0]
+    assert changed["memory"] == "cleared" and isinstance(changed["at_ms"], int)
+    assert changed["from"] == {**LOGIN_REF, "model": DEFAULT_MODEL}
+    assert changed["to"] == {"id": "openrouter", "label": "OpenRouter",
+                             "model": "anthropic/claude-opus-5.5"}
+    assert len(sdk.clients) == 2 and sdk.clients[0].disconnected
+    second = sdk.clients[1].options.kw
+    assert "resume" not in second                      # no resume across providers
+    assert second["env"]["ANTHROPIC_AUTH_TOKEN"] == KEY_A
+    assert second["model"] == "anthropic/claude-opus-5.5"
+
+
+def test_a_model_only_change_keeps_the_memory_and_resumes(tmp_path):
+    llm = FakeLlm(provider("openrouter", tmp_path))
+    sdk = FakeSdk(ok_turn_factory("sess-a"), ok_turn_factory("sess-a"))
+    svc = make_service(tmp_path, sdk, llm=llm)
+
+    async def main():
+        sid, rec, t1 = await start_turn(svc)
+        await _ends(rec, t1)
+        llm.rp = provider("openrouter", tmp_path, generation=2, model="minimax/minimax-m3")
+        t2 = await svc.post_message(sid, "again")
+        await _ends(rec, t2)
+        await svc.shutdown()
+        return rec
+    rec = asyncio.run(main())
+    changed = rec.of("provider_changed")
+    assert [c["memory"] for c in changed] == ["kept"]
+    assert changed[0]["to"]["model"] == "minimax/minimax-m3"
+    assert sdk.clients[0].disconnected
+    assert sdk.clients[1].options.kw["resume"] == "sess-a"
+    assert sdk.clients[1].options.kw["model"] == "minimax/minimax-m3"
+
+
+def test_an_unchanged_generation_reuses_the_cli_and_emits_nothing(tmp_path):
+    llm = FakeLlm(provider("openrouter", tmp_path))
+    sdk = FakeSdk(ok_turn_factory(), ok_turn_factory())
+    svc = make_service(tmp_path, sdk, llm=llm)
+
+    async def main():
+        sid, rec, t1 = await start_turn(svc)
+        await _ends(rec, t1)
+        t2 = await svc.post_message(sid, "again")
+        await _ends(rec, t2)
+        await svc.shutdown()
+        return rec
+    rec = asyncio.run(main())
+    assert "provider_changed" not in rec.names()
+    assert len(sdk.clients) == 1 and llm.resolves == 2
+
+
+def test_a_running_turn_finishes_on_the_old_provider(tmp_path):
+    """Spec §8: a settings change never interrupts the running turn."""
+    gate = {}
+
+    async def slow(client, prompt):
+        yield init(session_id="sess-a")
+        await gate["release"].wait()
+        for m in streamed_text("done"):
+            yield m
+        yield ResultMessage(session_id="sess-a")
+
+    llm = FakeLlm(provider("openrouter", tmp_path))
+    sdk = FakeSdk(slow, ok_turn_factory("sess-b"))
+    svc = make_service(tmp_path, sdk, llm=llm)
+
+    async def main():
+        gate["release"] = asyncio.Event()
+        sid, rec, t1 = await start_turn(svc)
+        await rec.wait_name("turn_start")
+        await asyncio.sleep(0.05)
+        llm.rp = provider("custom", tmp_path, key=KEY_B, generation=5)
+        await asyncio.sleep(0.05)
+        assert not sdk.clients[0].disconnected and sdk.clients[0].interrupts == 0
+        gate["release"].set()
+        end = await _ends(rec, t1)
+        assert end[2]["stop"] == "end"
+        assert "provider_changed" not in rec.names()
+        t2 = await svc.post_message(sid, "next")
+        await _ends(rec, t2)
+        await svc.shutdown()
+        return rec
+    rec = asyncio.run(main())
+    assert sdk.clients[0].interrupts == 0
+    assert sdk.clients[0].options.kw["env"]["ANTHROPIC_AUTH_TOKEN"] == KEY_A
+    assert sdk.clients[1].options.kw["env"]["ANTHROPIC_AUTH_TOKEN"] == KEY_B
+    assert rec.of("provider_changed")[0]["memory"] == "cleared"
+
+
+@pytest.mark.parametrize(("reason", "message"), [
+    ("provider_key_missing", "The analyst has no key for OpenRouter."),
+    ("provider_not_configured", "The analyst isn't set up to use OpenRouter."),
+])
+def test_a_provider_that_is_not_ready_never_spawns_a_cli(tmp_path, reason, message):
+    """Spec §4.4/§5: rp.ready False fails the turn with code config; no connect."""
+    llm = FakeLlm(provider("openrouter", tmp_path, ready=False, reason=reason, env={}))
+    sdk = FakeSdk()
+    svc = make_service(tmp_path, sdk, llm=llm)
+
+    async def main():
+        st = svc.status()
+        assert st["available"] is False and st["reason"] == reason
+        assert st["hint"] == "Open analyst settings."
+        _, rec, tid = await start_turn(svc)
+        end = (await _ends(rec, tid))[2]
+        await svc.shutdown()
+        return rec, end
+    rec, end = asyncio.run(main())
+    assert sdk.clients == []
+    assert end == {"turn_id": end["turn_id"], "stop": "error", "error": reason}
+    err = rec.of("error")[0]
+    assert err["code"] == "config" and err["message"] == message
+    assert err["provider"] == {"id": "openrouter", "label": "OpenRouter"}
+    assert err["retryable"] is False
+    assert "provider_changed" not in rec.names()
+
+
+def test_a_failing_resolve_is_a_settings_error_not_a_crash(tmp_path):
+    class Broken(FakeLlm):
+        def resolve(self):
+            raise RuntimeError("settings file unreadable")
+
+    sdk, events, _svc = run_one_turn(tmp_path, llm=Broken(provider("login", tmp_path)))
+    errors = [d for _, n, d in events if n == "error"]
+    assert errors[0]["code"] == "config"
+    assert errors[0]["message"] == "The analyst's model settings could not be read."
+    assert sdk.clients == []
+
+
+@pytest.mark.parametrize(("status", "error", "text", "code"), [
+    (401, "invalid_request", "", "auth"),              # gateway 401: the status decides
+    (None, "authentication_failed", "", "auth"),
+    (403, None, "", "auth"),
+    (402, None, "", "billing"),
+    (None, "billing_error", "", "billing"),
+    (404, None, "", "model"),
+    (None, "model_not_found", "", "model"),            # outside the SDK's Literal
+    (429, None, "", "rate_limit"),
+    (None, "rate_limit", "", "rate_limit"),
+    (400, None, "Input tag 'adaptive' is invalid", "invalid_request"),
+    (422, None, "", "invalid_request"),
+    (None, "unknown", "API Error: 400 bad thinking", "invalid_request"),
+    (500, None, "", "server"), (502, None, "", "server"), (503, None, "", "server"),
+    (529, "server_error", "", "server"),
+    (None, "server_error", "", "server"),
+    # The CLI reports a refused connection as server_error with no status.
+    (None, "server_error", "Unable to connect: ECONNREFUSED 127.0.0.1:53999", "network"),
+    (None, "server_error", "API Error: 500 upstream timed out", "server"),
+    (None, None, "connect ECONNREFUSED 127.0.0.1:53999", "network"),
+    (None, None, "getaddrinfo ENOTFOUND api.example", "network"),
+    (None, None, "Request timed out", "network"),
+    (None, None, "unable to verify the first certificate", "network"),
+    (None, None, "something odd", "unknown"),
+    (True, None, "", "unknown"),                       # a bool is not a status
+])
+def test_classify_provider_error_covers_every_row_of_the_table(status, error, text, code):
+    assert chat_mod.classify_provider_error(status, error, text) == code
+
+
+def test_provider_error_copy_is_the_specs_copy():
+    copy = chat_mod.provider_error_copy
+    assert copy("auth", label="MiniMax", status=401) == (
+        "MiniMax rejected the key.", "Open analyst settings to replace the key.", False)
+    assert copy("auth", label="MiniMax", status=403)[0] == "MiniMax refused access for this key."
+    assert copy("billing", label="X")[0] == "X reports a billing problem."
+    assert copy("model", label="X", model="m-1")[0] == "X doesn't recognize the model m-1."
+    assert copy("rate_limit", label="X")[2] is True
+    msg, hint, retry = copy("invalid_request", label="X", detail="Input tag 'adaptive' bad")
+    assert msg == "X rejected the request: Input tag 'adaptive' bad" and retry is False
+    assert hint == "Turn off extended thinking for this model in analyst settings."
+    assert copy("invalid_request", label="X", detail="nope")[1] == (
+        "Run a full check in analyst settings.")
+    assert copy("server", label="X")[0] == "X had a server error."
+    assert copy("network", label="X", host="api.x.io")[0] == "Couldn't reach api.x.io."
+    msg, hint, retry = copy("unknown", label="X", detail="d" * 900)
+    assert msg == "The analyst hit an error with X: " + "d" * 300 and hint is None and retry
+
+
+def _error_turn(*, status=None, error=None, text="", result_text=None):
+    async def turn(client, prompt):
+        yield init()
+        if error:
+            yield AssistantMessage([TextBlock(text)], error=error)
+        yield ResultMessage(is_error=True, api_error_status=status,
+                            result=result_text or text or "failed")
+    return turn
+
+
+def test_a_gateway_401_is_an_auth_error_and_marks_the_provider(tmp_path):
+    """PLUMBING §7: api_error_status=401 with error="invalid_request"."""
+    llm = FakeLlm(provider("openrouter", tmp_path))
+    _sdk, events, svc = run_one_turn(
+        tmp_path, llm=llm, turn=_error_turn(status=401, error="invalid_request",
+                                            text="API Error: 401 invalid_request"))
+    err = [d for _, n, d in events if n == "error"]
+    assert err == [{"message": "OpenRouter rejected the key.",
+                    "hint": "Open analyst settings to replace the key.", "retryable": False,
+                    "code": "auth", "provider": {"id": "openrouter", "label": "OpenRouter"}}]
+    st = svc.status()
+    assert st["available"] is False and st["reason"] == "provider_auth"
+    llm.rp = provider("openrouter", tmp_path, key=KEY_B, generation=2)
+    assert svc.status()["available"] is True             # a new key clears it
+
+
+def test_a_turn_that_works_clears_provider_auth_on_the_same_generation(tmp_path):
+    llm = FakeLlm(provider("openrouter", tmp_path))
+    sdk = FakeSdk(_error_turn(status=401, error="authentication_failed", text="bad key"),
+                  ok_turn_factory())
+    svc = make_service(tmp_path, sdk, llm=llm)
+
+    async def main():
+        sid, rec, t1 = await start_turn(svc)
+        await _ends(rec, t1)
+        assert svc.status()["reason"] == "provider_auth"
+        t2 = await svc.post_message(sid, "again")          # the provider recovered
+        assert (await _ends(rec, t2))[2]["stop"] == "end"
+        await svc.shutdown()
+    asyncio.run(main())
+    assert svc.status()["available"] is True and "reason" not in svc.status()
+
+
+def test_model_not_found_and_403_and_network_get_provider_copy(tmp_path):
+    rp = provider("custom", tmp_path)
+    _, events, _ = run_one_turn(tmp_path / "m", llm=FakeLlm(rp),
+                                turn=_error_turn(error="model_not_found", text="no such model"))
+    assert [(d["code"], d["message"]) for _, n, d in events if n == "error"] == [
+        ("model", ("Custom Anthropic-compatible endpoint doesn't recognize the model "
+                  "stub-model."))]
+    _, events, _ = run_one_turn(tmp_path / "f", llm=FakeLlm(rp),
+                                turn=_error_turn(status=403, result_text="Forbidden"))
+    err = next(d for _, n, d in events if n == "error")
+    assert err["code"] == "auth" and "refused access" in err["message"]
+
+    async def refused(client, prompt):
+        yield init()
+        raise RuntimeError("connect ECONNREFUSED 127.0.0.1:53999")
+        yield  # pragma: no cover
+
+    _, events, _ = run_one_turn(tmp_path / "n", llm=FakeLlm(rp), turn=refused)
+    err = next(d for _, n, d in events if n == "error")
+    assert err["code"] == "network" and err["message"] == "Couldn't reach 127.0.0.1."
+    assert err["retryable"] is True
+
+
+def test_the_claude_login_keeps_its_own_copy_with_a_code(tmp_path):
+    _, events, svc = run_one_turn(
+        tmp_path, llm=FakeLlm(provider("login", tmp_path)),
+        turn=_error_turn(status=429, error="rate_limit", text="limit"))
+    err = [d for _, n, d in events if n == "error"]
+    assert err == [{"message": "Claude usage limit reached.",
+                    "hint": "Wait for the limit to reset, then retry.", "retryable": True,
+                    "code": "rate_limit", "provider": LOGIN_REF}]
+    assert svc.status()["available"] is True             # login errors keep today's status
+
+
+LONG_KEY = "sk-or-v1-" + "a1b2c3d4e5f6" * 4                # fake; 57 characters
+
+
+def test_redactor_catches_the_key_its_fragments_and_its_json_form():
+    red = chat_mod._Redactor()
+    red.add(LONG_KEY)
+    red.add("lmstudio")                                    # a placeholder token: left alone
+    assert red.text(f"401: bad key {LONG_KEY}!") == "401: bad key [redacted key]!"
+    assert LONG_KEY[20:32] not in red.text(f"tail ...{LONG_KEY[20:32]}...")
+    assert red.text(json.dumps({"k": LONG_KEY})) == '{"k": "[redacted key]"}'
+    assert red.text("token lmstudio ok") == "token lmstudio ok"
+    assert red.value({"a": [LONG_KEY], "b": 3}) == {"a": ["[redacted key]"], "b": 3}
+
+
+def test_a_key_the_provider_echoes_never_reaches_events_logs_or_the_transcript(
+        tmp_path, caplog):
+    """Spec §9.5/§9.6 (DESIGN S10/S11): a 401 that echoes the key."""
+    rp = provider("custom", tmp_path, key=LONG_KEY)
+    config_dir = Path(rp.env["CLAUDE_CONFIG_DIR"])
+    transcript = config_dir / "projects" / "-store-analyst" / "sess-x.jsonl"
+    echo = f"Invalid bearer token {LONG_KEY}"
+
+    async def echo_turn(client, prompt):
+        client.options.stderr(f"[api] 401 for Authorization: Bearer {LONG_KEY}")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(json.dumps({"message": {"content": echo}}) + "\n")
+        yield init(session_id="sess-x")
+        yield AssistantMessage([TextBlock(echo)], error="authentication_failed")
+        yield ResultMessage(session_id="sess-x", is_error=True, api_error_status=401,
+                            result=echo, errors=[echo])
+
+    sdk = FakeSdk(echo_turn, ok_turn_factory("sess-x"))
+    svc = make_service(tmp_path, sdk, llm=FakeLlm(rp))
+    caplog.set_level("INFO", logger="godseye_uav.chat")
+
+    async def main():
+        sid, rec, t1 = await start_turn(svc)
+        await _ends(rec, t1)
+        chat_mod.log.warning("provider said: %s", echo)   # the module logger is filtered
+        frames = []
+        async for frame in svc.sse_frames(sid, heartbeat_s=0.01):
+            frames.append(frame)
+            if len(frames) > 3 and frame.startswith(": ping"):
+                break
+        tail = list(svc._sessions[sid].stderr_tail)
+        t2 = await svc.post_message(sid, "again")
+        await _ends(rec, t2)
+        await svc.shutdown()
+        return rec, frames, tail
+    rec, frames, tail = asyncio.run(main())
+    blob = json.dumps([e[2] for e in rec.events]) + "".join(frames) + " ".join(tail)
+    fragment = LONG_KEY[-12:]
+    assert LONG_KEY not in blob and fragment not in blob
+    assert "[redacted key]" in " ".join(tail)
+    assert LONG_KEY not in caplog.text and fragment not in caplog.text
+    assert rec.of("error")[0]["code"] == "auth"
+    # the turn's transcript was scrubbed after the turn, with the CLI stopped
+    assert transcript.is_file() and LONG_KEY not in transcript.read_text()
+    assert "[redacted key]" in transcript.read_text()
+    assert stat.S_IMODE(transcript.stat().st_mode) == 0o600
+    assert sdk.clients[0].disconnected
+    assert sdk.clients[1].options.kw["resume"] == "sess-x"   # resumes the clean transcript
+
+
+def test_scrub_transcripts_rewrites_only_the_sessions_own_files(tmp_path):
+    """Another session's CLI may be appending to its file in the same folder:
+    only this session's transcript (and its side folder) is replaced."""
+    cfg = tmp_path / "home"
+    folder = cfg / "projects" / "-store-analyst"
+    (folder / "s1").mkdir(parents=True)
+    line = f'{{"k": "{LONG_KEY}"}}\n'
+    for name in ("s1.jsonl", "s2.jsonl", "s1/agent-1.jsonl"):
+        (folder / name).write_text(line)
+    red = chat_mod._Redactor()
+    red.add(LONG_KEY)
+    done = chat_mod.scrub_transcripts(cfg, session_ids=["s1", "../x"], redact=red.text)
+    assert done == [folder / "s1" / "agent-1.jsonl", folder / "s1.jsonl"]
+    assert LONG_KEY not in (folder / "s1.jsonl").read_text()
+    assert LONG_KEY in (folder / "s2.jsonl").read_text()   # another session: untouched
+    assert chat_mod.scrub_transcripts(tmp_path / "none", session_ids=["s1"],
+                                      redact=red.text) == []
+
+
+@pytest.mark.parametrize(("name", "priced"), [("login", True), ("anthropic_api", True),
+                                               ("bedrock", True), ("openrouter", False),
+                                               ("custom", False)])
+def test_usage_names_its_cost_basis_and_drops_invented_dollars(tmp_path, name, priced):
+    """Spec §8: the CLI prices a model it doesn't know from its own table."""
+    rp = provider(name, tmp_path)
+    _, events, _ = run_one_turn(tmp_path, llm=FakeLlm(rp))
+    usage = [d for _, n, d in events if n == "usage"][-1]
+    assert usage["cost_basis"] == rp.cost_basis
+    assert ("cost_usd" in usage) is priced and ("session_cost_usd" in usage) is priced
+    assert usage["input_tokens"] == 3 and usage["output_tokens"] == 2
+
+
+def test_status_and_the_session_event_name_the_provider_without_secrets(tmp_path):
+    rp = provider("openrouter", tmp_path)
+    llm = FakeLlm(rp, rev=7)
+    svc = make_service(tmp_path, FakeSdk(), llm=llm)
+    st = svc.status()
+    assert st["available"] is True and st["model"] == "anthropic/claude-opus-5.5"
+    assert st["provider"] == {"id": "openrouter", "label": "OpenRouter",
+                              "kind": "anthropic_compatible", "model_family": "mixed",
+                              "host": "openrouter.ai", "key_source": "keychain",
+                              "configured": True}
+    assert st["cost_basis"] == "unreliable" and st["settings_rev"] == 7
+    assert "effort" not in st and llm.resolves == 0     # status never resolves (no keychain)
+    assert KEY_A not in json.dumps(st) and "env" not in json.dumps(st)
+
+    async def main():
+        sid = await svc.create_session()
+        async for seq, name, data in svc.subscribe(sid):
+            assert (seq, name) == (0, "session")
+            return data
+    session = asyncio.run(main())
+    assert session["provider"] == {"id": "openrouter", "label": "OpenRouter"}
+    assert session["model"] == "anthropic/claude-opus-5.5"
+    login = make_service(tmp_path, FakeSdk(), llm=FakeLlm(provider("login", tmp_path)),
+                         model="claude-flag", effort="high")
+    st = login.status()
+    assert st["model"] == "claude-flag" and st["effort"] == "high"
+    assert st["provider"]["key_source"] == "login" and st["cost_basis"] == "anthropic_list"
+
+
+def test_a_summary_without_provider_status_falls_back_to_the_last_resolve(tmp_path):
+    class Minimal:
+        def __init__(self, rp):
+            self.rp = rp
+
+        def resolve(self):
+            return self.rp
+
+    svc = make_service(tmp_path, FakeSdk(), llm=Minimal(provider("custom", tmp_path)))
+    assert svc.status()["provider"]["id"] == "unknown"     # nothing resolved yet
+    asyncio.run(svc._resolve_provider())
+    st = svc.status()
+    assert st["provider"]["id"] == "custom" and st["model"] == "stub-model"
+    assert KEY_A not in json.dumps(st)
+
+
+@pytest.mark.parametrize("name", ["login", "openrouter", "custom", "bedrock"])
+def test_the_approval_gate_is_the_same_whatever_the_model(tmp_path, name):
+    """Spec §0.8/§11.2: a hostile model's command still waits for approval;
+    an unknown tool is a command; denying never runs it."""
+    seen: dict = {}
+
+    async def hostile(client, prompt):
+        yield init()
+        for tool, args, call in (("mcp__godseye__uav_takeoff", {"vehicle": "Drone1"}, "t1"),
+                                 ("Bash", {"command": "ls"}, "t2")):
+            yield AssistantMessage([ToolUseBlock(call, tool, args)])
+            seen[call] = perm = await client.ask(tool, args, call)
+            yield deny_result(call, perm)
+        for m in streamed_text("Takeoff approved and executed"):
+            yield m
+        yield ResultMessage()
+
+    svc = make_service(tmp_path, FakeSdk(hostile), llm=FakeLlm(provider(name, tmp_path)))
+
+    async def main():
+        sid, rec, tid = await start_turn(svc)
+        for n in (1, 2):
+            req = await rec.wait(lambda e, n=n: e[1] == "approval_request"
+                                 and len(rec.of("approval_request")) >= n)
+            await svc.resolve_approval(sid, rec.of("approval_request")[n - 1]["approval_id"],
+                                       "deny")
+        await _ends(rec, tid)
+        await svc.shutdown()
+        return rec, req
+    rec, _ = asyncio.run(main())
+    reqs = rec.of("approval_request")
+    assert [(r["tool"], r["class"]) for r in reqs] == [("uav_takeoff", "command"),
+                                                      ("Bash", "command")]
+    assert [r["outcome"] for r in rec.of("tool_result")] == ["not_run", "not_run"]
+    assert all(isinstance(p, PermissionResultDeny) for p in seen.values())
+    assert rec.of("ui") == []                             # the claim in text changes nothing
+
+
+# ---- review fixes (secrets lens) --------------------------------------------
+
+def test_the_chat_redactor_covers_every_valid_key_but_the_placeholders():
+    """An all-letter key of 8-11 characters is a valid key (validate_key): it
+    is redacted; only the keyless-local placeholder tokens are left alone."""
+    from godseye_uav import llm_settings
+    assert chat_mod.PLACEHOLDER_TOKENS == llm_settings.PLACEHOLDER_TOKENS
+    red = chat_mod._Redactor()
+    for key in ("abcdefghij", "secretkey"):
+        assert llm_settings.validate_key(key) == key
+        red.add(key)
+        assert key not in red.text(f"invalid api key: {key}")
+    for token in chat_mod.PLACEHOLDER_TOKENS:
+        red.add(token)
+        assert red.text(f"token {token} ok") == f"token {token} ok"
+
+
+def split_key_turn(key: str, session_id: str = "sess-split"):
+    """A provider that answers 200 and quotes the credential in 5-character
+    text deltas (no single delta holds 12 characters of it)."""
+    text = f"Upstream said: invalid key {key}. Please retry."
+    chunks = [text[i:i + 5] for i in range(0, len(text), 5)]
+
+    async def turn(client, prompt):
+        yield init(session_id=session_id)
+        yield StreamEvent({"type": "content_block_start", "index": 0,
+                           "content_block": {"type": "thinking", "thinking": ""}})
+        for c in chunks:
+            yield StreamEvent({"type": "content_block_delta", "index": 0,
+                               "delta": {"type": "thinking_delta", "thinking": c}})
+        yield StreamEvent({"type": "content_block_stop", "index": 0})
+        for m in streamed_text(*chunks):
+            yield m
+        yield ResultMessage(session_id=session_id)
+    return turn, text
+
+
+def test_a_key_split_across_deltas_is_redacted_and_the_transcript_scrubbed(tmp_path):
+    rp = provider("custom", tmp_path, key=KEY_A)
+    config_dir = Path(rp.env["CLAUDE_CONFIG_DIR"])
+    transcript = config_dir / "projects" / "-store-analyst" / "sess-split.jsonl"
+    turn, text = split_key_turn(KEY_A)
+
+    async def writing_turn(client, prompt):
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(json.dumps({"message": {"content": text}}) + "\n")
+        async for m in turn(client, prompt):
+            yield m
+
+    sdk = FakeSdk(writing_turn)
+    svc = make_service(tmp_path, sdk, llm=FakeLlm(rp))
+
+    async def main():
+        sid, rec, tid = await start_turn(svc)
+        await _ends(rec, tid)
+        frames = []
+        async for frame in svc.sse_frames(sid, heartbeat_s=0.01):
+            frames.append(frame)
+            if frame.startswith(": ping"):
+                break
+        await svc.shutdown()
+        return rec, frames
+    rec, frames = asyncio.run(main())
+    said = "".join(e["text"] for e in rec.of("text_delta"))
+    thought = "".join(e["text"] for e in rec.of("thinking"))
+    for blob in (said, thought, "".join(frames)):
+        assert KEY_A not in blob
+    assert said == thought == text.replace(KEY_A, "[redacted key]")
+    assert KEY_A not in transcript.read_text() and "[redacted key]" in transcript.read_text()
+    assert sdk.clients[0].disconnected
+
+
+def test_a_session_holds_back_only_what_could_still_be_a_key():
+    s = chat_mod._Session("s", chat_mod._Redactor())
+    assert s.stream("text", "no key known yet: all of it") == "no key known yet: all of it"
+    s._redactor.add(KEY_A)
+    out = [s.stream("text", d) for d in ("invalid key tes", "t-key", "-123.", " ok then")]
+    out.append(s.flush_stream("text"))
+    assert "".join(out) == "invalid key [redacted key]. ok then"
+    assert all(KEY_A[:5] not in piece or "[redacted" in piece for piece in out)
+    assert s.needs_scrub is True
+    assert s.flush_stream("text") == ""
+
+
+def test_a_full_text_block_with_a_key_flags_the_scrub_even_when_streamed(tmp_path):
+    """The final TextBlock is checked even when its deltas were already sent."""
+    s = chat_mod._Session("s", chat_mod._Redactor())
+    s._redactor.add(KEY_A)
+    svc = make_service(tmp_path, FakeSdk())
+    turn = chat_mod._Turn("t1", text_chars=10, any_text=True)
+    s.turn = turn
+    svc._on_assistant(s, turn, AssistantMessage([TextBlock(f"key was {KEY_A}")]))
+    assert s.needs_scrub is True and len(s.log) == 0   # nothing re-sent, scrub flagged
+
+
+class PreflightLlm(FakeLlm):
+    def __init__(self, rp, refusal):
+        super().__init__(rp)
+        self.refusal = refusal
+        self.preflights = 0
+
+    async def preflight(self, rp):
+        self.preflights += 1
+        return self.refusal
+
+
+def test_a_redirecting_endpoint_never_spawns_a_cli(tmp_path):
+    rp = provider("custom", tmp_path)
+    refusal = {"code": "config", "status": 307, "hint": "Use the endpoint URL the provider "
+               "documents.", "message": "127.0.0.1 tried to redirect the request. "
+               "The key wasn't sent on."}
+    llm = PreflightLlm(rp, refusal)
+    sdk = FakeSdk()
+    svc = make_service(tmp_path, sdk, llm=llm)
+
+    async def main():
+        _, rec, tid = await start_turn(svc)
+        end = (await _ends(rec, tid))[2]
+        await svc.shutdown()
+        return rec, end
+    rec, end = asyncio.run(main())
+    assert sdk.clients == [] and llm.preflights == 1
+    assert end["stop"] == "error"
+    err = rec.of("error")[0]
+    assert (err["code"], err["message"], err["hint"]) == (
+        "config", refusal["message"], refusal["hint"])
+    assert err["retryable"] is False
+
+
+def test_a_clean_preflight_spawns_once_and_is_not_rerun_on_a_live_cli(tmp_path):
+    llm = PreflightLlm(provider("custom", tmp_path), None)
+    sdk = FakeSdk(ok_turn_factory(), ok_turn_factory())
+    svc = make_service(tmp_path, sdk, llm=llm)
+
+    async def main():
+        sid, rec, t1 = await start_turn(svc)
+        await _ends(rec, t1)
+        t2 = await svc.post_message(sid, "again")
+        await _ends(rec, t2)
+        await svc.shutdown()
+    asyncio.run(main())
+    assert len(sdk.clients) == 1 and llm.preflights == 1

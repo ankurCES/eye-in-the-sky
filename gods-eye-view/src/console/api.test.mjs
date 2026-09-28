@@ -510,3 +510,53 @@ test('SSE events arrive with bidi controls removed; tool args keep a visible tok
   assert.equal(ui.reason, 'watch evil');
   assert.equal(neutralizeBidi(null), null);
 });
+
+test('put sends JSON with caller headers (If-Match) and the bearer token', async () => {
+  const { calls, fetchImpl } = recordingFetch(response(200, { rev: 8 }));
+  const api = createApi({ base: '', token: 'secret', fetchImpl });
+  const out = await api.put(
+    '/settings/llm',
+    { provider: 'minimax' },
+    { headers: { 'If-Match': '7' } },
+  );
+  assert.deepEqual(out, { rev: 8 });
+  assert.equal(calls[0].init.method, 'PUT');
+  assert.equal(calls[0].init.headers['If-Match'], '7');
+  assert.equal(calls[0].init.headers['Content-Type'], 'application/json');
+  assert.equal(calls[0].init.headers.Authorization, 'Bearer secret');
+  assert.deepEqual(JSON.parse(calls[0].init.body), { provider: 'minimax' });
+});
+
+test('settings error codes read as words; provider_changed is a default SSE event', async () => {
+  const { ERROR_WORDS, DEFAULT_SSE_EVENTS } = await import('./api.js');
+  for (const code of [
+    'invalid_settings',
+    'settings_conflict',
+    'locked_by_environment',
+    'needs_check',
+    'needs_ack',
+    'cross_origin',
+    'test_busy',
+    'settings_unavailable',
+    'if_match_required',
+    'read_only',
+    'key_store_failed',
+    'unknown_provider',
+    'not_found',
+    'json_required',
+    'too_large',
+    'token_in_url',
+  ]) {
+    assert.equal(typeof ERROR_WORDS[code], 'string', code);
+    assert.doesNotMatch(ERROR_WORDS[code], /_/);
+  }
+  assert.ok(DEFAULT_SSE_EVENTS.includes('provider_changed'));
+  const { fetchImpl } = recordingFetch(response(409, { error: 'needs_check' }));
+  const api = createApi({ fetchImpl });
+  await assert.rejects(api.put('/settings/llm', {}), (e) => {
+    assert.equal(e.name, 'HttpError');
+    assert.equal(e.code, 'needs_check');
+    assert.equal(e.message, ERROR_WORDS.needs_check);
+    return true;
+  });
+});

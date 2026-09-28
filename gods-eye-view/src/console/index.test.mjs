@@ -641,6 +641,35 @@ function stubComponents(log) {
       log.calls.push(['confirmAbort', vehicle]);
       return Promise.resolve(false);
     },
+    createSettingsSheet(host, ctx) {
+      log.settingsHost = host;
+      let open = false;
+      log.settings = {
+        open(o) {
+          open = true;
+          log.calls.push([
+            'settings.open',
+            o?.provider ?? null,
+            o?.invoker ?? null,
+          ]);
+          ctx.bus.emit('settings:state', { open: true });
+        },
+        close() {
+          open = false;
+          log.calls.push(['settings.close']);
+          ctx.bus.emit('settings:state', { open: false });
+        },
+        escape() {
+          if (!open) return false;
+          log.settings.close();
+          return true;
+        },
+        isOpen: () => open,
+        setLayout: record('settings.setLayout'),
+        destroy: record('settings.destroy'),
+      };
+      return log.settings;
+    },
   };
 }
 
@@ -1587,4 +1616,172 @@ test('search CSS: results never let the id print over the name, and narrow drops
   );
   // No segment is ever cut off at a sheet edge (the BINGO sentence).
   assert.doesNotMatch(css, /\.ic-kit-part \{\s*white-space: nowrap;/);
+});
+
+// ---- analyst settings (BYOK spec §10) ------------------------------------------------------
+
+// A button's text ends with its label (an icon's ligature word may lead).
+const buttonWith = (root, text) =>
+  find(root, (el) => el.tag === 'button' && textOf(el).endsWith(text));
+
+test('⌘, opens analyst settings; the column under it is inert; Esc closes it first', async () => {
+  const t = await mount();
+  try {
+    assert.equal(t.log.settingsHost, t.el.root);
+    const ev = t.win.key({ key: ',', metaKey: true, target: t.doc.body });
+    assert.equal(ev.defaultPrevented, true);
+    assert.deepEqual(
+      t.log.calls.filter((c) => c[0] === 'settings.open').map((c) => c[1]),
+      [null],
+    );
+    assert.ok('inert' in t.el.analyst.attrs);
+    assert.ok(!('inert' in t.el.stage.attrs));
+    // Esc: the innermost layer is the sheet.
+    t.el.root.fire('keydown', {
+      key: 'Escape',
+      target: t.el.root,
+      preventDefault() {},
+      stopPropagation() {},
+    });
+    assert.ok(t.log.calls.some((c) => c[0] === 'settings.close'));
+    assert.ok(!('inert' in t.el.analyst.attrs));
+    // Ctrl+, too (not a Mac), and the bus event with a provider.
+    t.win.key({ key: ',', ctrlKey: true, target: t.doc.body });
+    t.log.settings.close();
+    t.bus.emit('settings:open', { section: 'llm', provider: 'minimax' });
+    assert.equal(
+      t.log.calls.filter((c) => c[0] === 'settings.open').at(-1)[1],
+      'minimax',
+    );
+  } finally {
+    t.restore();
+  }
+});
+
+test('narrow: the sheet covers every region, and a tab switch leaves it', async () => {
+  const t = await mount({ width: 420 });
+  try {
+    t.bus.emit('settings:open', {});
+    assert.ok('inert' in t.el.stage.attrs);
+    assert.ok('inert' in t.el.analyst.attrs);
+    t.el.tabs.analyst.fire('click');
+    assert.equal(t.log.settings.isOpen(), false);
+  } finally {
+    t.restore();
+  }
+});
+
+test('review: over the spine the sheet covers the stage, which goes inert', async () => {
+  const t = await mount({
+    chatStatus: { available: false, reason: 'provider_key_missing' },
+  });
+  try {
+    assert.equal(t.el.root.attrs['data-spine'], 'on');
+    assert.ok(!('inert' in t.el.stage.attrs));
+    t.el.spine.fire('click');
+    buttonWith(t.el.spinePop, 'Open analyst settings').fire('click');
+    assert.ok(t.log.settings.isOpen());
+    // The sheet is wider than the spine: the stage's search and Orb/List
+    // toggle sit under it, so nothing there takes a click or a Tab.
+    assert.ok('inert' in t.el.stage.attrs);
+    t.log.settings.close();
+    assert.ok(!('inert' in t.el.stage.attrs));
+  } finally {
+    t.restore();
+  }
+});
+
+test('the spine popover opens analyst settings for a provider reason', async () => {
+  const t = await mount({
+    chatStatus: {
+      available: false,
+      reason: 'provider_auth',
+      provider: { id: 'minimax', label: 'MiniMax' },
+    },
+  });
+  try {
+    t.el.spine.fire('click');
+    assert.match(textOf(t.el.spinePop), /MiniMax rejected the analyst's key\./);
+    const open = buttonWith(t.el.spinePop, 'Open analyst settings');
+    assert.equal(open.attrs['data-variant'], 'primary');
+    assert.ok(buttonWith(t.el.spinePop, 'Check again'));
+    open.fire('click');
+    const call = t.log.calls.filter((c) => c[0] === 'settings.open').at(-1);
+    assert.equal(call[1], 'minimax');
+    assert.equal(call[2], t.el.spine);
+    assert.equal(isHidden(t.el.spinePop), true);
+  } finally {
+    t.restore();
+  }
+});
+
+test('no provider set up: Open analyst settings; a Claude sign-in failure: Use an API key instead', async () => {
+  const t = await mount({
+    chatStatus: { available: false, reason: 'provider_not_configured' },
+  });
+  try {
+    t.el.spine.fire('click');
+    assert.match(
+      textOf(t.el.spinePop),
+      /The analyst has no model provider set up\./,
+    );
+    assert.ok(buttonWith(t.el.spinePop, 'Open analyst settings'));
+    assert.equal(buttonWith(t.el.spinePop, 'Choose a provider'), null);
+    t.log.chat.emit('status', { available: false, reason: 'auth' });
+    t.el.spine.fire('click');
+    t.el.spine.fire('click');
+    const apiKey = buttonWith(t.el.spinePop, 'Use an API key instead');
+    assert.ok(apiKey);
+    apiKey.fire('click');
+    assert.equal(
+      t.log.calls.filter((c) => c[0] === 'settings.open').at(-1)[1],
+      'anthropic_api',
+    );
+  } finally {
+    t.restore();
+  }
+});
+
+test('the shortcut sheet lists analyst settings', async () => {
+  const t = await mount();
+  try {
+    const own = (el) =>
+      [
+        el.textContent,
+        ...el.children.filter((c) => typeof c === 'string'),
+      ].join('');
+    const row = find(
+      t.el.sheet,
+      (el) => el.tag === 'dd' && own(el) === 'Analyst settings',
+    );
+    assert.ok(row);
+    const key = find(
+      t.el.sheet,
+      (el) => el.tag === 'kbd' && /,$/.test(own(el)),
+    );
+    assert.match(own(key), /^(⌘|Ctrl\+),$/);
+  } finally {
+    t.restore();
+  }
+});
+
+test('analystUnavailableCopy covers the provider reasons', () => {
+  const c = analystUnavailableCopy({
+    reason: 'provider_key_missing',
+    provider: { id: 'deepseek', label: 'DeepSeek' },
+    hint: 'Open analyst settings.',
+  });
+  assert.equal(c.title, 'The analyst has no key for DeepSeek.');
+  assert.equal(c.action, 'Open analyst settings');
+  assert.equal(c.provider, 'deepseek');
+  // The server's "Open analyst settings." only repeats the button.
+  assert.equal(c.hint, '');
+  assert.equal(
+    analystUnavailableCopy({ reason: 'auth' }).secondary,
+    'Use an API key instead',
+  );
+  assert.equal(
+    analystUnavailableCopy({ reason: 'sdk_missing' }).action,
+    undefined,
+  );
 });

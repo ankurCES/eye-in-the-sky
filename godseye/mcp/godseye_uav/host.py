@@ -23,9 +23,15 @@ and differs from ``launch.main`` in three ways:
   host on a worker thread with its own loop.
 
 Routes are added from outside ``create_app``, never inside it (the bridge's
-tests pin its route set). ``intel_graph`` and ``chat`` are imported lazily. If
-either fails to load or to start, the host still boots: it answers that
-module's routes with an honest 503, so the operator keeps the rest of the app.
+tests pin its route set). ``intel_graph``, ``chat`` and ``llm_settings`` are
+imported lazily. If one fails to load or to start, the host still boots: it
+answers that module's routes with an honest 503, so the operator keeps the
+rest of the app (without the settings, the analyst runs on the Claude login).
+
+The analyst's model-provider settings (BYOK spec §7): ``LlmSettings`` is built
+before ``ChatService`` (which resolves every turn through it), its
+``/settings/llm*`` routes sit before the ``/api/*`` catch-all and the static
+mount, and ``SettingsGuardMiddleware`` wraps them inside the Host check.
 """
 from __future__ import annotations
 
@@ -34,6 +40,7 @@ import contextlib
 import errno
 import hmac
 import html as html_lib
+import inspect
 import json
 import logging
 import os
@@ -43,7 +50,7 @@ import socket
 import sys
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -106,6 +113,9 @@ class HostConfig:
     cli_path: str | None = None            # None = frozen helper if bundled, else SDK discovery
     effort: str | None = None
     start_loops: bool = True               # bridge telemetry/camera/mission loops
+    #: Provider/credential variables ``app.capture_llm_env`` took out of the
+    #: launch environment (BYOK spec §3.3). Holds secrets: never log or print it.
+    llm_env: dict[str, str] | None = field(default=None, repr=False)
 
 
 def default_store_dir(*, platform: str | None = None, env: Any = None,
@@ -598,6 +608,8 @@ class Host:
     def __init__(self, **kw: Any) -> None:
         self.intel = None
         self.chat = None
+        self.llm = None                      # llm_settings.LlmSettings | None
+        self.llm_error: str | None = None
         self.intel_error: str | None = None
         self.chat_error: str | None = None
         self.chat_reason: str | None = None
@@ -656,7 +668,9 @@ class Host:
 
     # -- introspection ----------------------------------------------------
     def chat_summary(self) -> dict:
-        """``chat`` block of ``/app/config``: available, model, reason?"""
+        """``chat`` block of ``/app/config``: available, model, reason?,
+        provider? (``{id, label}`` only: the route has no auth, so no host,
+        key flags or base URL; BYOK spec §8)."""
         model = self.config.model
         if self.chat is not None:
             try:
@@ -666,8 +680,15 @@ class Host:
             out = {"available": bool(st.get("available")), "model": st.get("model", model)}
             if st.get("reason"):
                 out["reason"] = st["reason"]
+            ref = _provider_ref(st.get("provider"))
+            if ref:
+                out["provider"] = ref
             return out
-        return {"available": False, "reason": self.chat_reason or "error", "model": model}
+        out = {"available": False, "reason": self.chat_reason or "error", "model": model}
+        ref = _provider_ref(llm_provider_block(self.llm))
+        if ref:
+            out["provider"] = ref
+        return out
 
 
 def _bridge_ctx(bridge_app: FastAPI, adapter: Any, token: str) -> Any:
@@ -699,14 +720,59 @@ def _unavailable_router(prefix: str, error: str, auth: Callable[..., bool]) -> A
     return router
 
 
+#: What ``/chat/status`` may say about the provider (never a key or a base URL).
+_PROVIDER_BLOCK_KEYS = ("id", "label", "kind", "model_family", "host", "key_source",
+                        "configured")
+
+
+def llm_provider_block(llm: Any) -> dict | None:
+    """The active provider as ``/chat/status`` shows it, straight from the
+    settings (used when the analyst itself could not start). Asks the
+    settings' keychain-free summary (``provider_status()``, else
+    ``status()``); only ``_PROVIDER_BLOCK_KEYS`` survive. None without one.
+    """
+    if llm is None:
+        return None
+    raw = None
+    for name in ("provider_status", "status"):
+        fn = getattr(llm, name, None)
+        if callable(fn):
+            try:
+                raw = fn()
+            except Exception as exc:  # noqa: BLE001 - status must not 500
+                log.warning("provider summary failed: %s", type(exc).__name__)
+                return None
+            break
+    if inspect.isawaitable(raw):
+        with contextlib.suppress(Exception):
+            raw.close()
+        return None
+    if not isinstance(raw, dict):
+        raw = {k: getattr(raw, k) for k in _PROVIDER_BLOCK_KEYS if hasattr(raw, k)}
+    src = raw.get("provider") if isinstance(raw.get("provider"), dict) else raw
+    block = {k: src.get(k, raw.get(k)) for k in _PROVIDER_BLOCK_KEYS}
+    return block if block.get("id") else None
+
+
+def _provider_ref(block: Any) -> dict | None:
+    """``{id, label}`` of a provider block, or None."""
+    if not isinstance(block, dict) or not block.get("id"):
+        return None
+    return {"id": str(block["id"]), "label": str(block.get("label") or "")}
+
+
 def _chat_fallback_router(host: Host, auth: Callable[..., bool]) -> APIRouter:
     router = APIRouter()
 
     @router.get("/chat/status")
     def chat_status(_: bool = Depends(auth)) -> dict:
-        return {"available": False, "reason": host.chat_reason or "error",
-                "hint": host.chat_error or "the analyst could not be started",
-                "model": host.config.model}
+        out = {"available": False, "reason": host.chat_reason or "error",
+               "hint": host.chat_error or "the analyst could not be started",
+               "model": host.config.model}
+        block = llm_provider_block(host.llm)
+        if block:
+            out["provider"] = block
+        return out
 
     router.include_router(_unavailable_router("/chat", "chat_unavailable", auth))
     return router
@@ -820,14 +886,80 @@ def build_host(cfg: HostConfig) -> Host:
     return host
 
 
+def _supported_kwargs(fn: Any, **kw: Any) -> dict:
+    """The subset of ``kw`` that ``fn`` accepts (all of it for ``**kwargs``)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kw
+    return {k: v for k, v in kw.items() if k in params}
+
+
+def _load_llm_settings(host: Host) -> Any:
+    """Import ``llm_settings`` and build ``LlmSettings(store_dir.parent,
+    llm_env)`` (BYOK spec §12). Returns the module, or None after logging:
+    the analyst then runs on the Claude login exactly as before the spec
+    (the launch provider variables are gone from ``os.environ`` either way).
+    """
+    try:
+        from . import llm_settings
+        cls = llm_settings.LlmSettings
+        cfg = host.config
+        # --model/--effort lock those settings; the port is the app's own
+        # host:port (a base URL may not point back at it).
+        host.llm = cls(host.store_dir.parent, dict(cfg.llm_env or {}),
+                       **_supported_kwargs(cls, store_dir=host.store_dir, model=cfg.model,
+                                           effort=cfg.effort, app_port=host.port,
+                                           cli_path=cfg.cli_path or frozen_cli_path()))
+        return llm_settings
+    except Exception as exc:  # noqa: BLE001 - the host boots without the settings
+        host.llm = None
+        host.llm_error = type(exc).__name__   # never the message: it could quote a value
+        log.warning("analyst settings unavailable (%s); the analyst uses the Claude login",
+                    host.llm_error)
+        return None
+
+
+def _settings_guard(llm_mod: Any, host: Host) -> tuple[type, dict] | None:
+    """``(SettingsGuardMiddleware, kwargs)`` for this host's origins, checked
+    by building one eagerly: Starlette builds middleware at the first
+    request, where a bad signature would fail every route. None if unusable.
+    """
+    guard = getattr(llm_mod, "SettingsGuardMiddleware", None) if llm_mod else None
+    if guard is None:
+        return None
+    ports = tuple(p for p in (host.port, host.mcp_port) if p)
+    origins = tuple(f"http://{h}:{p}" for p in ports for h in ("127.0.0.1", "localhost", "[::1]"))
+    kw = _supported_kwargs(guard, port=host.port, ports=ports, allowed_origins=origins,
+                           origins=origins)
+
+    async def _probe_app(scope: Scope, receive: Receive, send: Send) -> None:  # pragma: no cover
+        return None
+
+    try:
+        guard(_probe_app, **kw)
+    except Exception as exc:  # noqa: BLE001 - no guard, so no settings routes either
+        log.warning("analyst settings guard unusable: %s", type(exc).__name__)
+        return None
+    return guard, kw
+
+
 def _wire(host: Host, mcp_asgi: ASGIApp, adapter: Any) -> None:
     app, cfg, token = host.app, host.config, host.token
     auth, auth_sse = bearer_auth(token), sse_auth(token)
+    llm_mod = _load_llm_settings(host)
+    guard = _settings_guard(llm_mod, host)
 
     app.router.routes.append(Route(MCP_PATH, endpoint=mcp_asgi, name="mcp"))
     app.add_middleware(ShutdownDisconnectMiddleware, stopping=lambda: host._stopping,
                        loop=lambda: host._loop)
     app.add_middleware(TokenPageCorsGuardMiddleware)      # outside the bridge's CORS
+    if guard is not None:
+        # /settings/*: strips Origin before the bridge's CORS, refuses a
+        # cross-origin caller (spec §7.5). Inside the Host check.
+        app.add_middleware(guard[0], **guard[1])
     app.add_middleware(LoopbackHostMiddleware)            # outermost
 
     @app.get("/app/config", include_in_schema=False)
@@ -854,7 +986,8 @@ def _wire(host: Host, mcp_asgi: ASGIApp, adapter: Any) -> None:
         cli_path = cfg.cli_path or frozen_cli_path()
         host.chat = chat.ChatService(
             server=host.server, intel=host.intel, store_dir=host.store_dir,
-            model=cfg.model, effort=cfg.effort, cli_path=cli_path, enabled=cfg.chat)
+            model=cfg.model, effort=cfg.effort, cli_path=cli_path, enabled=cfg.chat,
+            llm=host.llm)
         app.include_router(chat.chat_router(host.chat, auth, auth_sse))
     except Exception as exc:  # noqa: BLE001 - the console still works without the analyst
         host.chat = None
@@ -862,6 +995,23 @@ def _wire(host: Host, mcp_asgi: ASGIApp, adapter: Any) -> None:
         host.chat_error = f"{type(exc).__name__}: {exc}"
         log.warning("analyst chat unavailable: %s", host.chat_error)
         app.include_router(_chat_fallback_router(host, auth))
+
+    # -- analyst settings (BYOK spec §7): header bearer only, never ?token= --
+    settings_router = None
+    if llm_mod is not None and guard is not None and host.llm is not None:
+        try:
+            make = llm_mod.llm_settings_router
+            try:
+                wants_chat = len(inspect.signature(make).parameters) >= 3
+            except (TypeError, ValueError):
+                wants_chat = False
+            args = (host.llm, auth, host.chat) if wants_chat else (host.llm, auth)
+            settings_router = make(*args)
+        except Exception as exc:  # noqa: BLE001 - the rest of the app stays up
+            host.llm_error = type(exc).__name__
+            log.warning("analyst settings routes unavailable: %s", host.llm_error)
+    app.include_router(settings_router
+                       or _unavailable_router("/settings", "settings_unavailable", auth))
 
     # -- GEV node-only providers do not exist here ---------------------------
     @app.api_route("/api/{path:path}", include_in_schema=False,

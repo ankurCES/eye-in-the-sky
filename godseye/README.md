@@ -61,9 +61,14 @@ wait for the operator's order slip in the console. Its system prompt is `analyst
 distilled from the skill below.
 
 It needs the `app` extra (`pip install -e '.[app]'`, which brings `claude-agent-sdk` and
-`pywebview`) and a Claude sign-in or `ANTHROPIC_API_KEY`. `INTEL_CONSOLE.md` has the full contract:
-routes, SSE events, approval classes, session grants, sign-in policy, environment variables, where
-transcripts are written, and observed cost.
+`pywebview`) and a model provider: the Claude sign-in on this machine by default, or one chosen in
+the console's Analyst settings (⌘,): an Anthropic API key, Bedrock, Vertex, Foundry, OpenRouter,
+several Anthropic-compatible providers, a local Ollama or LM Studio, or a custom endpoint.
+`llm_settings.py` owns those settings, the key store (the macOS Keychain or a 0600 file, never the
+browser) and the CLI's environment; `llm_providers.py` is the catalog. Dev and test runs should set
+`GODSEYE_LLM_SECRET_STORE=file`. `INTEL_CONSOLE.md` has the full contract: routes, SSE events,
+approval classes, session grants, sign-in policy, providers and keys, environment variables, where
+transcripts are written, and observed cost; the repository `README.md` lists the providers.
 
 ## Connecting a harness
 
@@ -138,6 +143,7 @@ stricter.
 | `mcp/godseye_uav/bridge.py` | Telemetry bridge |
 | `mcp/godseye_uav/intel_graph.py` | Intel graph and `/intel/*` routes |
 | `mcp/godseye_uav/chat.py`, `analyst_policy.py`, `analyst_toolbelt.py`, `analyst_prompt.md` | The analyst |
+| `mcp/godseye_uav/llm_settings.py`, `llm_providers.py` | The analyst's model providers: `/settings/llm*`, keys, connection checks, the catalog |
 | `mcp/godseye_uav/` (rest) | Safety, tasking, missions, targets, threat, geo, store, theaters, real data, fake sim |
 | `packaging/macos/` | PyInstaller spec, entry point and icon (built by `../scripts/build_desktop.sh`) |
 | `tests/` | Test suite; runs with no GPU and no Unreal |
@@ -158,11 +164,14 @@ stricter.
 `tests/conftest.py` puts `mcp/` and the AirSim PythonClient (`$GODSEYE_AIRSIM_PYTHONCLIENT`,
 `../airsim/PythonClient` or `.godseye/vendor/airsim/PythonClient`, which `scripts/setup.sh` fetches)
 on the path. The whole suite runs against the built-in fake AirSim with no Unreal and no GPU:
-1,522 tests, about 40 minutes, most of it `test_server.py`. The analyst and window tests mostly use
+1,767 tests, about 40 minutes, most of it `test_server.py`. The analyst and window tests mostly use
 fakes for `claude_agent_sdk` and `webview`; the few that need the real SDK skip without it, so the
 suite runs without the `app` extra. One test runs the
 built desktop app and is opt-in: `GODSEYE_TEST_DESKTOP_APP=1 .venv/bin/python -m pytest
-tests/test_app.py -k built_app` after `../scripts/build_desktop.sh`.
+tests/test_app.py -k built_app` after `../scripts/build_desktop.sh`. The provider checks in
+`tests/test_llm_settings_live.py` run the real bundled CLI against a local stub behind a deny-all
+proxy, with fake keys (`GODSEYE_LIVE_CLI=0` skips them); `GODSEYE_TEST_KEYCHAIN=1` adds a round trip
+through a throwaway Keychain.
 
 ## Datum: read this before touching altitudes
 

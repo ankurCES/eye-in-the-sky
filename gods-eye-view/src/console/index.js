@@ -30,6 +30,12 @@ import { createChatClient } from './chat/client.js';
 import { createAnalyst } from './chat/view.js';
 import { createSearch } from './search.js';
 import { createInspector } from './inspector.js';
+import { createSettingsSheet } from './settings/view.js';
+import {
+  USE_API_KEY,
+  providerHint,
+  providerUnavailableCopy,
+} from './settings/model.js';
 import {
   alarmLabel,
   confirmAbort,
@@ -80,6 +86,7 @@ export const ICON = Object.freeze({
   offline: 'cloud_off',
   orb: 'bubble_chart',
   retry: 'refresh',
+  settings: 'settings',
   signIn: 'login',
   track: 'my_location',
   warning: 'warning',
@@ -141,6 +148,7 @@ export const COPY = Object.freeze({
     n === 1 ? '1 approval waiting' : `${n} approvals waiting`,
   pointedOut: (n) => `${n} pointed out by the analyst`,
   shortcuts: 'Keyboard shortcuts',
+  analystSettings: 'Analyst settings',
   close: 'Close',
   panelFailed: (name) =>
     `The ${name} didn't load. The rest of the console still works.`,
@@ -156,6 +164,9 @@ export function analystUnavailableCopy(status) {
   const reason = status?.reason ?? null;
   const hint =
     typeof status?.hint === 'string' && status.hint ? status.hint : '';
+  // Provider settings (BYOK spec §10): the popover opens analyst settings.
+  const provider = providerUnavailableCopy(reason, status?.provider);
+  if (provider) return { ...provider, hint: providerHint(hint) };
   switch (reason) {
     case 'sdk_missing':
       return {
@@ -189,6 +200,8 @@ export function analystUnavailableCopy(status) {
         title: "The analyst isn't signed in.",
         body: 'Sign in with the claude CLI (`claude`, then /login) or set ANTHROPIC_API_KEY.',
         hint,
+        secondary: USE_API_KEY,
+        secondaryProvider: 'anthropic_api',
       };
     default:
       return {
@@ -664,6 +677,7 @@ const DEFAULT_COMPONENTS = Object.freeze({
   createSearch,
   createInspector,
   createSituation,
+  createSettingsSheet,
   confirmAbort,
 });
 
@@ -776,6 +790,7 @@ export function mountIntelConsole({
   let sheetOpen = false;
   let sheetOpener = null;
   let spineOpen = false;
+  let settingsOpen = false;
   let recoveredAt = null;
   let recoveredTimer = null;
   let connecting = true;
@@ -929,6 +944,27 @@ export function mountIntelConsole({
   const analyst = mountPanel('analyst', el.analystBody, () =>
     C.createAnalyst(el.analystBody, ctx),
   );
+  // Analyst settings (BYOK spec §10): a sheet over the analyst column, a
+  // direct child of the root so it also takes input in tracking.
+  let settingsSheet = null;
+  try {
+    settingsSheet = C.createSettingsSheet?.(el.root, ctx) || null;
+  } catch (err) {
+    globalThis.console?.error?.(err);
+    settingsSheet = null;
+  }
+
+  /** Open analyst settings, optionally at one provider (⌘, / Ctrl+,, the
+   *  analyst menu, the unavailable panel, the spine popover). */
+  function openSettings({ provider = null, invoker = null } = {}) {
+    if (!settingsSheet) return;
+    if (sheetOpen) closeSheet();
+    const from =
+      invoker || (spineOpen ? el.spine : null) || doc?.activeElement || null;
+    if (spineOpen) closeSpine({ restore: false });
+    settingsSheet.setLayout?.(layout);
+    settingsSheet.open({ provider, invoker: from });
+  }
 
   // ---- orb wiring --------------------------------------------------------------
 
@@ -1533,6 +1569,9 @@ export function mountIntelConsole({
 
   function setTab(next) {
     const value = ['orb', 'analyst', 'situation'].includes(next) ? next : 'orb';
+    // A tab chosen on the narrow bar leaves analyst settings.
+    if (value !== tab && settingsSheet?.isOpen?.())
+      settingsSheet.close({ restore: false });
     tab = value;
     if (tab === 'orb') orbTabBadge = 0;
     el.root.setAttribute('data-tab', tab);
@@ -1560,15 +1599,21 @@ export function mountIntelConsole({
     // Narrow: one section at a time; the others are hidden and inert.
     const railOn = !narrow || tab === 'situation';
     const stageOn = !narrow || tab === 'orb';
+    // Analyst settings cover the analyst column (wide, compact) or every
+    // region under the narrow bar (narrow): what is under the sheet is inert.
+    // Over the 56 px spine the sheet also covers the stage's right edge
+    // (search, the Orb/List toggle), so the stage goes inert too.
+    const covered = settingsOpen && narrow;
+    const overSpine = settingsOpen && !analystOn && !narrow && !tracking;
     setHidden(el.rail, !railOn);
-    setInert(el.rail, !railOn);
+    setInert(el.rail, !railOn || covered);
     setHidden(el.stage, !stageOn);
-    setInert(el.stage, !stageOn);
+    setInert(el.stage, !stageOn || covered || overSpine);
     const analystVisible = tracking
       ? !dockCollapsed
       : !narrow || tab === 'analyst';
     setHidden(el.analyst, !analystVisible);
-    setInert(el.analyst, !analystVisible);
+    setInert(el.analyst, !analystVisible || settingsOpen);
 
     // Analyst unavailable (§3e): a 56 px spine, never at narrow or in tracking.
     const spine = !analystOn && !narrow && !tracking;
@@ -1621,6 +1666,7 @@ export function mountIntelConsole({
     situation?.setLayout?.(layout);
     analyst?.setLayout?.(layout);
     inspector?.setLayout?.(layout);
+    settingsSheet?.setLayout?.(layout);
     bus.emit('layout', { layout });
     applyViewport();
     renderBadges();
@@ -1666,6 +1712,7 @@ export function mountIntelConsole({
         available,
         reason: st.reason ?? null,
         hint: st.hint ?? null,
+        ...(st.provider ? { provider: st.provider } : {}),
       });
     }
   }
@@ -1686,13 +1733,34 @@ export function mountIntelConsole({
     if (copy.body) kids.push(h('p', { class: 'ic-popover__body' }, copy.body));
     if (copy.hint && copy.hint.trim() !== copy.title)
       kids.push(h('p', { class: 'ic-popover__hint' }, copy.hint));
-    kids.push(
+    const actions = [];
+    // A provider reason opens analyst settings (primary); Check again stays.
+    if (copy.action && settingsSheet) {
+      actions.push(
+        btn(copy.action, {
+          icon: ICON.settings,
+          variant: 'primary',
+          onClick: () => openSettings({ provider: copy.provider || null }),
+        }),
+      );
+    }
+    actions.push(
       btn(COPY.checkAgain, {
         icon: ICON.retry,
-        variant: 'primary',
+        variant: copy.action && settingsSheet ? 'quiet' : 'primary',
         onClick: () => checkAnalyst(),
       }),
     );
+    if (copy.secondary && settingsSheet) {
+      actions.push(
+        btn(copy.secondary, {
+          variant: 'quiet',
+          onClick: () =>
+            openSettings({ provider: copy.secondaryProvider || null }),
+        }),
+      );
+    }
+    kids.push(h('div', { class: 'ic-popover__actions' }, ...actions));
     replaceKids(el.spinePop, kids);
   }
 
@@ -1776,6 +1844,10 @@ export function mountIntelConsole({
 
   /** Close the innermost layer (§9). Returns whether something closed. */
   function escapeLayer() {
+    if (settingsSheet?.isOpen?.()) {
+      settingsSheet.escape();
+      return true;
+    }
     if (sheetOpen) {
       closeSheet();
       return true;
@@ -1929,6 +2001,14 @@ export function mountIntelConsole({
     if (mod && !event.altKey && key === '.') {
       consume(event);
       stopAnalyst();
+      return;
+    }
+    if (mod && !event.altKey && !event.shiftKey && key === ',') {
+      // ⌘, / Ctrl+, : analyst settings, from anywhere (BYOK spec §10).
+      if (settingsSheet) {
+        consume(event);
+        openSettings({ invoker: doc?.activeElement || null });
+      }
       return;
     }
     if (key === 'F6' && !mod && !event.altKey) {
@@ -2138,6 +2218,7 @@ export function mountIntelConsole({
           available: p.available !== false,
           reason: p.reason ?? null,
           hint: p.hint ?? null,
+          provider: p.provider ?? analystStatus?.provider ?? null,
         },
         { emit: false },
       );
@@ -2149,6 +2230,22 @@ export function mountIntelConsole({
     }),
     bus.on('abort:request', (p) => {
       if (p?.vehicle) C.confirmAbort?.(ctx, p.vehicle);
+    }),
+    bus.on('settings:open', (p) => {
+      openSettings({
+        provider: typeof p?.provider === 'string' ? p.provider : null,
+        invoker: p?.invoker || null,
+      });
+    }),
+    bus.on('settings:state', (p) => {
+      const next = Boolean(p?.open);
+      if (next === settingsOpen) return;
+      settingsOpen = next;
+      applyRegions();
+    }),
+    bus.on('settings:changed', () => {
+      // A new provider or key: ask the analyst again (the spine may lift).
+      checkAnalyst();
     }),
     bus.on('gev:status', (p) => {
       // GEV (the map under the console) reports its start-up. Only a failure
@@ -2396,7 +2493,14 @@ export function mountIntelConsole({
       }
     }
     ro?.disconnect?.();
-    for (const panel of [analyst, inspector, search, situation, listView]) {
+    for (const panel of [
+      analyst,
+      inspector,
+      search,
+      situation,
+      listView,
+      settingsSheet,
+    ]) {
       try {
         panel?.destroy?.();
       } catch (err) {
@@ -2696,6 +2800,7 @@ function buildShell(mac) {
     ['/', 'Search, outside text fields'],
     [`${cmd}I`, 'Go to the composer'],
     [`${cmd}.`, 'Stop the analyst'],
+    [`${cmd},`, COPY.analystSettings],
     ['F6, Shift+F6', 'Move between regions'],
     [mac ? '⌥A' : 'Alt+A', 'Oldest approval waiting'],
     ['Esc', 'Close the innermost layer'],

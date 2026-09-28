@@ -53,6 +53,14 @@ _PORTS = list(range(52600, 52800))
 _rng = random.Random(os.getpid() ^ time.time_ns())
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _llm_keys_in_memory():
+    """The hosts built here keep analyst keys in memory: no test reads or
+    writes a keychain (BYOK spec §11)."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("GODSEYE_LLM_SECRET_STORE", "memory")
+        yield
+
 # ---------------------------------------------------------------------------
 # env hygiene (contract §2)
 # ---------------------------------------------------------------------------
@@ -257,10 +265,13 @@ def test_optional_gui_and_agent_sdks_are_not_imported_at_module_load():
 def _child_env(**extra: str) -> dict:
     # Start from an environment with no Claude Code session in it (this suite
     # may itself run inside one), then add exactly what the test asks for.
+    # No provider variable of the developer's shell reaches the child, and its
+    # analyst settings keep keys in memory, never in a keychain (BYOK spec §11).
     env = {k: v for k, v in sanitize_env({**os.environ, "CLAUDECODE": ""}).items()
-           if k not in ("GODSEYE_TOKEN", "PYTHONPATH")}
+           if k not in ("GODSEYE_TOKEN", "PYTHONPATH", *appmod.LLM_ENV_VARS)}
     env["PYTHONPATH"] = os.pathsep.join(
         [str(GS / "mcp"), str(Path(airsim.__file__).resolve().parents[1])])
+    env["GODSEYE_LLM_SECRET_STORE"] = "memory"
     env.update(extra)
     return env
 
@@ -1228,3 +1239,117 @@ def test_the_built_app_passes_its_selftest(tmp_path):
     verdict = json.loads(out.read_text())
     assert proc.returncode == 0 and verdict["ok"], verdict
     assert verdict["app"]["frozen"] is True
+
+
+# ---------------------------------------------------------------------------
+# BYOK: the launch environment's provider variables (spec §3.3, §8, §9.4)
+# ---------------------------------------------------------------------------
+# Fake keys only.
+
+APP_KEY = "test-key-123-app"
+CHAIN_VARS = {"AWS_PROFILE": "dev", "AWS_REGION": "us-east-1",
+              "AWS_ACCESS_KEY_ID": "AKIAFAKE", "GOOGLE_APPLICATION_CREDENTIALS": "/x.json",
+              "CLOUD_ML_REGION": "global", "ANTHROPIC_VERTEX_PROJECT_ID": "proj-12345",
+              "HTTPS_PROXY": "http://127.0.0.1:3128", "NODE_EXTRA_CA_CERTS": "/ca.pem",
+              "PATH": "/usr/bin"}
+
+
+@pytest.mark.parametrize("settings_module", ["real", "broken"])
+def test_capture_llm_env_pops_every_provider_variable_and_keeps_the_chains(
+        monkeypatch, settings_module):
+    if settings_module == "broken":           # fail closed: the app pops them itself
+        monkeypatch.setitem(sys.modules, "godseye_uav.llm_settings", None)
+    env = {name: f"{APP_KEY}-{i}" for i, name in enumerate(appmod.LLM_ENV_VARS)}
+    env.update(CHAIN_VARS)
+    captured = appmod.capture_llm_env(env)
+    assert env == CHAIN_VARS
+    assert set(captured) == set(appmod.LLM_ENV_VARS)
+    assert captured["OPENROUTER_API_KEY"].startswith(APP_KEY)
+    assert appmod.capture_llm_env(dict(CHAIN_VARS)) == {}
+
+
+def test_the_apps_list_is_the_settings_modules_list():
+    settings = pytest.importorskip("godseye_uav.llm_settings")
+    names = getattr(settings, "CAPTURED_VARS", None)
+    if names is None:
+        pytest.skip("llm_settings exposes no CAPTURED_VARS")
+    assert set(appmod.LLM_ENV_VARS) == set(names)
+
+
+def test_main_captures_after_sanitizing_and_hands_the_values_to_the_host_only(
+        tmp_path, monkeypatch, main_env, capsys):
+    monkeypatch.setenv("CLAUDECODE", "1")                       # a session var set ...
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")  # ... drops the proxy
+    monkeypatch.setenv("OPENROUTER_API_KEY", APP_KEY)
+    monkeypatch.setenv("GODSEYE_LLM_PROVIDER", "openrouter")
+    seen: dict = {}
+
+    def fake_build(cfg, **kw):
+        seen["cfg"] = cfg
+        seen["environ"] = {k: os.environ.get(k) for k in appmod.LLM_ENV_VARS}
+        raise RuntimeError("stop before the host")
+
+    monkeypatch.setattr(appmod, "_build", fake_build)
+    rc = appmod.main(["--headless", "--no-chat", "--token", "t",
+                      "--store", str(tmp_path / "data" / "store")])
+    assert rc == 1
+    assert seen["cfg"].llm_env == {"OPENROUTER_API_KEY": APP_KEY,
+                                   "GODSEYE_LLM_PROVIDER": "openrouter"}
+    assert all(v is None for v in seen["environ"].values())   # the CLI inherits none
+    out = capsys.readouterr().out
+    assert APP_KEY not in out and APP_KEY not in repr(seen["cfg"])
+    assert ("analyst provider settings from the environment (names only): "
+            "GODSEYE_LLM_PROVIDER, OPENROUTER_API_KEY") in out
+
+
+def test_config_from_args_carries_the_captured_env():
+    cfg = appmod._config_from_args(build_parser().parse_args([]), "tok",
+                                   llm_env={"ANTHROPIC_API_KEY": APP_KEY})
+    assert cfg.llm_env == {"ANTHROPIC_API_KEY": APP_KEY}
+    assert APP_KEY not in repr(cfg)
+    assert appmod._config_from_args(build_parser().parse_args([]), "tok").llm_env == {}
+
+
+@pytest.mark.parametrize(("chat", "line"), [
+    ({"available": True, "model": "anthropic/claude-opus-5.5",
+      "provider": {"id": "openrouter", "label": "OpenRouter"}},
+     "analyst  : available (model anthropic/claude-opus-5.5 via OpenRouter)"),
+    ({"available": True, "model": "claude-opus-5"},
+     "analyst  : available (model claude-opus-5)"),
+    ({"available": False, "reason": "provider_key_missing",
+      "provider": {"id": "minimax", "label": "MiniMax"}},
+     "analyst  : unavailable (provider_key_missing) via MiniMax"),
+])
+def test_the_startup_banner_names_the_provider_never_the_key(tmp_path, capsys, chat, line):
+    host = types.SimpleNamespace(
+        theater=types.SimpleNamespace(id="default", place="Redmond", label="AirSim default"),
+        url="http://127.0.0.1:1/", mcp_url="http://127.0.0.1:1/mcp", mcp_port=None,
+        token="t", store_dir=tmp_path / "store", ui_built=True, ui_dir=tmp_path,
+        config=HostConfig(theater=None, llm_env={"MINIMAX_API_KEY": APP_KEY}),
+        chat_summary=lambda: chat)
+    appmod._describe(host, token_source="generated", harness_file=None)
+    out = capsys.readouterr().out
+    assert line in out.splitlines()[-1] and APP_KEY not in out
+
+
+def test_headless_app_never_prints_or_serves_a_launch_key(tmp_path):
+    """End to end: the key from the launch environment is captured (names
+    only in the log) and is on no open route."""
+    app = AppProc(tmp_path, [], _child_env(OPENROUTER_API_KEY=APP_KEY,
+                                           GODSEYE_LLM_PROVIDER="openrouter"))
+    try:
+        out = app.output()
+        assert APP_KEY not in out
+        assert "(names only): GODSEYE_LLM_PROVIDER, OPENROUTER_API_KEY" in out
+        cfg = httpx.get(f"http://127.0.0.1:{app.port}/app/config", timeout=10)
+        assert cfg.status_code == 200 and APP_KEY not in cfg.text
+        token = json.loads((tmp_path / "data" / "mcp.json").read_text())["token"]
+        auth = {"Authorization": f"Bearer {token}"}
+        for path in ("/settings/llm", "/chat/status"):
+            r = httpx.get(f"http://127.0.0.1:{app.port}{path}", headers=auth, timeout=10)
+            assert r.status_code in (200, 503), (path, r.status_code)
+            assert APP_KEY not in r.text and "test-key" not in r.text
+        assert app.stop(signal.SIGTERM) == 0
+        assert APP_KEY not in app.output()
+    finally:
+        app.kill()

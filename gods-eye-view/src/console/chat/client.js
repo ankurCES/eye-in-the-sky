@@ -40,6 +40,7 @@ export const CHAT_EVENTS = Object.freeze([
   'usage',
   'turn_end',
   'error',
+  'provider_changed',
 ]);
 
 export const SESSION_KEY = 'ic.chat.session';

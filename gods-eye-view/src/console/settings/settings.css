@@ -1,0 +1,604 @@
+/*
+ * Analyst settings sheet (BYOK spec §10; UX spec §2, §11.2).
+ *
+ * @import-ed at the top of console.css. Flat single ic-settings__ classes at
+ * (0,1,0) via :where(.ic-root); state lives in attributes. A sheet over the
+ * analyst column (same width, raised, layer 30, radius 10); at narrow a
+ * full-screen sheet under the always-visible narrow bar. Colour is status
+ * only (ok, warn, critical), never magenta or analyst blue, and always
+ * paired with a glyph or a word. Mono only for hosts, env names, model ids,
+ * the key's last four and HTTP codes.
+ */
+
+:where(.ic-root) .ic-settings {
+  --ic-settings-w: clamp(420px, 31vw, 520px);
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: var(--ic-z-sheet, 30);
+  display: flex;
+  flex-direction: column;
+  width: var(--ic-settings-w);
+  max-width: 100%;
+  min-height: 0;
+  border-left: 1px solid var(--ic-hairline);
+  border-radius: var(--ic-r-popover, 10px) 0 0 var(--ic-r-popover, 10px);
+  background: var(--ic-raised);
+  box-shadow: var(--ic-shadow-e2);
+  color: var(--ic-film);
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-settings[data-layout='compact'] {
+  --ic-settings-w: clamp(360px, 36vw, 420px);
+}
+
+:where(.ic-root) .ic-settings[data-layout='narrow'] {
+  top: var(--ic-narrowbar-h, 0px);
+  left: 0;
+  width: auto;
+  border-left: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+:where(.ic-root) .ic-settings__approval {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 12px 6px 16px;
+  border-left: 4px solid var(--ic-film);
+  border-radius: var(--ic-r-popover, 10px) 0 0 0;
+  background: var(--ic-panel);
+  font: var(--ic-type-small);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-settings__approvaltext {
+  min-width: 0;
+}
+
+/* At narrow the narrow bar already pins the approval, except on Analyst. */
+:where(.ic-root[data-layout='narrow']:not([data-tab='analyst']))
+  .ic-settings__approval {
+  display: none;
+}
+
+:where(.ic-root) .ic-settings__head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--ic-header-h, 56px);
+  padding: 0 12px 0 var(--ic-col-inset, 24px);
+  border-bottom: 1px solid var(--ic-hairline);
+}
+
+:where(.ic-root .ic-settings[data-layout='narrow']) .ic-settings__head {
+  padding-left: 8px;
+}
+
+:where(.ic-root) .ic-settings__glyph {
+  color: var(--ic-pencil);
+}
+
+:where(.ic-root) .ic-settings__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: var(--ic-type-title);
+}
+
+:where(.ic-root) .ic-settings__scroll {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--ic-s-6, 24px);
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 16px var(--ic-col-inset, 24px) 0;
+}
+
+:where(.ic-root) .ic-settings__notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 12px;
+  border-left: 4px solid var(--ic-edge);
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-panel);
+}
+
+:where(.ic-root) .ic-settings__notice[data-tone='warn'] {
+  border-left-color: var(--ic-warn);
+}
+
+:where(.ic-root) .ic-settings__notice[data-tone='critical'] {
+  border-left-color: var(--ic-critical);
+}
+
+:where(.ic-root) .ic-settings__noticetext {
+  flex: 1 1 16em;
+  min-width: 0;
+}
+
+:where(.ic-root) .ic-settings__inuse {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 16px;
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-panel);
+}
+
+:where(.ic-root) .ic-settings__inuseline {
+  font: var(--ic-type-body-strong);
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-settings__inuselabel {
+  color: var(--ic-pencil);
+  font-weight: 400;
+}
+
+:where(.ic-root) .ic-settings__host {
+  color: var(--ic-pencil);
+  font: var(--ic-type-data);
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-settings__state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ic-pencil);
+  font: var(--ic-type-caption);
+}
+
+:where(.ic-root) .ic-settings__state[data-state='connected'],
+:where(.ic-root) .ic-settings__state[data-state='active'] {
+  color: var(--ic-ok);
+}
+
+:where(.ic-root) .ic-settings__state[data-state='failed'] {
+  color: var(--ic-critical);
+}
+
+:where(.ic-root) .ic-settings__state[data-state='needs_check'],
+:where(.ic-root) .ic-settings__state[data-state='no_key'],
+:where(.ic-root) .ic-settings__state[data-state='not_set_up'] {
+  color: var(--ic-warn);
+}
+
+:where(.ic-root) .ic-settings__state .ic-icon {
+  font-size: 16px;
+}
+
+/* Provider picker: a radiogroup. Selection is the operator's ink (film). */
+
+:where(.ic-root) .ic-settings__section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+:where(.ic-root) .ic-settings__heading {
+  color: var(--ic-pencil);
+  font: var(--ic-type-caption);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-settings__picker {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+:where(.ic-root) .ic-settings__group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+:where(.ic-root) .ic-settings__grouphead {
+  margin-bottom: 4px;
+  color: var(--ic-pencil);
+  font: var(--ic-type-caption);
+}
+
+:where(.ic-root) .ic-settings__row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: max(var(--ic-target, 32px), 48px);
+  padding: 6px 10px 6px 34px;
+  position: relative;
+  border: 1px solid transparent;
+  border-radius: var(--ic-r-control, 6px);
+  text-align: left;
+  transition: background-color var(--ic-t-quick) var(--ic-ease-out);
+}
+
+/* The radio mark: a ring, filled when checked. */
+:where(.ic-root) .ic-settings__row::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 10px;
+  width: 14px;
+  height: 14px;
+  margin-top: -7px;
+  border: 1.5px solid var(--ic-edge);
+  border-radius: 50%;
+}
+
+:where(.ic-root) .ic-settings__row:hover {
+  background: var(--ic-panel);
+}
+
+:where(.ic-root) .ic-settings__row[aria-checked='true'] {
+  border-color: var(--ic-hairline);
+  background: var(--ic-panel);
+}
+
+:where(.ic-root) .ic-settings__row[aria-checked='true']::before {
+  border-color: var(--ic-film);
+  background: radial-gradient(circle, var(--ic-film) 0 3.5px, transparent 4px);
+}
+
+:where(.ic-root) .ic-settings__rowmain {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+}
+
+:where(.ic-root) .ic-settings__rowlabel {
+  font: var(--ic-type-body-strong);
+}
+
+:where(.ic-root) .ic-settings__rownote {
+  color: var(--ic-pencil);
+  font: var(--ic-type-small);
+}
+
+/* A row whose note is only its host: hosts are mono. */
+:where(.ic-root) .ic-settings__rownote.ic-mono {
+  font: var(--ic-type-data);
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-settings__rowmeta {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+:where(.ic-root) .ic-settings__tag {
+  display: inline-block;
+  padding: 0 6px;
+  border: 1px solid var(--ic-graticule);
+  border-radius: var(--ic-r-chip, 4px);
+  color: var(--ic-pencil);
+  font: var(--ic-type-caption);
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-settings__rowstatus {
+  color: var(--ic-pencil);
+  font: var(--ic-type-caption);
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-settings__rowstatus[data-status='active'] {
+  color: var(--ic-film);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-settings__rowstatus[data-status='needs_check'] {
+  color: var(--ic-warn);
+}
+
+/* The selected provider's panel. */
+
+:where(.ic-root) .ic-settings__detail {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--ic-hairline);
+}
+
+:where(.ic-root) .ic-settings__detailhead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+
+:where(.ic-root) .ic-settings__detailtitle {
+  font: var(--ic-type-title);
+}
+
+:where(.ic-root) .ic-settings__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+:where(.ic-root) .ic-settings__label {
+  font: var(--ic-type-small);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-settings__input,
+:where(.ic-root) .ic-settings__select {
+  width: 100%;
+  min-height: var(--ic-target, 32px);
+  padding: 0 10px;
+  border: 1px solid var(--ic-edge);
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-slate);
+  color: var(--ic-film);
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-settings__input.ic-mono {
+  font: var(--ic-type-data);
+}
+
+:where(.ic-root) .ic-settings__input[readonly] {
+  border-style: dashed;
+  color: var(--ic-pencil);
+}
+
+:where(.ic-root) .ic-settings__input[aria-invalid='true'] {
+  border-color: var(--ic-critical);
+}
+
+:where(.ic-root) .ic-settings__keyrow {
+  display: flex;
+  gap: 8px;
+}
+
+:where(.ic-root) .ic-settings__keyrow .ic-settings__input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+:where(.ic-root) .ic-settings__text {
+  max-width: var(--ic-measure, 68ch);
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-settings__help,
+:where(.ic-root) .ic-settings__why,
+:where(.ic-root) .ic-settings__note {
+  max-width: var(--ic-measure, 68ch);
+  color: var(--ic-pencil);
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-settings__error {
+  color: var(--ic-critical);
+  font: var(--ic-type-small);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-settings__buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+:where(.ic-root) .ic-settings__show {
+  min-width: 64px;
+}
+
+:where(.ic-root) .ic-settings__confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-left: 4px solid var(--ic-critical);
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-panel);
+}
+
+:where(.ic-root) .ic-settings__disclosure {
+  align-self: flex-start;
+  padding-left: 6px;
+  border-color: transparent;
+  color: var(--ic-pencil);
+}
+
+:where(.ic-root)
+  .ic-settings__disclosure[aria-expanded='true']
+  :where(.ic-icon) {
+  transform: rotate(180deg);
+}
+
+:where(.ic-root) .ic-settings__advanced {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-left: 12px;
+  border-left: 2px solid var(--ic-hairline);
+}
+
+:where(.ic-root) .ic-settings__lan,
+:where(.ic-root) .ic-settings__caveat {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-left: 4px solid var(--ic-warn);
+  border-radius: var(--ic-r-control, 6px);
+  background:
+    linear-gradient(var(--ic-warn-tint), var(--ic-warn-tint)), var(--ic-panel);
+}
+
+:where(.ic-root) .ic-settings__warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-settings__warn .ic-icon {
+  color: var(--ic-warn);
+  font-size: 18px;
+}
+
+:where(.ic-root) .ic-settings__caveattitle {
+  font: var(--ic-type-body-strong);
+}
+
+:where(.ic-root) .ic-settings__check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: var(--ic-target, 32px);
+  font: var(--ic-type-small);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+:where(.ic-root) .ic-settings__check input {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--ic-film);
+}
+
+:where(.ic-root) .ic-settings__docs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+
+:where(.ic-root) .ic-settings__docslabel {
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-settings__docsurl {
+  flex: 1 1 12em;
+  min-width: 0;
+  color: var(--ic-pencil);
+  font: var(--ic-type-data);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+/* What the buttons said: above the sticky row, scrolling with the form so
+   the sticky part stays short at small heights. The view script sets the
+   scroll margin that keeps a revealed result clear of the sticky row. */
+:where(.ic-root) .ic-settings__outcome {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  scroll-margin-bottom: 120px;
+}
+
+:where(.ic-root) .ic-settings__outcome:not(:has(> :not([hidden]))) {
+  display: none;
+}
+
+/* Only the button row stays reachable at the foot of the sheet. */
+:where(.ic-root) .ic-settings__actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 calc(-1 * var(--ic-col-inset, 24px));
+  padding: 12px var(--ic-col-inset, 24px) 16px;
+  border-top: 1px solid var(--ic-hairline);
+  background: var(--ic-raised);
+}
+
+:where(.ic-root .ic-settings__actions) .ic-btn[data-variant='primary'] {
+  margin-left: auto;
+}
+
+:where(.ic-root .ic-settings) .ic-btn[aria-disabled='true'] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+:where(.ic-root) .ic-settings__result {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 8px 12px;
+  border-left: 4px solid var(--ic-edge);
+  border-radius: var(--ic-r-control, 6px);
+  background: var(--ic-panel);
+}
+
+:where(.ic-root) .ic-settings__result[data-tone='ok'] {
+  border-left-color: var(--ic-ok);
+}
+
+:where(.ic-root) .ic-settings__result[data-tone='warn'] {
+  border-left-color: var(--ic-warn);
+}
+
+:where(.ic-root) .ic-settings__result[data-tone='critical'] {
+  border-left-color: var(--ic-critical);
+}
+
+:where(.ic-root) .ic-settings__resulttext {
+  flex: 1 1 100%;
+  font: var(--ic-type-small);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-settings__code {
+  color: var(--ic-pencil);
+  font: var(--ic-type-data);
+}
+
+:where(.ic-root) .ic-settings__full {
+  align-self: flex-start;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :where(.ic-root)
+    .ic-settings__disclosure[aria-expanded='true']
+    :where(.ic-icon) {
+    transform: none;
+  }
+}
+
+@media (forced-colors: active) {
+  :where(.ic-root) .ic-settings,
+  :where(.ic-root) .ic-settings__result,
+  :where(.ic-root) .ic-settings__caveat,
+  :where(.ic-root) .ic-settings__lan {
+    border: 1px solid CanvasText;
+  }
+
+  :where(.ic-root) .ic-settings__row[aria-checked='true'] {
+    border-color: Highlight;
+  }
+}
+
+/* The analyst's unavailable panel: its settings action, Check again and
+   "Use an API key instead" in one wrapping row (BYOK spec §10). */
+:where(.ic-root) .ic-unavailable__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}

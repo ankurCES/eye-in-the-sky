@@ -17,6 +17,7 @@
  * prefers-reduced-motion, prefers-contrast, forced-colors.
  */
 @import './reset.css';
+@import './settings/settings.css';
 @import './orb/orb.css';
 @import './chat/chat.css';
 @import './panels.css';
@@ -738,6 +739,12 @@
 
 .ic-popover__body {
   font: var(--ic-type-small);
+}
+
+.ic-popover__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .ic-popover__hint {

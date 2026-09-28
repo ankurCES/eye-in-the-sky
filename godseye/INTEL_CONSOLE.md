@@ -2,8 +2,9 @@
 
 This is the reference for the Eye in the Sky app: the single-process host, its HTTP and SSE contract,
 the analyst's approval policy, and the data-honesty rules the console follows. Everything here was
-checked against the code: `mcp/godseye_uav/{host,app,chat,analyst_policy,analyst_toolbelt,intel_graph}.py`
-and `gods-eye-view/src/console/`. Where this file and the code disagree, the code wins.
+checked against the code: `host.py`, `app.py`, `chat.py`, `analyst_policy.py`, `analyst_toolbelt.py`,
+`intel_graph.py`, `llm_settings.py` and `llm_providers.py` in `mcp/godseye_uav/`, and
+`gods-eye-view/src/console/`. Where this file and the code disagree, the code wins.
 
 **ISR-only.** The analyst observes, classifies and reports. Nothing it can call is kinetic, and threat
 output is sensor-posture advice only. Every action that moves an aircraft, tasks a sensor or changes
@@ -21,6 +22,8 @@ the sim waits for the operator.
 - [Tracking handoff](#tracking-handoff)
 - [The analyst's toolbelt](#the-analysts-toolbelt)
 - [Analyst sign-in and Anthropic's policy](#analyst-sign-in-and-anthropics-policy)
+- [Analyst providers and keys](#analyst-providers-and-keys)
+- [Settings routes](#settings-routes)
 - [Environment variables](#environment-variables)
 - [Where things are written](#where-things-are-written)
 - [Observed cost](#observed-cost)
@@ -39,7 +42,10 @@ The app opens on an intelligence console, not a map:
 - a **situation rail**: theater, sim status, fleet fuel against BINGO, running missions, alarms and
   data caveats;
 - an **entity inspector** with measured and assumed values marked, related entities and actions
-  (Ask about this, Focus, Track, Abort).
+  (Ask about this, Focus, Track, Abort);
+- **analyst settings** (⌘, or Ctrl+, or "Analyst settings…" in the analyst's menu): which model
+  provider the analyst uses, its model and its key. The analyst's header names the model and the
+  provider ("claude-opus-5 via Claude login (this Mac)").
 
 The Cesium map from God's Eye View (GEV) appears only in **tracking mode**, following one drone in the
 cockpit view. `?console=off` on the page URL skips the console and loads the plain GEV map
@@ -53,19 +59,20 @@ application, first-run launcher included (`gods-eye-view/src/main.js`).
  │ 127.0.0.1:8780  (start.sh: 127.0.0.1:8790, and the same app again on :8791)                      │
  │                                                                                                   │
  │  /                 built console UI (gods-eye-view/dist), window.__GODSEYE__ injected            │
- │  /app/config       /intel/*   /chat/*          host routers, added outside create_app            │
+ │  /app/config  /intel/*  /chat/*  /settings/llm*    host routers, added outside create_app        │
  │  /mcp              GodseyeUavServer, Streamable HTTP + bearer       <── external MCP harnesses   │
  │  /health /snapshot /mission-overlay /theaters /events /tracks /control/* /camera/*   bridge      │
  │  /api/*            404 {"error":"not_available_in_app_host"}                                      │
  │                                                                                                   │
  │  IntelService ── reads app.state.godseye (bridge caches) + the server object, never over HTTP    │
+ │  LlmSettings  ── the analyst's provider, its key (Keychain or 0600 file), the CLI's env          │
  │  ChatService  ── one actor task per chat session ── ClaudeSDKClient ──┐                          │
  │                  in-process SDK MCP server "godseye" (the toolbelt)   │ stdin/stdout              │
  │                  └─ server.mcp.call_tool(...) on the same loop        │                          │
  │  bridge mission feed ── polls /mcp over loopback HTTP (same port)     │                          │
  └────────────┬──────────────────────────────────────────────────────────┼──────────────────────────┘
               │ msgpack-rpc, loopback only                                ▼
-      FakeAirSim (in-process threads)                        claude CLI child process ──► Anthropic API
+      FakeAirSim (in-process threads)                        claude CLI child process ──► the chosen provider
       or a real AirSim with --real
 ```
 
@@ -79,8 +86,8 @@ application, first-run launcher included (`gods-eye-view/src/main.js`).
 - The fake sim is patched to bind loopback only, and the host refuses to start if it cannot verify
   that.
 - Two hosts cannot share a store: the store directory is locked (`<store>/.host.lock`).
-- If `intel_graph` or `chat` fails to load or start, the host still boots and answers that module's
-  routes with 503 (see below).
+- If `intel_graph`, `chat` or `llm_settings` fails to load or start, the host still boots and answers
+  that module's routes with 503 (see below).
 
 ## HTTP contract
 
@@ -91,11 +98,11 @@ that fails validation gets FastAPI's standard 422 (`{"detail": [...]}`).
 | Route | Auth | Response |
 |---|---|---|
 | `GET /` and `GET /index.html` | none | The built UI with `<script>window.__GODSEYE__={"bridgeUrl":"","token":"…"}</script>` inserted before the first module script. Sent with `no-store`, `X-Frame-Options: DENY`, `Content-Security-Policy: frame-ancestors 'none'` and `Cross-Origin-Resource-Policy: same-origin`; CORS headers are stripped. If the UI is not built, a page that says how to build it. |
-| `GET /app/config` | none | `{app:"eye-in-the-sky", version, theater:{id,label}, chat:{available, model, reason?}, mcp_path:"/mcp", ui:"built"\|"missing"}`. Never the token. |
+| `GET /app/config` | none | `{app:"eye-in-the-sky", version, theater:{id,label}, chat:{available, model, reason?, provider?:{id,label}}, mcp_path:"/mcp", ui:"built"\|"missing"}`. Never the token, and never the provider's host, base URL or key state (this route has no auth). |
 | `GET /intel/graph?scope=theater\|all` | bearer | The intel graph (below). Bad scope: 422 `{error:"invalid_scope", scope, allowed}`. |
 | `GET /intel/entity/{id}` | bearer | `{id, type, label, subtitle, status, requested_id?, fields, provenance, related:[{id,type,label,kind,dir}], related_omitted?, caveats, raw?}`, at most 60,000 bytes. Accepts a collapsed duplicate's id or a bare id. Unknown: 404 `{error:"unknown_entity", id}`. |
 | `GET /intel/events/recent?limit=50` | bearer | `{events:[alarm payload + seq]}`, limit clamped to 1–100. |
-| `GET /chat/status` | bearer | `{available, model, reason?:"disabled"\|"sdk_missing"\|"cli_missing", hint?, effort?}` |
+| `GET /chat/status` | bearer | `{available, model, reason?, hint?, effort?, provider:{id, label, kind, model_family, host, key_source, configured}, cost_basis:"anthropic_list"\|"unreliable", settings_rev}`. Never reads a key and never carries one. `reason` is `disabled`, `sdk_missing` or `cli_missing` (the analyst can't run at all), or a provider reason (below). |
 | `POST /chat/sessions` | bearer | `{session_id}`. The CLI is not started until the first message. With 8 sessions open, the least recently active idle one is closed; if none is idle, 409 `{error:"busy", message}`. |
 | `POST /chat/sessions/{sid}/messages` | bearer | Body `{text (1–8000 chars), context?:{focused_ids:[graph id]}}` → 202 `{turn_id}`. 404 `{error:"unknown_session", session_id}`; 409 `{error:"busy", turn_id}` while a turn runs; 503 `{error:"unavailable", reason, hint?}`; 422 `{error:"invalid", message}`. Up to 20 valid `focused_ids` are prefixed to the prompt as `[[id]]` references. |
 | `GET /chat/sessions/{sid}/stream` | bearer or `?token=` | `text/event-stream` (next section). Resume with the `Last-Event-ID` header or `?last_event_id=`. 404 for an unknown session. |
@@ -104,13 +111,34 @@ that fails validation gets FastAPI's standard 422 (`{"detail": [...]}`).
 | `DELETE /chat/sessions/{sid}/grants/{tool}` | bearer | `{ok:true}`; idempotent for a known session, 404 `unknown_session` otherwise. |
 | `POST /chat/sessions/{sid}/interrupt` | bearer | `{ok:true}`. Pending approvals resolve as `cancelled`. 404 for an unknown session. |
 | `DELETE /chat/sessions/{sid}` | bearer | `{ok:true}`. Stops the session's CLI. 404 for an unknown session. |
+| `GET /settings/llm`, `PUT /settings/llm`, `POST /settings/llm/test`, `DELETE /settings/llm/providers/{id}/key` | bearer, header only | The analyst's model-provider settings; see [Settings routes](#settings-routes). Same origin only; a key goes in and never comes back out. |
 | `/mcp` | bearer | The godseye MCP server (46 tools, 8 resources; see `TOOL_CONTRACT.md`). A 401 names `http://127.0.0.1:<port>/.well-known/oauth-protected-resource` as its resource metadata; that address is not served (404). |
 | `/api/{path}` | none | 404 `{error:"not_available_in_app_host"}`: GEV's node-only providers exist only under its vite dev server. |
 
 When a module could not be loaded: `/intel/*` answers 503 `{error:"intel_unavailable"}`;
 `GET /chat/status` answers `{available:false, reason:"sdk_missing"|"error", hint, model}` and the
-other `/chat/*` routes 503 `{error:"chat_unavailable"}`. The bridge routes are unchanged; see
-`BRIDGE_CONTRACT.md`. The chat never uses `/control/*`.
+other `/chat/*` routes 503 `{error:"chat_unavailable"}`. If `llm_settings` fails to load or its
+routes can't be built, `/settings/*` answers 503 `{error:"settings_unavailable"}` and the analyst
+runs on the Claude login. The bridge routes are unchanged; see `BRIDGE_CONTRACT.md`. The chat never
+uses `/control/*`.
+
+**`/chat/status` and the provider** (when the settings module loaded):
+
+- `provider.key_source` is `login`, `environment`, `keychain`, `file`, `memory`, `cloud` (the cloud
+  credential chain) or `none`. `provider.host` is where requests go (`api.anthropic.com` for the
+  Claude login and an Anthropic key, the endpoint's host for a URL provider, the regional Bedrock,
+  Vertex or Foundry host).
+- The provider reasons make `available` false with the hint "Open analyst settings.":
+  `provider_not_configured`, `provider_key_missing`, `settings_error`, and `provider_auth` (the
+  provider rejected the key; its hint is "Open analyst settings to replace the key.", and it clears
+  when the settings change or a later turn on the same settings succeeds).
+- A provider reason does not block `POST …/messages`; only `disabled`, `sdk_missing` and
+  `cli_missing` answer 503 there. With `provider_not_configured`, `provider_key_missing` or
+  `settings_error` the turn starts, no CLI is spawned, and it ends with an `error` event whose `code`
+  is `config`. With `provider_auth` the turn runs, so the provider can take the key after all.
+- `model` is the active provider's model; `--model` and `GODSEYE_CHAT_MODEL` apply only to the two
+  Claude-from-Anthropic kinds, and `effort` is shown only for the Claude kinds (login, API key,
+  Bedrock, Vertex, Foundry).
 
 ### The intel graph
 
@@ -164,7 +192,8 @@ events per session are kept for replay.
 
 | Event | Data |
 |---|---|
-| `session` | `{session_id, model, available, last_seq, history_truncated}`; always first, with no `id:` line |
+| `session` | `{session_id, model, available, provider:{id,label}, last_seq, history_truncated}`; always first, with no `id:` line |
+| `provider_changed` | `{from:{id,label,model}, to:{id,label,model}, memory:"kept"\|"cleared", at_ms}`; just before `turn_start`, when the provider or its settings changed since this session's last turn |
 | `turn_start` | `{turn_id, text}` |
 | `text_delta` | `{turn_id, text}` |
 | `thinking` | `{turn_id, text}` (summarized thinking) |
@@ -173,9 +202,9 @@ events per session are kept for replay.
 | `approval_resolved` | `{approval_id, call_id, decision:"approved"\|"denied"\|"expired"\|"cancelled", tool, scope:"once"\|"session", note?}` |
 | `tool_result` | `{call_id, ok, outcome:"ok"\|"rejected"\|"error"\|"busy"\|"not_run", rejected?, error?, busy_with?:{task_id?, mission_id?, tool?}, summary, bytes, truncated, entities:[graph id]}` |
 | `ui` | `{action:"focus", ids, note?}`, `{action:"track", vehicle, reason}`, `{action:"orb"}` or `{action:"inspect", id}` |
-| `usage` | `{turn_id, cost_usd?, session_cost_usd?, input_tokens?, output_tokens?, rate_limit?:{status, resets_at, type}}` |
+| `usage` | `{turn_id, cost_usd?, session_cost_usd?, cost_basis?, input_tokens?, output_tokens?, rate_limit?:{status, resets_at, type}}`; the end-of-turn event carries `cost_basis` (`anthropic_list` or `unreliable`; with `unreliable` the two cost fields are left out), and an event sent when the CLI reports a rate limit carries only `turn_id` and `rate_limit` |
 | `turn_end` | `{turn_id, stop:"end"\|"interrupted"\|"error"\|"max_turns", error?}` |
-| `error` | `{message, hint?, retryable}` |
+| `error` | `{message, hint?, retryable, code, provider:{id,label}}`; `code` is `auth`, `billing`, `model`, `rate_limit`, `invalid_request`, `server`, `network`, `config` or `unknown` |
 
 Details that matter to a client:
 
@@ -191,6 +220,21 @@ Details that matter to a client:
 - `input_tokens` includes cache reads and writes. `cost_usd` is per turn (the CLI reports a running
   total per process; the service takes the difference).
 - `rate_limit` appears when the CLI reports one (a Claude subscription login does).
+- `cost_basis: "unreliable"` is every provider except the Claude kinds (login, API key, Bedrock,
+  Vertex, Foundry): the CLI prices a model it doesn't know from its own table, so the dollars would be
+  invented. The console says the provider bills you directly.
+- Errors from a provider other than the Claude login are worded per `code` and name the provider
+  ("OpenRouter rejected the key." with the hint "Open analyst settings to replace the key."); the
+  Claude login keeps its sign-in wording and hint. The HTTP status the CLI reports decides the code
+  first, then the CLI's error label, then the error text.
+- `provider_changed.memory` is `kept` when only the model or key changed and `cleared` when the
+  provider, endpoint or account changed: the conversation does not resume across providers. It is
+  sent only once the session has run a turn, and a running turn is never interrupted by a change.
+- Every event is redacted before it is stored or sent: a known key, or any run of 12 of its
+  characters, becomes `[redacted key]`. While a key is known, streamed `text_delta` and `thinking` hold back
+  their last 11 characters until the next delta or the end of the block, so a key split across two
+  deltas is still caught. If redaction fired during a turn, the CLI is stopped and that session's
+  transcript is rewritten without the key before the next turn resumes from it.
 - The stop reason is `max_turns` after 40 model turns in one message.
 - Entity references in assistant text use `[[type:id|label]]` or `[[type:id]]` with the ten graph
   prefixes (`veh msn trk unit ob rpt thr poi alarm feed`). The console renders them as chips.
@@ -328,8 +372,10 @@ Every `approval_request` renders as an order slip inline in the transcript
   `{"_truncated":true,"_omitted":N,"_note":…}` and the result carries a top-level `_truncated`.
 - The CLI runs with no built-in tools (`tools=[]`), no settings files (`setting_sources=[]`), only
   this MCP server (`strict_mcp_config`), `verbatim_prompts=True` (so `@path` and `/command` in chat
-  text are plain text), permission mode `default`, adaptive thinking with summarized display, and
-  `cwd=<store>/analyst`.
+  text are plain text), permission mode `default`, and `cwd=<store>/analyst`. Only the model,
+  thinking, effort and the child environment depend on the provider (`chat.provider_options`):
+  thinking is adaptive with summarized display unless the provider's setting or its full check turned
+  it off.
 - The system prompt is `mcp/godseye_uav/analyst_prompt.md` (package data), distilled from the
   `godseye-uav` skill: ISR-only identity, task → plan → dry-run → execute → monitor → report, server
   gates win, measured versus assumed, SALUTE and INTREP, and the console's approval and chip rules.
@@ -341,47 +387,188 @@ Every `approval_request` renders as an order slip inline in the transcript
 The analyst needs the `app` extra (`pip install -e './godseye[app]'`), which installs
 `claude-agent-sdk`. It runs the Claude Code CLI that the SDK bundles (0.2.160 bundles CLI 2.1.283),
 or `Contents/Helpers/claude` inside the desktop app. Without the SDK, `/chat/status` says
-`sdk_missing`; with `--no-chat`, `disabled`; without a CLI, `cli_missing`. The app does not pass
-credentials to the CLI; the CLI inherits the app's environment after `app.sanitize_env`:
+`sdk_missing`; with `--no-chat`, `disabled`; without a CLI, `cli_missing`.
+
+Which model provider the analyst uses is chosen in the console: **Analyst settings…** in the
+analyst's menu, or ⌘, (Ctrl+, off macOS). The default is the Claude login. The CLI never picks up a
+credential from the app's environment by itself: at launch, right after `app.sanitize_env`,
+`app.capture_llm_env` takes every provider, credential and model variable out of the process
+environment, and each CLI is started with an environment built for the active provider (see
+[Analyst providers and keys](#analyst-providers-and-keys)).
 
 - **Your own Claude login, on your own machine.** Sign in once with `claude` then `/login` (Claude
   Code on your PATH, or the SDK's bundled binary at `claude_agent_sdk/_bundled/claude`); on macOS the
-  CLI stores the login in the keychain. This is how the analyst was run and tested here, with
-  no API key. It uses your plan's usage limits, and the console shows the limit warnings the CLI
-  reports.
-- **`ANTHROPIC_API_KEY`.** If it is set in the app's environment, the CLI uses it; Anthropic's
-  authentication docs rank an API key above the `/login` subscription.
+  CLI stores the login in the keychain. This is how the analyst was run and tested here. It uses
+  your plan's usage limits, and the console shows the limit warnings the CLI reports. The settings
+  sheet's note says it is for your own local use only.
+- **An Anthropic API key** ("Anthropic API key" in settings) is the supported way to run the analyst
+  with your own Anthropic account. Paste it in settings, or set `ANTHROPIC_API_KEY` when you launch
+  the app. A launch key selects that provider unless another one was put in use in settings, and it
+  can't be changed or removed in settings.
 - **Anything you give to other people must use API-key authentication.** Anthropic's Agent SDK
   documentation says that, unless previously approved, third-party developers may not offer
   claude.ai login or its rate limits for products built on the SDK, and should use API-key
   authentication instead. A build distributed to anyone else must have its user supply their own
-  `ANTHROPIC_API_KEY` (or a cloud provider the CLI supports), not a Claude login. The SDK's own
-  package metadata also states that its use is governed by Anthropic's Commercial Terms of Service
-  (see `THIRD_PARTY_NOTICES.md`).
-- There is no in-app key entry today. A key comes from the environment only. A Finder launch of the
-  `.app` does not see variables from your shell profile; to pass one, start the binary from a terminal
-  (`"dist/Eye in the Sky.app/Contents/MacOS/EyeInTheSky"`).
-- `ANTHROPIC_BASE_URL` is kept unless the app was launched from inside a Claude Code session. Do not
-  set it without a key for that endpoint: this project's provider research observed the CLI sending
-  the Claude login's token to a base URL that had no key configured.
-- Sign-in failures surface as an `error` event with the hint "Sign in with the claude CLI (`claude`
-  then /login) or set ANTHROPIC_API_KEY".
+  Anthropic API key (or a cloud provider), not a Claude login. The SDK's own package metadata also
+  states that its use is governed by Anthropic's Commercial Terms of Service (see
+  `THIRD_PARTY_NOTICES.md`).
+- **`ANTHROPIC_BASE_URL` at launch** counts only together with `ANTHROPIC_AUTH_TOKEN` (Bearer) or
+  `ANTHROPIC_API_KEY` (x-api-key): the pair becomes the custom endpoint's URL and key, read-only in
+  settings, and selects it unless another provider was put in use in settings. A base URL without a
+  key is ignored with a warning, because the CLI would send the Claude login's token to that host.
+  When the app is launched from inside a Claude Code session, `sanitize_env` drops that session's
+  base URL first.
+- A Finder launch of the `.app` does not see variables from your shell profile. Keys entered in
+  settings don't need the environment; to pass a launch variable to the packaged app, start
+  `"dist/Eye in the Sky.app/Contents/MacOS/EyeInTheSky"` from a terminal.
+- On the Claude login, a sign-in failure surfaces as an `error` event ("The analyst could not sign in
+  to Claude.") with `code:"auth"` and the hint "Sign in with the claude CLI (`claude` then /login)
+  or set ANTHROPIC_API_KEY". Other providers get the wording in
+  [Chat stream (SSE)](#chat-stream-sse).
+
+## Analyst providers and keys
+
+The provider catalog is `mcp/godseye_uav/llm_providers.py`: data only, each fact with its source, and
+anything not confirmed by the provider's documentation or this project's offline runs marked
+"Unverified:" in the notes the settings sheet shows. The repository `README.md` ("Analyst
+providers") lists the 15 providers and what each needs. `llm_settings.py` holds the mechanics:
+
+- **Kinds.** `anthropic_login` (the default) and `anthropic_key` (Claude from Anthropic); `bedrock`,
+  `vertex` and `foundry` (Claude on your cloud, through the CLI's own switches);
+  `anthropic_compatible` (a provider's Anthropic Messages endpoint: OpenRouter, MiniMax, DeepSeek,
+  Moonshot, Z.ai, Zhipu, Alibaba Model Studio, Ollama, LM Studio); and `custom` (any
+  Anthropic-compatible URL). The Claude kinds take `effort` and are priced
+  (`cost_basis:"anthropic_list"`); the other two are `unreliable`.
+- **The CLI's environment** is built in one place, `llm_settings.build_child_env`. The SDK can set a
+  child variable but not unset one, so every build first writes `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN` and every `CLAUDE_CODE_USE_*` provider switch the bundled CLI reads as
+  blank. The Claude login adds nothing else (only a launch `CLAUDE_CODE_OAUTH_TOKEN` or
+  `CLAUDE_CONFIG_DIR`, if one was set). Every other kind adds its credential, base URL or cloud
+  switch and fields, and the model pins, then a hardening set
+  (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `DISABLE_TELEMETRY=1`, `DISABLE_ERROR_REPORTING=1`,
+  `CLAUDE_CODE_DISABLE_FAST_MODE=1`, `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1`,
+  `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`, `CLAUDE_CODE_ATTRIBUTION_HEADER=0`,
+  `CLAUDE_CODE_MAX_RETRIES=2`) and its own `CLAUDE_CONFIG_DIR=<store>/analyst/claude-home`, so it
+  never sees the Claude login. A kind that needs a key is not started without one
+  (`provider_key_missing`): given a base URL and no key, the CLI sends the Claude login's token to
+  that URL. The key reaches the CLI through its environment only, never its command line.
+- **Where the data goes.** The analyst's messages, the intel picture it reads and every tool result
+  go to the active provider's host: `provider.host` in `/chat/status`, "Requests go to …" in the
+  sheet. In this project's offline tests, the CLI of a non-login provider, behind a deny-all proxy,
+  made no connection other than to its endpoint, including over a 200-second idle.
+- **Extended thinking** is adaptive (summarized) unless it is set to Off, the catalog turns it off
+  (Alibaba Model Studio), or, for providers marked `auto`, a full check saw the provider reject it
+  for that model; the check then turns it off and says so.
+- **Checks.** "Test connection" runs the quick check where the provider has one: one direct HTTP
+  request (the models list for an Anthropic key, the key-info route for OpenRouter, otherwise a
+  one-token message, which the sheet marks as billable), 20 s timeout, redirects refused. The Claude
+  login and the cloud kinds have no quick check. "Run a full check" runs one tiny turn through the
+  analyst's own engine (the bundled CLI with the analyst's option builder, a check prompt and one
+  dummy tool, in `<store>/analyst/claude-check`, 45 s). For a URL provider it first sends one POST to
+  `{base}/v1/messages` that never follows a redirect: a 3xx fails the check with code `redirect`,
+  because the CLI would follow it and re-send an `x-api-key` header to the new host. The same probe
+  runs before the analyst starts a CLI for a URL provider, and a redirect refuses the turn with
+  `code:"config"`. A passing full check returns a one-use `check_token`, valid for 10 minutes and
+  bound to that config and key.
+- **Use and Save.** "Use {provider}" puts a provider in use. It needs a ready config, a `check_token`
+  for exactly that config and key (except the Claude login) and, for a model that isn't Claude, the
+  acknowledgement "I understand; use it anyway". Save stores edits without switching providers,
+  except that a change to the provider in use (endpoint, model, family or key) needs the same check
+  and acknowledgement (the sheet runs the check for you; the host answers 409 without it). The
+  acknowledgement is recorded only with a model that needs it, so one sent while a Claude model was
+  selected doesn't cover a later non-Claude one. A provider in use whose stored acknowledgement
+  doesn't cover its current model family is not started.
+- **Switching** applies from the next message; a running turn finishes on the provider it started
+  with. A new provider, endpoint or account field starts a fresh CLI conversation
+  (`provider_changed` with `memory:"cleared"`); a new model or key keeps it (`memory:"kept"`).
+- **Models that aren't Claude.** Anthropic doesn't support routing Claude Code to non-Claude models
+  through any gateway, and the analyst is built and tested with Claude. The sheet says so on every
+  such provider. The approval policy doesn't depend on the model: every command, sensor tasking and
+  sim change still waits for the operator's order slip.
+- **Keys are write-only.** No route returns a key; the sheet shows "Saved key ending in" and the
+  last four characters. Where a key is kept:
+  - on macOS, your default (login) Keychain: a generic password with service `eye-in-the-sky.llm`,
+    account `<scope>:<provider id>` (a random scope per settings file) and label "Eye in the Sky LLM
+    key", written through `security -i` with the key hex-encoded on stdin, never on a command line,
+    and read back to confirm;
+  - otherwise, or if the Keychain write fails, or with `GODSEYE_LLM_SECRET_STORE=file`, or for a
+    store under a temporary directory: `llm-secrets.json` beside the store, mode 0600;
+  - with `GODSEYE_LLM_SECRET_STORE=memory`: in memory, for that run only.
+
+  A save deletes the provider's key from every other store, and "Remove key" deletes it from all of
+  them (500 `key_store_failed` if a copy can't be removed). A key from the launch environment is
+  used for that run only and never stored. Every settings, status and chat answer, every SSE event
+  and the `godseye_uav` and `claude_agent_sdk` log lines pass through a redactor that knows every
+  key the process holds.
+
+## Settings routes
+
+`llm_settings.llm_settings_router`, mounted before `/api/*` and the static UI, wrapped in
+`SettingsGuardMiddleware`. Every answer is `Cache-Control: no-store` and passes through the key
+redactor.
+
+- **Auth**: `Authorization: Bearer <token>` only. A `token` query parameter is refused (400
+  `token_in_url`), because a URL ends up in logs and history.
+- **Same origin only**: an `Origin` other than `http://127.0.0.1:<port>`, `http://localhost:<port>`
+  or `http://[::1]:<port>` (the app's own port), or a `Sec-Fetch-Site` other than `same-origin` or
+  `none`, gets 403 `cross_origin`. No `Access-Control-*` header is ever sent, so a cross-origin
+  preflight fails. The console served by vite's dev server is cross-origin and can't use the sheet.
+- **Bodies**: `POST` and `PUT` need `Content-Type: application/json` (415 `json_required`) and at
+  most 64 KiB (413 `too_large`).
+- **Writes** need `If-Match: <rev>`, the `rev` from the last read (428 `if_match_required` without
+  it, 409 `settings_conflict` with the current `rev` if it changed). A settings file written by a
+  newer version is read-only (`read_only:true`, 409 `read_only` on a write).
+
+| Route | Body | Answer |
+|---|---|---|
+| `GET /settings/llm` | – | `{schema:"eye-in-the-sky.llm-settings/1", rev, active, read_only, notice, locks:{provider, provider_env, model, model_source}, key_store:{kind, label, path}, providers:[…]}` |
+| `PUT /settings/llm` | `{provider, model?, small_model?, base_url?, fields?, auth_scheme?, thinking?:"auto"\|"adaptive"\|"off", model_family? (custom only), allow_insecure_http?, key?:{action:"keep"\|"set"\|"clear", value?}, activate?, check_token?, acknowledge_non_claude?}` | The `GET` view. Everything is validated before anything is stored. |
+| `DELETE /settings/llm/providers/{id}/key` | – | The `GET` view; the key is deleted from every store and the provider's test record is cleared. |
+| `POST /settings/llm/test` | `{provider, depth:"quick"\|"full", key?, …the PUT config fields}` | `{ok, depth, host, status, code, message, hint, retryable, latency_ms, checked_at_ms, thinking, thinking_detected, check_token, model}`. Never writes settings. |
+
+Each entry in `providers` carries: `id, label, kind, group, model_family, claude_prefixes,
+base_url:{value, default, editable, required, presets, env}` (URL kinds only), `host, model,
+small_model, small_model_effective, thinking, thinking_effective, models:{default, small_default,
+suggestions, placeholder}, fields, values, auth:{scheme, schemes, key_label, key_optional,
+key_needed}, auth_scheme, allow_insecure_http, ack_non_claude_at_ms, needs_ack,
+key:{configured, source, masked, env}, status, ready, reason, tested:{depth, ok, at_ms,
+thinking_detected, code?, current}, notes, docs_url, docs, quick_check, quick_check_billable,
+cost_basis, effort, locked:{model, base_url, key}`. `key.masked` is "…" plus the last four
+characters, never more. `status` is `active` (in use and ready), `ready`, `key_saved`,
+`needs_check`, `not_configured` or `from_environment`.
+
+**Base URL rules** (`validate_base_url`): https anywhere; http only for a loopback address, or for a
+private network address (RFC 1918 or ULA) with `allow_insecure_http:true`; no user name, password,
+query or fragment; no link-local or unspecified address; never the app's own address; the URL is
+the API root, and the analyst adds `/v1/messages`. A provider with a fixed endpoint accepts only its
+listed endpoints.
+
+**Test results**: `code` is one of the `error.code` values, or `redirect`, `malformed` (the endpoint
+didn't answer like an Anthropic Messages API) or `endpoint` (nothing at `{base}/v1/messages`). One
+test runs at a time and full checks are at least 10 s apart (429 `test_busy`, with `retry_after_s`
+for the cooldown).
+
+Other refusals: 422 `invalid_settings` `{field, message}`; 404 `unknown_provider` or `not_found`;
+409 `locked_by_environment` `{field, env}` for a provider, model or key set at launch; 409
+`needs_check` or `needs_ack` (above); 500 `key_store_failed`; 503 `settings_unavailable`.
 
 ## Environment variables
 
 | Variable | Read by | Meaning |
 |---|---|---|
 | `GODSEYE_TOKEN` | `app.py` | API and MCP bearer token. `--token` wins; otherwise a random token per launch. Removed from the process environment before anything is spawned, and never printed. `start.sh` passes its `TOKEN` this way. |
-| `GODSEYE_CHAT_MODEL` | `chat.py` | Analyst model. `--model` wins; default `claude-opus-5`. |
-| `GODSEYE_CHAT_EFFORT` | `chat.py` | `low`, `medium`, `high`, `xhigh` or `max`. `--effort` wins; an unknown value is ignored with a warning; unset means the model's default. |
+| `GODSEYE_CHAT_MODEL` | `chat.py`, `llm_settings.py` | Analyst model for the Claude login and an Anthropic API key. `--model` wins; default `claude-opus-5`. Either one locks that model in settings; other providers use the model chosen there. |
+| `GODSEYE_CHAT_EFFORT` | `chat.py` | `low`, `medium`, `high`, `xhigh` or `max`. `--effort` wins; an unknown value is ignored with a warning; unset means the model's default. Passed only to the Claude kinds (login, API key, Bedrock, Vertex, Foundry). |
+| `GODSEYE_LLM_PROVIDER` | `llm_settings.py` | A provider id from the catalog. Puts that provider in use for this launch and locks the choice in settings. An unknown id is ignored with a warning. |
+| `GODSEYE_LLM_SECRET_STORE` | `llm_settings.py` | Where keys entered in settings are kept: `keychain`, `file` (`llm-secrets.json`, 0600) or `memory` (this run only). Unset: the Keychain on macOS, the file elsewhere, and the file for a store under a temporary directory (`/tmp`, `/var/folders`, `$TMPDIR`) unless this says `keychain`. Dev and test runs should use `file` so they never touch the login Keychain. |
 | `GODSEYE_UI_DIR` | `host.py` | Built UI directory. `--ui-dir` wins; default `gods-eye-view/dist`, or `ui/` inside the frozen app. |
 | `GODSEYE_AIRSIM_PYTHONCLIENT` | `app.py`, scripts | Location of the AirSim PythonClient; otherwise `../airsim/PythonClient`, then `godseye/.godseye/vendor/airsim/PythonClient`. |
 | `GODSEYE_BRIDGE_CORS_ORIGINS` | `bridge.py` | Comma- or space-separated CORS origins, or `*`. Default: ports 4173, 5173 and 5199 on localhost and 127.0.0.1. The token pages never get CORS headers. |
 | `GODSEYE_REAL_DATA` | `server.py` | Real-data layer switch (`1/true/yes/on/enable(d)` or `0/false/no/off/disable(d)`); unset is off. Any other value is an error at startup. |
 | `GODSEYE_GEV_ORIGIN` | `realdata.py` | Where the real-data layer finds GEV's `/api` providers; default `http://localhost:5199`. GEV's vite dev server listens on 4173 by default (and `start.sh` uses `UI_PORT`, 4173), so set `GODSEYE_GEV_ORIGIN=http://localhost:4173` to use it. |
 | `GODSEYE_AIRFRAME` | `safety.py` | Fuel-model airframe profile. |
-| `ANTHROPIC_API_KEY` | the CLI | Used by the analyst when set (above). |
-| `CLAUDE_CODE_USE_BEDROCK`, `…_VERTEX`, `…_FOUNDRY`, `AWS_*`, `GOOGLE_*` | the CLI | Kept by `sanitize_env` for provider selection; not exercised by this project's tests. |
+| Provider, credential and model variables | `app.py`, `llm_settings.py` | Taken out of the process environment at launch (`app.LLM_ENV_VARS`, the same list as `llm_settings.CAPTURED_VARS`), so the CLI never inherits them: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_MODEL` and the `ANTHROPIC_DEFAULT_*_MODEL` / `ANTHROPIC_SMALL_FAST_MODEL` pins, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, every `CLAUDE_CODE_USE_*` switch, the Bedrock, Vertex, Foundry, AWS-hosted and Google Cloud base URLs and keys, `OPENROUTER_API_KEY`, `MINIMAX_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `ZAI_API_KEY`, `ZHIPU_API_KEY`, `DASHSCOPE_API_KEY`, `OLLAMA_API_KEY` and `GODSEYE_LLM_PROVIDER`. The settings read them once: a provider's key variable supplies that provider's key for the run (shown as coming from the environment, not editable); `ANTHROPIC_API_KEY` alone selects the Anthropic API key provider, `CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY=1` the cloud one, and `ANTHROPIC_BASE_URL` with a key the custom endpoint, unless another provider was put in use in settings. The log prints their names only. |
+| `AWS_*`, `GOOGLE_*`, `CLOUD_ML_REGION`, proxies, `NODE_EXTRA_CA_CERTS` | the CLI | Left in the environment: the cloud credential chains the Bedrock and Vertex providers use. They do nothing without a `CLAUDE_CODE_USE_*` switch, which only the settings set. |
 | `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT` | `app.py` | When either is present (launched from inside Claude Code), `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SSE_PORT`, `CLAUDE_EFFORT`, `ANTHROPIC_BASE_URL` and `CLAUDE_CODE_OAUTH_*`, `CLAUDE_CODE_SDK_*`, `CLAUDE_CODE_MESSAGING_*` are removed so the analyst's CLI does not attach to the parent session. |
 | `CI`, `SSH_CONNECTION`, `SSH_TTY`, `DISPLAY`, `WAYLAND_DISPLAY` | `app.py` | Decide whether a window can open; without one the default mode is `--browser`. |
 
@@ -395,7 +582,9 @@ passes the MCP URL and token to the bridge directly.
 | Store (tracks, missions, audit, fuel journal) | `--store`, else `~/Library/Application Support/EyeInTheSky/store` on macOS, `$XDG_DATA_HOME/eye-in-the-sky/store` (default `~/.local/share/…`) elsewhere, `%LOCALAPPDATA%\EyeInTheSky\store` on Windows. `start.sh` uses `godseye/.godseye/store`. |
 | Harness config (MCP URL + token, mode 0600) | `<store>/../mcp.json`; usable as a Claude Code `--mcp-config` file. |
 | Analyst working directory | `<store>/analyst` |
-| Analyst transcripts | The Claude CLI writes every conversation to `~/.claude/projects/<encoded cwd>/<session>.jsonl`, whatever the options say. The encoded cwd is the absolute path of `<store>/analyst` with every character other than a letter or digit replaced by `-`; for the desktop app's default store that is `~/.claude/projects/-Users-<you>-Library-Application-Support-EyeInTheSky-store-analyst/`. These files hold the full conversation, tool arguments and results. |
+| Analyst transcripts | The Claude CLI writes every conversation to `<config dir>/projects/<encoded cwd>/<session>.jsonl`, whatever the options say. The encoded cwd is the absolute path of `<store>/analyst` with every character other than a letter or digit replaced by `-`. On the **Claude login** the config dir is `~/.claude` (or a `CLAUDE_CONFIG_DIR` set at launch): for the desktop app's default store that is `~/.claude/projects/-Users-<you>-Library-Application-Support-EyeInTheSky-store-analyst/`. On **every other provider** it is `<store>/analyst/claude-home` (mode 0700), so those transcripts are under `<store>/analyst/claude-home/projects/`. These files hold the full conversation, tool arguments and results. A full check runs its CLI with `<store>/analyst/claude-check` as the config dir (the Claude login's check keeps `~/.claude`) and `<store>/analyst/check-cwd` as the cwd. |
+| Analyst settings | `<store>/../llm-settings.json` (mode 0600, atomic writes): the provider in use and each provider's model, endpoint, fields, test record and acknowledgement. Never a key. |
+| Analyst keys | The macOS Keychain (service `eye-in-the-sky.llm`), or `<store>/../llm-secrets.json` (mode 0600); see [Analyst providers and keys](#analyst-providers-and-keys). |
 | Frozen app log | `<store>/../logs/eye-in-the-sky.log` (mode 0600, rotated at 5 MB), only when the `.app` is launched without a terminal. |
 | Window storage | `<store>/../webview` is passed to pywebview as its storage path. For the packaged app, WebKit keeps page data (including `localStorage`) in `~/Library/WebKit/io.eyeinthesky.console` and `~/Library/Caches/io.eyeinthesky.console`. |
 
@@ -413,8 +602,12 @@ Measured on this machine with `claude-opus-5` and the owner's Claude login (no A
 - Tool definitions are roughly half of every model call: the 52 tools measured before
   `uav_handoff_target` was hidden came to 45,322 characters (about 11,000–14,000 tokens), and the
   system prompt adds about 3,000 tokens.
+- The smallest turn, after the provider settings were added: "Reply with the single word OK." with
+  effort `low` took 5.5 s, 24,921 input tokens including cache and 4 output tokens, $0.250.
 
-Figures on an API key follow Anthropic's API pricing for the chosen model.
+Figures on an API key follow Anthropic's API pricing for the chosen model. Other providers bill you
+directly at their own prices; the console shows no dollar figure for them
+(`cost_basis:"unreliable"`), because the CLI would price their models from Anthropic's table.
 
 ## Data-honesty rules
 
@@ -469,9 +662,29 @@ these rules hold everywhere:
 - **Fonts load from Google Fonts** (Atkinson Hyperlegible Next and Mono for the console, plus GEV's
   own faces and Material Symbols); offline, the browser falls back to other fonts.
 - **Chat sessions live in memory.** A host restart loses sessions and grants; the transcripts stay
-  under `~/.claude/projects/`.
-- **No in-app provider or key settings.** A bring-your-own-key settings design has been written but
-  not built; keys come from the environment only.
+  under `~/.claude/projects/` (Claude login) or `<store>/analyst/claude-home/projects/` (every other
+  provider).
+- **Providers other than the Claude login were tested offline only.** No third-party provider, and
+  no Anthropic API key, was called while building the settings: the checks ran the real bundled CLI
+  against a local stub behind a deny-all proxy, with fake keys. Provider facts that could not be
+  confirmed are marked "Unverified:" in the catalog and in the sheet. The analyst is built and
+  tested with Claude; other models may misuse tools or the doctrine (the approval slips still
+  apply).
+- **A redirect that starts mid-session.** The redirect probe runs at the full check and before each
+  CLI start. A CLI that is already running would follow a redirect its endpoint starts answering
+  later, and the CLI re-sends an `x-api-key` header to the new host (it drops `Authorization`).
+- **Streamed text can lag by up to 11 characters** while a provider key is known: the redactor holds
+  that much back to catch a key split across deltas.
+- **The settings sheet needs the app host's own page.** From vite's dev server it is cross-origin
+  and shows a message instead. Whether ⌘, reaches the page inside the desktop window has not been
+  checked; "Analyst settings…" in the analyst's menu works everywhere.
+- **A dev run with a store outside a temporary directory uses the macOS Keychain.** Set
+  `GODSEYE_LLM_SECRET_STORE=file` for dev and test runs.
+- The CLI sends `role:"system"` messages inside the message list; a provider that rejects them
+  fails the full check. Vertex models without a global endpoint need a regional override the sheet
+  doesn't offer yet.
+- `provider_changed` is sent only once a session has run a turn: a change before the first message
+  shows no divider.
 - `tool_result.busy_with` is covered by unit tests, not yet seen live.
 - A pointer approval takes effect 500 ms after the click, so scripts that click Approve must wait for
   it.

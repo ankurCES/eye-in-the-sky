@@ -69,6 +69,7 @@ export function initialState() {
       serverSessionCost: null,
       turns: {},
       rateLimit: null,
+      costBasis: null,
     },
     grants: {},
     grantsSupported: null,
@@ -77,7 +78,11 @@ export function initialState() {
     pendingContext: [],
     interruptedAt: null,
     availability: null,
+    // A live status's {provider, model} that arrived while a turn ran: the
+    // running turn keeps its provider on screen; this applies at turn_end.
+    deferredLive: null,
     auth: null,
+    authProvider: null,
     lastOperatorText: null,
     turnsEnded: 0,
   };
@@ -93,6 +98,19 @@ function withTurn(state, turnId, fn) {
   const turn = state.turns[turnId];
   if (!turn) return state;
   return { ...state, turns: { ...state.turns, [turnId]: fn(turn) } };
+}
+
+/** `{id, label, ...}` from a provider block, or null (BYOK spec §8). */
+export function providerOf(value) {
+  if (!value || typeof value !== 'object') return null;
+  const id = str(value.id);
+  const label = str(value.label);
+  if (!id && !label) return null;
+  const out = { id, label };
+  for (const key of ['kind', 'model_family', 'host', 'key_source', 'model'])
+    if (typeof value[key] === 'string') out[key] = value[key];
+  if (typeof value.configured === 'boolean') out.configured = value.configured;
+  return out;
 }
 
 /** Make sure a turn exists (an event for a turn whose start we never saw). */
@@ -272,6 +290,7 @@ function onSession(state, data, at) {
       id,
       model: str(data.model) || state.session?.model || null,
       available: data.available !== false,
+      provider: providerOf(data.provider) || state.session?.provider || null,
     },
   };
   const truncated = data.history_truncated === true;
@@ -321,6 +340,7 @@ function onTurnStart(state, data, at, replay) {
       ...turn,
       text: turn.text ?? text,
       at: turn.at ?? at ?? null,
+      provider: turn.provider ?? currentProvider(state),
     }));
   }
   const key = text.trim();
@@ -344,6 +364,9 @@ function onTurnStart(state, data, at, replay) {
     blocks: [],
     focusedIds,
     replay: Boolean(replay),
+    // The provider this turn runs on: a switch mid-turn applies from the
+    // next turn, so its header and cost note stay with this one.
+    provider: currentProvider(state),
   };
   let turns = state.turns;
   let running = state.running;
@@ -623,10 +646,22 @@ function onUsage(state, data, at) {
     for (const key of ['cost_usd', 'input_tokens', 'output_tokens']) {
       if (Number.isFinite(data[key])) merged[key] = data[key];
     }
+    // The turn's own basis and provider: the cost note stays true to the
+    // turn after the analyst moves to another provider.
+    if (typeof data.cost_basis === 'string') merged.costBasis = data.cost_basis;
+    const who =
+      providerOf(data.provider) ||
+      state.turns[turnId]?.provider ||
+      currentProvider(state);
+    if (who) merged.provider = who;
     usage.turns = { ...usage.turns, [turnId]: merged };
   }
-  if (Number.isFinite(data.cost_usd)) usage.sessionCost += data.cost_usd;
-  if (Number.isFinite(data.session_cost_usd))
+  if (typeof data.cost_basis === 'string') usage.costBasis = data.cost_basis;
+  // Unreliable dollars (a non-Anthropic price table) are never summed.
+  const priced = usage.costBasis !== 'unreliable';
+  if (priced && Number.isFinite(data.cost_usd))
+    usage.sessionCost += data.cost_usd;
+  if (priced && Number.isFinite(data.session_cost_usd))
     usage.serverSessionCost = data.session_cost_usd;
   if (Object.hasOwn(data, 'rate_limit')) {
     usage.rateLimit =
@@ -640,7 +675,9 @@ function onUsage(state, data, at) {
 function onTurnEnd(state, data, at) {
   const id = str(data.turn_id) || state.running;
   if (!id || !state.turns[id]) {
-    return state.running === id ? { ...state, running: null } : state;
+    return state.running === id
+      ? applyDeferred({ ...state, running: null })
+      : state;
   }
   const stop = str(data.stop) || 'end';
   const interruptedAt = state.interruptedAt;
@@ -691,32 +728,89 @@ function onTurnEnd(state, data, at) {
     }
   }
   if (approvalsChanged) next = { ...next, approvals };
-  return {
+  return applyDeferred({
     ...next,
     running: next.running === id ? null : next.running,
     interruptedAt: null,
     turnsEnded: next.turnsEnded + 1,
-  };
+  });
 }
 
+/** Once no turn runs, the header takes the live status held back for it. */
+function applyDeferred(state) {
+  const live = state.deferredLive;
+  if (!live || state.running) return state;
+  const session = state.session
+    ? {
+        ...state.session,
+        provider: live.provider || state.session.provider,
+        model: live.model || state.session.model,
+      }
+    : state.session;
+  return { ...state, session, deferredLive: null };
+}
+
+// Only for a host that predates `error.code` (BYOK spec §5).
 const SIGN_IN = /sign in|signed in|log ?in|authenticat/i;
+const LOGIN_ID = 'anthropic_login';
 
 function onError(state, data, at) {
+  const code = str(data.code);
+  const provider = providerOf(data.provider);
   const block = {
     kind: 'error',
     message: str(data.message) || 'The analyst reported an error.',
     hint: str(data.hint),
     retryable: data.retryable === true,
+    code,
+    provider,
     at: at ?? null,
   };
   let next = state;
-  if (SIGN_IN.test(`${block.message} ${block.hint || ''}`)) {
+  if (code) {
+    // The host classifies every failure: switch on its code, never the words.
+    if (code === 'auth')
+      next = {
+        ...next,
+        auth: provider?.id && provider.id !== LOGIN_ID ? 'provider' : 'failed',
+        authProvider: provider,
+      };
+    else if (code === 'config')
+      next = { ...next, auth: 'config', authProvider: provider };
+  } else if (SIGN_IN.test(`${block.message} ${block.hint || ''}`)) {
     next = { ...next, auth: 'failed' };
   }
   if (next.running && next.turns[next.running]) {
     return withTurn(next, next.running, (turn) => pushBlock(turn, block, at));
   }
   return { ...next, items: [...next.items, block] };
+}
+
+/**
+ * `provider_changed {from, to, memory}` (BYOK spec §8): a divider in the
+ * transcript, and the header's model and provider follow `to`.
+ */
+function onProviderChanged(state, data, at) {
+  const to = providerOf(data.to);
+  const from = providerOf(data.from);
+  const memory = data.memory === 'cleared' ? 'cleared' : 'kept';
+  const session = state.session
+    ? {
+        ...state.session,
+        provider: to || state.session.provider || null,
+        model: str(data.to?.model) || state.session.model,
+      }
+    : state.session;
+  return {
+    ...state,
+    session,
+    // The host's own word on the provider supersedes a held-back status.
+    deferredLive: null,
+    items: [
+      ...state.items,
+      { kind: 'divider', reason: 'provider', memory, from, to, at: at ?? null },
+    ],
+  };
 }
 
 function onEvent(state, action) {
@@ -786,6 +880,8 @@ function onEvent(state, action) {
       return onTurnEnd(next, data, at);
     case 'error':
       return onError(next, data, at);
+    case 'provider_changed':
+      return onProviderChanged(next, data, at);
     default:
       return next;
   }
@@ -876,6 +972,7 @@ function onNewSession(state, action) {
   return {
     ...state,
     session: null,
+    deferredLive: null,
     lastSeq: 0,
     approvals,
     rows,
@@ -915,17 +1012,44 @@ export function reduce(state, action) {
       }
       return { ...s, connection: conn };
     }
-    case 'availability':
+    case 'availability': {
+      // A live status names the provider and model the analyst's next turn
+      // uses (analyst settings may have just changed them): the header and
+      // cost footer follow it; a later provider_changed event agrees. While
+      // a turn runs it keeps its own provider on screen, so the status is
+      // held back until turn_end.
+      const liveProvider = providerOf(action.provider);
+      const liveModel = str(action.model);
+      const live =
+        s.session && action.available === true && (liveProvider || liveModel)
+          ? { provider: liveProvider, model: liveModel }
+          : null;
+      const turnRuns = Boolean(s.running && s.turns[s.running]);
+      const session =
+        live && !turnRuns
+          ? {
+              ...s.session,
+              provider: live.provider || s.session.provider,
+              model: live.model || s.session.model,
+            }
+          : s.session;
       return {
         ...s,
+        session,
+        deferredLive: live && turnRuns ? live : live ? null : s.deferredLive,
         availability: {
           available: action.available === true,
           reason: str(action.reason),
           hint: str(action.hint),
           model: str(action.model),
+          provider: providerOf(action.provider),
+          costBasis: str(action.cost_basis),
         },
         auth: action.available === true && action.clearAuth ? null : s.auth,
+        authProvider:
+          action.available === true && action.clearAuth ? null : s.authProvider,
       };
+    }
     case 'send': {
       const text = String(action.text || '').trim();
       const focusedIds = arr(action.focused_ids).map(String);
@@ -1040,10 +1164,44 @@ export function rateLimit(state, now = null) {
 
 /** Whether the analyst can be used at all (spec §3e). */
 export function availabilityOf(state) {
-  if (state.auth === 'failed') return { available: false, reason: 'auth' };
   const av = state.availability;
+  const provider = state.authProvider || av?.provider || null;
+  if (state.auth === 'failed') return { available: false, reason: 'auth' };
+  if (state.auth === 'provider' || state.auth === 'config') {
+    // The host's status names the exact reason once it is re-read.
+    const said = PROVIDER_REASONS.has(av?.reason) ? av.reason : null;
+    return {
+      available: false,
+      reason:
+        said ||
+        (state.auth === 'provider'
+          ? 'provider_auth'
+          : 'provider_not_configured'),
+      hint: said ? av.hint : null,
+      provider,
+    };
+  }
   if (!av) return { available: null, reason: null };
-  return { available: av.available, reason: av.reason, hint: av.hint };
+  const out = { available: av.available, reason: av.reason, hint: av.hint };
+  if (av.provider) out.provider = av.provider;
+  return out;
+}
+
+const PROVIDER_REASONS = new Set([
+  'provider_not_configured',
+  'provider_key_missing',
+  'provider_auth',
+  'settings_error',
+]);
+
+/** The provider the analyst uses now: the session's, else the status's. */
+export function currentProvider(state) {
+  return state.session?.provider || state.availability?.provider || null;
+}
+
+/** `usage.cost_basis`, else the status's (`anthropic_list` | `unreliable`). */
+export function costBasis(state) {
+  return state.usage.costBasis || state.availability?.costBasis || null;
 }
 
 /** Header status word (spec §6.1). */
