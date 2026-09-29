@@ -14,8 +14,10 @@ Start the stack with `./scripts/demo_laptop.sh` (zero GPU) and connect over MCP 
 `http://127.0.0.1:8791/mcp` with a Bearer token — `.mcp.json` wires this up for clients that read it.
 The MCP server is the **only** command path; the God's Eye View browser is read-only.
 
-**ISR-only.** There are no kinetic tools and none may be added. The system observes, classifies and
-reports; command authority stays with the operator.
+**ISR by default (M14a).** No kinetic tool exists in ISR mode, and none may be added outside the M14a
+rule (PLAN.md §4.5a): simulated wargame tools live only in `wargame*.py` under `wg_*`, engage only
+simulated scenario units, and every engagement is approved by the operator in the console. The system
+observes, classifies and reports; command authority stays with the operator.
 
 See `README.md` for the full picture and `TOOL_CONTRACT.md` for the authoritative tool catalog.
 

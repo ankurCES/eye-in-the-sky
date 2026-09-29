@@ -9,6 +9,7 @@ import {
   MODE_COPY,
   MODE_STATES,
   NOTICE_MS,
+  READ_WAIT_MS,
   STILL_STARTING_MS,
   createIris,
   createModeController,
@@ -1278,4 +1279,112 @@ test('the Sites switch reaches the overlay while in the map', async () => {
     { sites: true },
   ]);
   assert.deepEqual(t.mode.overlays, { sites: true });
+});
+
+test('the wargame switches join the overlay call only once set (WG v2 §5.3.12, B17)', async () => {
+  const t = mapSetup();
+  t.mode.requestMap(KHERSON);
+  await flush();
+  t.mode.setOverlays({ forces: false, vectors: true, bogus: false });
+  assert.deepEqual(t.port.calls.at(-1), [
+    'setOverlayVisibility',
+    { sites: true, forces: false, vectors: true },
+  ]);
+  assert.deepEqual(t.mode.overlays, {
+    sites: true,
+    forces: false,
+    vectors: true,
+  });
+});
+
+// ---- read view (WG spec §5.3.11) ---------------------------------------------------
+
+const AAR = {
+  id: 'rpt:aar-WG-1a2b3c',
+  entity: {
+    fields: { report_type: 'AAR', markdown: '# After-action review' },
+  },
+};
+
+test('requestRead on the orb opens the read view at once, with a safe doc', () => {
+  const t = setup();
+  const reads = [];
+  t.mode.onRead((d) => reads.push(d));
+  assert.equal(t.mode.requestRead(AAR), true);
+  assert.deepEqual(reads, [
+    {
+      id: 'rpt:aar-WG-1a2b3c',
+      title: 'After-action review (simulated)',
+      markdown: '# After-action review',
+      simulated: true,
+    },
+  ]);
+  assert.equal(t.mode.state, 'orb', 'the read view is not a mode');
+  // Nothing to read: no view, no mode change.
+  assert.equal(t.mode.requestRead({ id: 'rpt:x' }), false);
+  assert.equal(t.mode.requestRead(null), false);
+  assert.equal(reads.length, 1);
+});
+
+test('requestRead while tracking goes back to the orb first, then opens', async () => {
+  const t = setup();
+  const reads = [];
+  t.mode.onRead((d) => reads.push({ ...d, at: t.mode.state }));
+  t.mode.requestTrack('Drone1', { source: 'operator' });
+  await flush();
+  assert.equal(t.mode.state, 'tracking');
+  assert.equal(t.mode.requestRead(AAR), true);
+  assert.deepEqual(reads, [], 'not over the map');
+  await flush();
+  assert.equal(t.mode.state, 'orb');
+  assert.equal(reads.length, 1);
+  assert.equal(reads[0].at, 'orb');
+  assert.equal(reads[0].title, 'After-action review (simulated)');
+});
+
+test('a read request that waits too long for the orb is dropped', async () => {
+  const clock = fakeClock();
+  const port = fakePort();
+  let release = null;
+  const mode = createModeController({
+    trackingPort: port,
+    clock,
+    viewportInset: () => ({ right: 0 }),
+    // An exit iris that holds until the test lets it go.
+    iris: {
+      open: async () => {},
+      close: () =>
+        new Promise((r) => {
+          release = r;
+        }),
+      reset: () => {},
+    },
+  });
+  const reads = [];
+  mode.onRead((d) => reads.push(d));
+  mode.requestTrack('Drone1', { source: 'operator' });
+  await flush();
+  assert.equal(mode.state, 'tracking');
+  mode.requestRead(AAR);
+  await flush();
+  assert.equal(mode.state, 'exiting');
+  await clock.advance(READ_WAIT_MS + 1);
+  release();
+  await flush();
+  assert.equal(mode.state, 'orb');
+  assert.deepEqual(reads, [], 'a stale request never opens later');
+  mode.destroy();
+});
+
+test('destroy drops a pending read and its listeners', async () => {
+  const t = setup();
+  const reads = [];
+  t.mode.onRead((d) => reads.push(d));
+  t.mode.requestTrack('Drone1', { source: 'operator' });
+  await flush();
+  t.mode.requestRead(AAR);
+  t.mode.destroy();
+  await flush();
+  assert.deepEqual(reads, []);
+  assert.equal(t.mode.requestRead(AAR), false);
 });

@@ -11,6 +11,11 @@
  *   ▸ Key                                  (site glyphs and their words)
  *   Map data: © OpenStreetMap contributors, ODbL.   (whenever sites are drawn)
  *
+ * During a simulated wargame session only (WG v2 §5.3.12) the Show row adds
+ * Forces, Engagements and Vectors, and the Key adds the frames, the burst,
+ * the arrow, corridor exposure and two fixed lines. Outside a session the
+ * dock is exactly the Phase A dock.
+ *
  * `mapDockModel()` is pure: it reads the mode's map target, the intel graph
  * (`meta.sites`, vehicles) and, when the port offers them, the overlay's own
  * counts. `createMapDock()` builds the DOM with ../ui/uavDom.js only, so it
@@ -51,7 +56,33 @@ export const MAP_DOCK_COPY = Object.freeze({
   key: 'Key',
   track: (v) => `Track ${v}`,
   unrecognised: 'Unrecognised map item',
+  forces: (n) => `Forces ${n}`,
+  engagements: (n) => `Engagements ${n}`,
+  vectors: (n) => `Vectors ${n}`,
 });
+
+/** The wargame's Key rows and lines (WG v2 §5.3.12, Appendix B). */
+export const MAP_DOCK_WARGAME_KEY = Object.freeze({
+  blue: 'Blue unit (rectangle frame)',
+  red: 'Red unit (diamond frame)',
+  unknownSide: 'Side not set',
+  engagement: 'Simulated engagement',
+  axis: 'Red axis or planned corridor',
+  exposure: {
+    low: 'Corridor leg, low exposure',
+    moderate: 'Corridor leg, moderate exposure',
+    high: 'Corridor leg, high exposure',
+  },
+  rings: 'Rings mark outcomes. They are not effect areas.',
+  simulated: 'Everything on this layer from the wargame is simulated.',
+});
+
+/** The wargame's dock switches, in Show-row order. */
+export const MAP_DOCK_WARGAME_KINDS = Object.freeze([
+  Object.freeze({ key: 'forces', type: 'force', kind: 'force' }),
+  Object.freeze({ key: 'engagements', type: 'engagement', kind: 'engagement' }),
+  Object.freeze({ key: 'vectors', type: 'vector', kind: 'vector' }),
+]);
 
 function count(value) {
   const n = typeof value === 'string' && !value.trim() ? NaN : Number(value);
@@ -107,18 +138,45 @@ export function dockSiteCounts(graph, overlay = null) {
 }
 
 /**
+ * The wargame's per-kind numbers while a session runs, else null. Drawn
+ * counts come from the overlay when the port reports them
+ * (`wargame[kind].drawn`), else from the graph's nodes.
+ * @returns {{forces:number, engagements:number, vectors:number}|null}
+ */
+export function dockWargameCounts(graph, overlay = null) {
+  const wg = graph?.meta?.wargame;
+  if (!wg || typeof wg !== 'object' || wg.active !== true) return null;
+  const stats =
+    overlay && typeof overlay === 'object' && overlay.wargame
+      ? overlay.wargame
+      : null;
+  const out = {};
+  for (const { key, type, kind } of MAP_DOCK_WARGAME_KINDS) {
+    const reported = count(stats?.[kind]?.drawn);
+    out[key] =
+      reported != null
+        ? reported
+        : nodesOf(graph).filter((n) => n.type === type).length;
+  }
+  return out;
+}
+
+/**
  * Everything the dock shows, as safe text and numbers (pure).
  * @param {object} p
  * @param {{label?:string|null, bbox?:number[]|null}|null} p.target the map target
  * @param {object|null} p.graph the intel graph
  * @param {object|null} [p.overlay] the port's overlay counts, if any
  * @param {boolean} [p.sitesOn] the Sites switch
+ * @param {{forces?:boolean, engagements?:boolean, vectors?:boolean}} [p.wargameOn]
+ *   the wargame switches (a missing one is on)
  */
 export function mapDockModel({
   target = null,
   graph = null,
   overlay = null,
   sitesOn = true,
+  wargameOn = {},
 } = {}) {
   const label = safeText(target?.label ?? '', 80);
   const size = target?.bbox ? areaText(target.bbox) : null;
@@ -138,7 +196,90 @@ export function mapDockModel({
         ? sitesNotDrawnText(sites.notDrawn)
         : null,
     attribution: on && sites.drawn > 0 ? MAP_ATTRIBUTION : null,
+    wargame: wargameModel(graph, overlay, wargameOn),
   };
+}
+
+function wargameModel(graph, overlay, wargameOn) {
+  const counts = dockWargameCounts(graph, overlay);
+  if (!counts) return null;
+  const rows = MAP_DOCK_WARGAME_KINDS.map(({ key }) => ({
+    key,
+    on: wargameOn?.[key] !== false,
+    label: MAP_DOCK_COPY[key](counts[key]),
+  }));
+  return { rows };
+}
+
+/** One Key row: a constant glyph (never text) and its word. */
+function keyRow(dataKey, svg, word) {
+  const glyph = h('span', {
+    class: 'ic-mapdock__glyph',
+    'aria-hidden': 'true',
+  });
+  if (typeof svg === 'string' && svg) glyph.innerHTML = svg;
+  return h(
+    'li',
+    { class: 'ic-mapdock__keyrow', 'data-category': dataKey },
+    glyph,
+    h('span', { class: 'ic-mapdock__keyword' }, word),
+  );
+}
+
+/** The wargame's Key rows: frames, burst, arrow, exposure (constants only). */
+function wargameKeyRows() {
+  const K = MAP_DOCK_WARGAME_KEY;
+  const force = (side) =>
+    glyphSvg('force', {
+      size: 16,
+      status: 'ok',
+      attrs: { side, provenance: 'scenario', state: 'active' },
+    });
+  const rows = [
+    keyRow('wg-blue', force('blue'), K.blue),
+    keyRow('wg-red', force('red'), K.red),
+    keyRow('wg-side-unknown', force(null), K.unknownSide),
+    keyRow(
+      'wg-engagement',
+      glyphSvg('engagement', {
+        size: 16,
+        status: 'ok',
+        attrs: {
+          phase: 'adjudicated',
+          consequence: 'none',
+          kind: 'blue_strike',
+        },
+      }),
+      K.engagement,
+    ),
+    keyRow(
+      'wg-vector',
+      glyphSvg('vector', {
+        size: 16,
+        status: 'ok',
+        attrs: { kind: 'axis', side: 'red' },
+      }),
+      K.axis,
+    ),
+  ];
+  for (const level of ['low', 'moderate', 'high']) {
+    rows.push(
+      h(
+        'li',
+        {
+          class: 'ic-mapdock__keyrow',
+          'data-category': `wg-exposure-${level}`,
+        },
+        h('span', {
+          class: 'ic-mapdock__swatch',
+          'data-exposure': level,
+          'aria-hidden': 'true',
+        }),
+        h('span', { class: 'ic-mapdock__keyword' }, K.exposure[level]),
+      ),
+    );
+  }
+  return rows;
 }
 
 /** The Key: one row per site glyph, then the unrecognised grey point. */
@@ -175,10 +316,12 @@ function keyRows() {
  * @param {() => void} [hooks.onBack] Back to console
  * @param {(vehicle:string) => void} [hooks.onTrack] Track {vehicle}
  * @param {(on:boolean) => void} [hooks.onSites] the Sites switch
+ * @param {(kinds:object) => void} [hooks.onWargame] a wargame switch
+ *   (`{forces|engagements|vectors: boolean}`)
  * @returns {{element:object, back:object, mini:object, badge:object,
  *   update(model:object):void, destroy():void}}
  */
-export function createMapDock({ onBack, onTrack, onSites } = {}) {
+export function createMapDock({ onBack, onTrack, onSites, onWargame } = {}) {
   let destroyed = false;
   let model = null;
 
@@ -225,6 +368,43 @@ export function createMapDock({ onBack, onTrack, onSites } = {}) {
     if (!destroyed) onSites?.(sitesBox.checked !== false);
   });
 
+  // The wargame's switches (a session only): built once, shown when needed.
+  const wgBoxes = new Map();
+  const wgTexts = new Map();
+  const wgRows = MAP_DOCK_WARGAME_KINDS.map(({ key: kind }) => {
+    const box = h('input', {
+      type: 'checkbox',
+      class: 'ic-mapdock__check',
+      'data-key': `map:${kind}`,
+    });
+    box.checked = true;
+    const text = h('span', { class: 'ic-mapdock__sites' });
+    box.addEventListener('change', () => {
+      if (!destroyed) onWargame?.({ [kind]: box.checked !== false });
+    });
+    wgBoxes.set(kind, box);
+    wgTexts.set(kind, text);
+    return h(
+      'label',
+      { class: 'ic-mapdock__toggle', 'data-kind': kind },
+      box,
+      text,
+    );
+  });
+  const wargameRow = h(
+    'div',
+    { class: 'ic-mapdock__wgshow', hidden: true },
+    h('span', { class: 'ic-mapdock__show' }, MAP_DOCK_COPY.show),
+    ...wgRows,
+  );
+  const wargameKey = h(
+    'div',
+    { class: 'ic-mapdock__wgkey', hidden: true },
+    h('ul', { class: 'ic-mapdock__keylist' }, ...wargameKeyRows()),
+    h('p', { class: 'ic-mapdock__caveat' }, MAP_DOCK_WARGAME_KEY.rings),
+    h('p', { class: 'ic-mapdock__caveat' }, MAP_DOCK_WARGAME_KEY.simulated),
+  );
+
   const degraded = h('p', {
     class: 'ic-mapdock__warn',
     role: 'status',
@@ -237,6 +417,7 @@ export function createMapDock({ onBack, onTrack, onSites } = {}) {
     h('summary', { class: 'ic-mapdock__keysum' }, MAP_DOCK_COPY.key),
     h('ul', { class: 'ic-mapdock__keylist' }, ...keyRows()),
     h('p', { class: 'ic-mapdock__caveat' }, SITE_CAVEAT),
+    wargameKey,
   );
   const attribution = h('p', {
     class: 'ic-mapdock__attribution',
@@ -254,6 +435,7 @@ export function createMapDock({ onBack, onTrack, onSites } = {}) {
     line,
     actions,
     sitesRow,
+    wargameRow,
     degraded,
     notDrawn,
     key,
@@ -316,6 +498,15 @@ export function createMapDock({ onBack, onTrack, onSites } = {}) {
     setHidden(notDrawn, !next.notDrawnText);
     attribution.textContent = next.attribution || '';
     setHidden(attribution, !next.attribution);
+    const wg = next.wargame || null;
+    setHidden(wargameRow, !wg);
+    setHidden(wargameKey, !wg);
+    for (const row of wg?.rows || []) {
+      const box = wgBoxes.get(row.key);
+      const text = wgTexts.get(row.key);
+      if (text) text.textContent = row.label;
+      if (box && box.checked !== row.on) box.checked = row.on;
+    }
   }
 
   return {

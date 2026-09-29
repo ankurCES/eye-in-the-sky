@@ -19,6 +19,7 @@ from godseye_uav.store import Store
 from godseye_uav.targets import (
     CONFIDENCE_LEVELS,
     OB_LIBRARY,
+    SCENARIO_CONTACT_NOTE,
     UNCLASSIFIED,
     PatternOfLife,
     Track,
@@ -30,10 +31,13 @@ from godseye_uav.targets import (
     intrep_summary,
     match_ob,
     mint_origin,
+    notional_ob,
     ob_for_category,
     salute_report,
 )
 from godseye_uav.threat import indicator_posture
+from godseye_uav.wargame_tables import label_for_ob
+from support.wg_tokens import assert_no_real_system_tokens, find_real_system_tokens
 
 HOME = GeoPoint(47.641468, -122.140165, 93.0)
 AO = [(47.63, -122.16), (47.63, -122.12), (47.66, -122.12), (47.66, -122.16)]
@@ -166,6 +170,54 @@ def test_track_manager_separates_distant_contacts():
     b = tm.ingest([_det("tank", 47.65, -122.15, 0)])[0]
     assert a.track_id != b.track_id
     assert len(tm.tracks()) == 2
+
+
+# ---- M14a (D1): scenario and non-scenario detections never share a track ----
+
+_SCN = "aaa_towed_1759072800123001"          # a wargame-owned object name
+_NEAR = 50.0 / 111_320.0                     # ~50 m north, inside the 75 m radius
+
+
+def test_a_non_scenario_detection_near_a_scenario_track_starts_its_own_track():
+    tm = TrackManager()
+    tm.segregate = lambda name: name == _SCN
+    scn = tm.ingest([_det(_SCN, 47.64, -122.14)], now=1000.0)[0]
+    isr = tm.ingest([_det("sam_short_range_1", 47.64 + _NEAR, -122.14)], now=1001.0)[0]
+    assert isr.track_id != scn.track_id and isr.name == "sam_short_range_1"
+    assert (scn.lat, scn.lon, scn.sightings) == (47.64, -122.14, 1), "scenario track moved"
+    # ...nor the reverse: a scenario detection beside an ISR track stays its own
+    again = tm.ingest([_det(_SCN, 47.64 + _NEAR, -122.14)], now=1002.0)[0]
+    assert again.track_id == scn.track_id and again.sightings == 2
+    assert tm.get(isr.track_id).sightings == 1
+
+
+def test_a_track_tagged_scenario_keeps_other_objects_out_even_after_the_session():
+    tm = TrackManager()
+    scn = tm.ingest([_det(_SCN, 47.64, -122.14)], now=1000.0)[0]
+    scn.scenario = True                      # the server's ingest hook tagged it
+    other = tm.ingest([_det("T72_Tank", 47.64 + _NEAR, -122.14)], now=1001.0)[0]
+    assert other.track_id != scn.track_id
+
+
+def test_two_scenario_objects_never_share_a_track():
+    tm = TrackManager()
+    tm.segregate = lambda name: name.startswith("aaa_towed_")
+    a = tm.ingest([_det("aaa_towed_1759072800123001", 47.64, -122.14)])[0]
+    b = tm.ingest([_det("aaa_towed_1759072800123002", 47.64 + _NEAR, -122.14)])[0]
+    assert a.track_id != b.track_id
+
+
+def test_isr_association_is_unchanged_with_no_session():
+    # segregate answering False everywhere (ISR mode) == no predicate at all
+    rows = []
+    for seg in (None, lambda name: False):
+        tm = TrackManager(origin="FIXEDPREFIX")
+        tm.segregate = seg
+        tm.ingest([_det("T72_Tank", 47.64, -122.14)], now=1000.0)
+        tm.ingest([_det("BMP2", 47.64 + _NEAR, -122.14)], now=1001.0)
+        rows.append([{k: v for k, v in t.to_dict().items() if k != "uid"}
+                     for t in tm.tracks()])
+    assert rows[0] == rows[1] and len(rows[0]) == 1, "ISR nearest-within-radius changed"
 
 
 def test_track_ids_are_not_reused_across_runs():
@@ -777,3 +829,180 @@ class TestAutoLabelKeepsObClass:
         assert track.ob_class == "sam_short_range"
         assert track.ob.weapon_range_m == OB_LIBRARY["sam_short_range"].weapon_range_m
         assert track.match_evidence["rule"] == SEQ_RULE
+
+
+# ---------------------------------------------------------------------------
+# M14a (WG §5.2.9, unit B3b): scenario contacts. The server's ingest hook tags
+# a track `scenario` when the simulated wargame owns its name; session end
+# deletes those tracks (`TrackManager.remove`) and their open pattern-of-life
+# visits (`PatternOfLife.forget`). An ISR track is byte-identical throughout.
+# ---------------------------------------------------------------------------
+
+class TestScenarioTrack:
+    def _pair(self):
+        """The same well-observed contact twice: once ISR, once scenario."""
+        isr = _identified_track(TrackManager(), name="sam_short_range_1")
+        scen = Track.from_dict(json.loads(json.dumps(isr.to_dict())))
+        scen.scenario = True
+        return isr, scen
+
+    def test_the_flag_defaults_off_and_an_isr_row_is_unchanged(self):
+        isr, _ = self._pair()
+        assert isr.scenario is False
+        row = isr.to_dict()
+        assert "scenario" not in row
+        assert set(row) == {
+            "track_id", "uid", "origin_run", "name", "category", "ob_class",
+            "match_evidence", "lat", "lon", "alt_m", "first_seen", "last_seen",
+            "sightings", "heading_deg", "speed_mps", "sim_epoch", "history",
+            "observations"}
+        assert Track.from_dict(row).scenario is False
+
+    def test_scenario_round_trips_through_json_and_the_manager(self):
+        _, scen = self._pair()
+        row = json.loads(json.dumps(scen.to_dict()))
+        assert row["scenario"] is True
+        back = Track.from_dict(row)
+        assert back.scenario is True
+        assert back.to_dict() == scen.to_dict()
+        tm = TrackManager()
+        tm.add(scen)
+        state = json.loads(json.dumps(tm.to_dict()))
+        again = TrackManager.from_dict(state).get(scen.track_id)
+        assert again is not None and again.scenario is True
+
+    @pytest.mark.parametrize("value", [False, None, 1, "true", "yes", [True]])
+    def test_only_the_json_literal_true_marks_a_scenario(self, value):
+        isr, _ = self._pair()
+        row = {**isr.to_dict(), "scenario": value}
+        assert Track.from_dict(row).scenario is False
+
+    def test_salute_prefixes_the_equipment_line_and_names_it_generically(self):
+        """D1 (B17 relabel): a scenario contact's SALUTE names the generic
+        wargame label, never the library's real-system name; the numbers and
+        every field that names nothing are the ISR report's."""
+        isr, scen = self._pair()
+        a = salute_report(isr, observer="Drone1", now=1100.0)
+        b = salute_report(scen, observer="Drone1", now=1100.0)
+        assert SCENARIO_CONTACT_NOTE == "Scenario contact (simulated)"
+        name = f"{label_for_ob('sam_short_range')} (notional)"
+        assert b["equipment"]["text"] == (
+            f"Scenario contact (simulated). {name} (sam_short_range_1)")
+        assert b["equipment"]["platform"] == name
+        assert b["equipment"]["capabilities"] == ["notional capability (simulated)"]
+        assert b["unit"]["text"] == f"{name} — notional element"
+        assert not a["equipment"]["text"].startswith("Scenario")
+        assert b["scenario"] is True and b["simulated"] is True
+        assert "scenario" not in a and "simulated" not in a
+        assert find_real_system_tokens(a)  # the ISR row does name the system
+        assert_no_real_system_tokens(b)
+        named = {"size", "unit", "equipment", "scenario", "simulated"}
+        assert {k: v for k, v in b.items() if k not in named} == {
+            k: v for k, v in a.items() if k not in named}
+        for k in ("weapon_range_m", "weapon_ceiling_m", "acquisition_range_m",
+                  "mobility", "detected_as"):
+            assert b["equipment"][k] == a["equipment"][k]
+        assert b["size"]["count"] == a["size"]["count"]
+
+    def test_the_notional_row_keeps_the_numbers_and_drops_every_name(self):
+        _, scen = self._pair()
+        row, lib = scen.ob, OB_LIBRARY["sam_short_range"]
+        assert row is not lib and row is scen.ob  # cached per class
+        assert (row.key, row.category, row.role, row.weapon_range_m,
+                row.weapon_ceiling_m, row.acquisition_range_m, row.mobility,
+                row.threat_weight, row.emitter, row.size_m) == (
+            lib.key, lib.category, lib.role, lib.weapon_range_m,
+            lib.weapon_ceiling_m, lib.acquisition_range_m, lib.mobility,
+            lib.threat_weight, lib.emitter, lib.size_m)
+        assert row.keywords == ()
+        for lib_row in OB_LIBRARY.values():
+            assert_no_real_system_tokens(notional_ob(lib_row).to_dict())
+        assert notional_ob(UNCLASSIFIED) is UNCLASSIFIED
+        isr, _ = self._pair()
+        assert isr.ob is lib  # an ISR track keeps the library row itself
+
+    def test_an_isr_salute_is_byte_identical_to_the_pre_m14a_shape(self):
+        isr, _ = self._pair()
+        rep = salute_report(isr, observer="Drone1", now=1100.0)
+        ob = OB_LIBRARY["sam_short_range"]
+        assert rep["equipment"]["text"] == f"{ob.name} (sam_short_range_1)"
+        assert "scenario" not in json.dumps(rep).lower()
+
+
+class TestTrackRemove:
+    def _three(self):
+        tm = TrackManager()
+        tracks = tm.ingest([_det("sam_short_range_1", 47.6400, -122.1400),
+                            _det("T72_1", 47.6450, -122.1300),
+                            _det("Ural_Truck_1", 47.6500, -122.1500)],
+                           now=1000.0, sensor=_good_sensor())
+        return tm, [t.track_id for t in tracks]
+
+    def test_remove_returns_what_it_removed_in_call_order(self):
+        tm, (a, b, c) = self._three()
+        assert tm.remove([c, "TRK-nope-0001", a, c]) == [c, a]
+        assert [t.track_id for t in tm.tracks()] == [b]
+        assert tm.get(a) is None and tm.get(c) is None
+        assert tm.remove([a]) == []
+        assert tm.remove([]) == []
+        assert tm.remove(iter([b])) == [b]
+        assert tm.tracks() == []
+
+    def test_a_bare_string_is_one_id_not_its_characters(self):
+        tm, (a, b, _) = self._three()
+        assert tm.remove(a) == [a]
+        assert tm.remove("T") == []
+        assert tm.get(b) is not None
+
+    def test_a_removed_id_is_never_reissued(self):
+        tm, ids = self._three()
+        tm.remove(ids)
+        # A fresh detection at a removed contact's spot is a NEW track (M11).
+        again = tm.ingest([_det("sam_short_range_1", 47.6400, -122.1400)],
+                          now=2000.0, sensor=_good_sensor())[0]
+        assert again.track_id not in ids
+        minted = {tm.new_track_id() for _ in range(10)}
+        assert minted.isdisjoint(ids)
+        # ...and the persisted state no longer carries the removed rows.
+        assert {r["track_id"] for r in tm.to_dict()["tracks"]} == {again.track_id}
+
+
+class TestPatternOfLifeForget:
+    def _pol(self):
+        pol = PatternOfLife(min_samples=4)
+        pol.define_poi("DEPOT", 47.6400, -122.1400, radius_m=300.0)
+        pol.define_poi("YARD", 47.6405, -122.1400, radius_m=300.0)
+        pol.define_poi("FAR", 47.7000, -122.2000, radius_m=100.0)
+        for tid in ("TRK-a-0001", "TRK-a-0002"):
+            pol.observe(tid, "sam", 47.6402, -122.1400, ts=H08)
+        return pol
+
+    def test_forget_drops_every_open_visit_of_those_tracks(self):
+        pol = self._pol()
+        before = {p: pol.get(p).to_dict() for p in pol.pois()}
+        assert pol.forget(["TRK-a-0001", "TRK-zz-0009"]) == 2   # DEPOT + YARD
+        for poi in ("DEPOT", "YARD"):
+            b = pol.get(poi)
+            assert "TRK-a-0001" not in b.open_visits
+            assert "TRK-a-0002" in b.open_visits
+            # counts already folded into the baseline stay; no dwell invented
+            row, was = b.to_dict(), before[poi]
+            del row["open_visits"], was["open_visits"]
+            assert row == was
+        assert pol.get("FAR").to_dict() == before["FAR"]
+        assert pol.forget(["TRK-a-0001"]) == 0
+
+    def test_a_forgotten_visit_never_closes_into_a_dwell_sample(self):
+        pol = self._pol()
+        pol.forget("TRK-a-0001")                 # a bare string is one id
+        for tid in ("TRK-a-0001", "TRK-a-0002"):  # both leave every POI
+            pol.observe(tid, "sam", 47.7500, -122.3000, ts=H08 + 600.0)
+        assert pol.get("DEPOT").dwell_samples == [600.0]
+        assert pol.get("YARD").dwell_samples == [600.0]
+
+    def test_forget_survives_a_round_trip(self):
+        pol = self._pol()
+        assert pol.forget({"TRK-a-0001", "TRK-a-0002"}) == 4
+        back = PatternOfLife.from_dict(json.loads(json.dumps(pol.to_dict())))
+        assert all(not back.get(p).open_visits for p in back.pois())
+        assert back.get("DEPOT").visits == 2

@@ -424,3 +424,305 @@ test('with an icon canvas a site is a billboard; at most 150 are drawn', async (
   assert.equal(status.sites.capped, 30);
   h.layer.destroy();
 });
+
+// ---- the simulated wargame (WG v2 §5.3.12, B16) --------------------------------
+
+/** A wargame feature as the engine serves it, for the view `truth`. */
+function wgFeature(kind, id, geometry, properties, truth) {
+  return {
+    type: 'Feature',
+    id,
+    geometry,
+    properties: {
+      kind,
+      id,
+      register: 'scenario',
+      simulated: true,
+      truth,
+      ...properties,
+    },
+  };
+}
+
+const POINT = { type: 'Point', coordinates: [-122.12, 47.65] };
+const SQUARE = {
+  type: 'Polygon',
+  coordinates: [
+    [
+      [-122.12, 47.65],
+      [-122.11, 47.65],
+      [-122.11, 47.66],
+      [-122.12, 47.65],
+    ],
+  ],
+};
+const PATH = {
+  type: 'LineString',
+  coordinates: [
+    [-122.13, 47.64],
+    [-122.12, 47.65],
+    [-122.11, 47.66],
+  ],
+};
+
+/** A session body: Umpire view (`truth`) carries red; Blue view does not. */
+function sessionBody(truth, rev = `0:17:5:${truth ? 1 : 0}`) {
+  const red = truth
+    ? [
+        wgFeature(
+          'force',
+          'frc:red-sam-1',
+          POINT,
+          {
+            label: 'Red SAM 1',
+            side: 'red',
+            state: 'active',
+            status: 'ok',
+          },
+          true,
+        ),
+        wgFeature(
+          'force_envelope',
+          'env:red-sam-1:threat',
+          SQUARE,
+          {
+            side: 'red',
+            force: 'frc:red-sam-1',
+            ring: 'threat',
+            status: 'ok',
+          },
+          true,
+        ),
+        wgFeature(
+          'force_envelope',
+          'env:red-sam-1:detection',
+          SQUARE,
+          {
+            side: 'red',
+            force: 'frc:red-sam-1',
+            ring: 'detection',
+            status: 'ok',
+          },
+          true,
+        ),
+        wgFeature(
+          'vector',
+          'vec:axis-red-sam-1',
+          PATH,
+          {
+            side: 'red',
+            kind_detail: 'axis',
+            status: 'ok',
+          },
+          true,
+        ),
+      ]
+    : [];
+  return body(
+    rev,
+    [
+      site(SITE_ID),
+      ...red,
+      wgFeature(
+        'force',
+        'frc:blue-art-1',
+        POINT,
+        {
+          label: 'Blue artillery 1',
+          side: 'blue',
+          state: 'active',
+          status: 'ok',
+        },
+        truth,
+      ),
+      wgFeature(
+        'vector',
+        'vec:cor-1',
+        PATH,
+        {
+          side: 'blue',
+          kind_detail: 'corridor',
+          corridor_m: 80,
+          legs: [{ exposure: 'low' }, { exposure: 'high' }],
+        },
+        truth,
+      ),
+      wgFeature(
+        'engagement',
+        'eng:bs-1',
+        POINT,
+        {
+          side: 'blue',
+          phase: 'adjudicated',
+          kind_detail: 'blue_strike',
+          outcome: truth ? 'destroyed' : null,
+          consequence: 'red_effect',
+        },
+        truth,
+      ),
+    ],
+    { omitted: { site: 3, force: 2 }, counts: {} },
+  );
+}
+
+/** Answer `/intel/overlay` by its truth query, like the host does. */
+function viewHost() {
+  const calls = [];
+  async function fetchImpl(url) {
+    if (url.includes('/mission-overlay')) {
+      return { ok: true, status: 200, json: async () => ({ features: [] }) };
+    }
+    calls.push(url);
+    const truth = /truth=1/.test(url);
+    return { ok: true, status: 200, json: async () => sessionBody(truth) };
+  }
+  return { calls, fetchImpl };
+}
+
+async function sessionHarness() {
+  const host = viewHost();
+  const h = await harness([], {
+    missionOverlay: {
+      baseUrl: 'http://host',
+      token: 'tok',
+      fetchImpl: host.fetchImpl,
+    },
+  });
+  h.layer.setContextActive(true);
+  await flush();
+  return { ...h, wg: host, ds: contextSource(h.viewer) };
+}
+
+const ids = (ds) => ds.entities.values.map((entity) => entity.id).sort();
+
+test('Blue view by default: no red drawn; the session kinds share the context source', async () => {
+  const h = await sessionHarness();
+  assert.match(h.wg.calls[0], /truth=0/);
+  assert.deepEqual(ids(h.ds), [
+    `${CONTEXT_PREFIX}eng:bs-1`,
+    `${CONTEXT_PREFIX}frc:blue-art-1`,
+    SITE_ENTITY,
+    `${CONTEXT_PREFIX}vec:cor-1`,
+    `${CONTEXT_PREFIX}vec:cor-1#leg0`,
+    `${CONTEXT_PREFIX}vec:cor-1#leg1`,
+  ]);
+  const status = h.layer.getContextStatus();
+  assert.equal(status.truth, false);
+  assert.equal(status.wargame.force.drawn, 1);
+  assert.equal(status.wargame.engagement.drawn, 1);
+  assert.deepEqual(status.wargame.omitted, { force: 2 });
+  assert.equal(status.wargame.error, null);
+  const burst = h.ds.entities.getById(`${CONTEXT_PREFIX}eng:bs-1`);
+  assert.equal(burst.label.text.getValue(), 'Outcome hidden (simulated)');
+  h.layer.destroy();
+});
+
+test('Umpire view asks truth=1 at once and draws red; Blue view drops red before refetching', async () => {
+  const h = await sessionHarness();
+  h.layer.setContextVisibility({ truth: true });
+  await flush();
+  assert.match(h.wg.calls.at(-1), /truth=1$/, 'refetched in full, no rev');
+  assert.equal(h.layer.getContextStatus().truth, true);
+  for (const id of [
+    'frc:red-sam-1',
+    'env:red-sam-1:threat',
+    'vec:axis-red-sam-1',
+    'eng:bs-1#ring',
+  ])
+    assert.ok(h.ds.entities.getById(`${CONTEXT_PREFIX}${id}`), id);
+  assert.equal(
+    h.ds.entities.getById(`${CONTEXT_PREFIX}env:red-sam-1:detection`),
+    undefined,
+    'a calm, unselected force has no detection ring',
+  );
+
+  const calls = h.wg.calls.length;
+  h.layer.setContextVisibility({ truth: false });
+  // Synchronous: red is gone before the Blue-view body arrives.
+  assert.equal(
+    h.ds.entities.getById(`${CONTEXT_PREFIX}frc:red-sam-1`),
+    undefined,
+  );
+  assert.equal(
+    h.ds.entities.getById(`${CONTEXT_PREFIX}vec:axis-red-sam-1`),
+    undefined,
+  );
+  await flush();
+  assert.equal(h.wg.calls.length, calls + 1);
+  assert.match(h.wg.calls.at(-1), /truth=0$/);
+  // A plain switch call leaves the view alone.
+  h.layer.setContextVisibility({ sites: true });
+  assert.equal(h.layer.getContextStatus().truth, false);
+  h.layer.destroy();
+});
+
+test('picks report console ids; a force picked shows its detection ring, empty ground clears it', async () => {
+  const h = await sessionHarness();
+  h.layer.setContextVisibility({ truth: true });
+  await flush();
+  const picks = [];
+  h.layer.onContextPick((pick) => picks.push(pick.id));
+  let under = null;
+  h.viewer.scene.pick = () => (under ? { id: under } : undefined);
+  const click = (entityId) => {
+    under = entityId
+      ? h.ds.entities.getById(`${CONTEXT_PREFIX}${entityId}`)
+      : null;
+    h.handler.click(new Cesium.Cartesian2(5, 5));
+  };
+  click('vec:cor-1#leg1');
+  click('eng:bs-1#ring');
+  click('env:red-sam-1:threat');
+  assert.deepEqual(picks, ['vec:cor-1', 'eng:bs-1', 'frc:red-sam-1']);
+  assert.equal(h.layer.getContextStatus().wargame.selected, 'frc:red-sam-1');
+  const ring = h.ds.entities.getById(
+    `${CONTEXT_PREFIX}env:red-sam-1:detection`,
+  );
+  assert.ok(ring, 'the selected force shows its detection ring');
+  assert.equal(ring.polyline.clampToGround.getValue(), true);
+  click(null);
+  assert.equal(h.layer.getContextStatus().wargame.selected, null);
+  assert.equal(
+    h.ds.entities.getById(`${CONTEXT_PREFIX}env:red-sam-1:detection`),
+    undefined,
+  );
+  assert.equal(picks.length, 3, 'empty ground reports nothing');
+  h.layer.destroy();
+});
+
+test('the dock switches hide a kind with every entity it draws', async () => {
+  const h = await sessionHarness();
+  h.layer.setContextVisibility({ truth: true });
+  await flush();
+  const shown = (id) => h.ds.entities.getById(`${CONTEXT_PREFIX}${id}`).show;
+  h.layer.setContextVisibility({ forces: false, engagements: false });
+  assert.equal(shown('frc:red-sam-1'), false);
+  assert.equal(shown('env:red-sam-1:threat'), false);
+  assert.equal(shown('eng:bs-1'), false);
+  assert.equal(shown('eng:bs-1#ring'), false);
+  assert.equal(shown('vec:cor-1#leg0'), true);
+  h.layer.setContextVisibility({ vectors: false });
+  assert.equal(shown('vec:cor-1'), false);
+  assert.equal(shown('vec:axis-red-sam-1'), false);
+  assert.equal(shown(SITE_ID), true);
+  h.layer.destroy();
+});
+
+test('a theater change forgets the view body and the selection', async () => {
+  const h = await sessionHarness();
+  h.layer.setContextVisibility({ truth: true });
+  await flush();
+  const force = h.ds.entities.getById(`${CONTEXT_PREFIX}frc:red-sam-1`);
+  h.viewer.scene.pick = () => ({ id: force });
+  h.handler.click(new Cesium.Cartesian2(5, 5));
+  assert.equal(h.layer.getContextStatus().wargame.selected, 'frc:red-sam-1');
+  await tickAt(h, T0 + 400, { theater: { id: 'dyn-k', epoch: 1 } });
+  const status = h.layer.getContextStatus();
+  assert.equal(status.wargame.selected, null);
+  assert.deepEqual(
+    status.wargame.omitted,
+    { force: 2 },
+    'the refetch refilled it',
+  );
+  h.layer.destroy();
+});

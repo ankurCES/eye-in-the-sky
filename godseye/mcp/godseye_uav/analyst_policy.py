@@ -1,7 +1,7 @@
 """Approval policy for the in-app analyst (contract §5.2). Pure; no I/O.
 
 Every tool call the analyst makes is classified here, by tool name AND
-arguments, into one of six classes:
+arguments, into one of seven classes:
 
   read             auto   -- reads state; may write an audit row, never moves anything
   plan             auto   -- a dry run: nothing is queued and nothing moves
@@ -10,14 +10,28 @@ arguments, into one of six classes:
   command          ask    -- moves an aircraft or changes its mission; EVERY call asks
   sim              ask    -- changes the simulated world; EVERY call asks
   safety_override  ask    -- overrides a safety mechanism; EVERY call asks
+  engagement       ask    -- rolls one simulated engagement outcome (M14a); EVERY call
+                             asks, with an acknowledgement, from the console only
 
 Session grants follow contract v1.1 §10.2: per tool, sensor class only.  (v1
 also let ``sim`` be granted for a session; v1.1 withdrew that.)
 
 ``Decision.acknowledge`` marks the classes whose approval card also asks the
-operator to acknowledge what they are overriding (``ACKNOWLEDGE_CLASSES``:
-``safety_override``; WG spec §3.6).  The chat service sends it to the console
-as ``acknowledge_required``.
+operator to acknowledge what they are approving (``ACKNOWLEDGE_CLASSES``:
+``safety_override`` and ``engagement``; WG spec §3.6).  The chat service sends
+it to the console as ``acknowledge_required``.
+
+Simulated wargame (M14a, PLAN.md §4.5a; WG spec §3.7, §5.2.11, D2): the
+``wg_*`` tools live on their own registry (``wargame_tools``).  Status, forces
+and classes are ``read``; corridor plans and strike proposals are ``plan``
+(nothing moves and nothing is adjudicated; a proposal only records what the
+engagement will ask the operator to approve); session start and end,
+scenario generation and force spawns are ``sim``.  ``wg_execute_engagement``
+is the one ``engagement`` tool: it is checked FIRST, before any other rule, so
+no argument can turn it into anything else, and it is never automatic and
+never session-grantable.  The policy only labels it; the server enforces the
+console-claimed approval path (``wargame.authorize``/``execute``).
+``WG_ENTRY_TOOLS`` are the only ``wg_*`` tools the ISR toolbelt carries.
 
 Runtime theaters (WG spec §3.7, A8): ``geo_lookup`` and ``geo_sites`` are
 ``read``, ``theater_propose`` is ``plan`` (it changes nothing; the server
@@ -64,13 +78,16 @@ SENSOR = "sensor"
 COMMAND = "command"
 SIM = "sim"
 SAFETY_OVERRIDE = "safety_override"
+#: A simulated engagement (M14a, D2): asks on every call, needs an
+#: acknowledgement, is never session-grantable and never automatic.
+ENGAGEMENT = "engagement"
 
-CLASSES = (READ, PLAN, SENSOR, COMMAND, SIM, SAFETY_OVERRIDE)
+CLASSES = (READ, PLAN, SENSOR, COMMAND, SIM, SAFETY_OVERRIDE, ENGAGEMENT)
 AUTO_CLASSES = frozenset({READ, PLAN})
 #: Classes whose calls an operator may allow for the rest of the session (per tool).
 SESSION_CLASSES = frozenset({SENSOR})
 #: Classes whose approval needs an explicit acknowledgement (WG spec §3.6).
-ACKNOWLEDGE_CLASSES = frozenset({SAFETY_OVERRIDE})
+ACKNOWLEDGE_CLASSES = frozenset({SAFETY_OVERRIDE, ENGAGEMENT})
 
 #: The in-process SDK server's name; the CLI exposes its tools as
 #: ``mcp__godseye__<tool>``.
@@ -96,6 +113,18 @@ class Decision:
 # server's tool list), plus the toolbelt's curated tools.
 # --------------------------------------------------------------------------
 
+#: The simulated wargame's tools (M14a; `wargame_tools.TOOL_NAMES`), by class
+#: (WG spec §3.7, §5.2.11).  They are listed here and in the class sets below.
+WG_READ_TOOLS = frozenset({"wg_session_status", "wg_list_forces", "wg_list_classes"})
+WG_PLAN_TOOLS = frozenset({"wg_plan_corridor", "wg_propose_strike"})
+WG_SIM_TOOLS = frozenset({"wg_session_start", "wg_session_end", "wg_generate_scenario",
+                          "wg_spawn_force"})
+#: The engagement class (D2).  Checked before every other rule in `_klass`.
+ENGAGEMENT_TOOLS = frozenset({"wg_execute_engagement"})
+WG_TOOLS = WG_READ_TOOLS | WG_PLAN_TOOLS | WG_SIM_TOOLS | ENGAGEMENT_TOOLS
+#: The only `wg_*` tools the ISR toolbelt carries (§3.7; `wargame_tools.ENTRY_TOOLS`).
+WG_ENTRY_TOOLS = frozenset({"wg_session_start", "wg_session_status", "wg_list_classes"})
+
 SERVER_READ_TOOLS = frozenset({
     "uav_get_telemetry", "uav_list_vehicles", "uav_task_status", "mission_status",
     "uav_los_check", "uav_target_report", "uav_identify_target", "uav_assess_threat",
@@ -114,7 +143,7 @@ CURATED_TOOLS = frozenset({
 })
 
 #: Plan tools: they change nothing, so they run at once.
-PLAN_TOOLS = frozenset({"mission_dry_run", "theater_propose"})
+PLAN_TOOLS = frozenset({"mission_dry_run", "theater_propose"}) | WG_PLAN_TOOLS
 #: The plan tools that read a mission ``params`` -- and so a ``lost_link_plan``,
 #: which the server applies to the LIVE plan even on a dry run.
 _MISSION_PLAN_TOOLS = frozenset({"mission_dry_run"})
@@ -139,7 +168,7 @@ SIM_TOOLS = frozenset({
     "sim_set_environment",
     # Runtime theaters (WG spec §3.7, D2): never session-grantable.
     "sim_set_theater", "sim_set_time_scale",
-})
+}) | WG_SIM_TOOLS
 
 SAFETY_OVERRIDE_TOOLS = frozenset({"sim_set_fuel", "sim_set_link_state", "sim_reset"})
 
@@ -152,7 +181,7 @@ DRY_RUN_TOOLS = frozenset({
     "mission_handoff_track",
 })
 
-READ_TOOLS = SERVER_READ_TOOLS | CURATED_TOOLS
+READ_TOOLS = SERVER_READ_TOOLS | CURATED_TOOLS | WG_READ_TOOLS
 
 #: The runtime-theater tools (`theater_tools.TOOL_NAMES`).  None of them declares
 #: a ``lost_link_plan``, so one passed to them changes nothing.
@@ -160,7 +189,11 @@ THEATER_TOOLS = frozenset({"geo_lookup", "geo_sites", "theater_propose",
                            "sim_set_theater", "sim_set_time_scale"})
 
 KNOWN_TOOLS = (READ_TOOLS | PLAN_TOOLS | SENSOR_TOOLS | COMMAND_TOOLS | SIM_TOOLS
-               | SAFETY_OVERRIDE_TOOLS)
+               | SAFETY_OVERRIDE_TOOLS | ENGAGEMENT_TOOLS)
+
+#: Tools that declare no ``lost_link_plan`` (the server drops it), so the card
+#: never claims one replaces the live plan.
+_NO_LOST_LINK_TOOLS = THEATER_TOOLS | WG_TOOLS
 
 #: Bare names safe to list in ``allowed_tools``: read whatever the arguments.
 STATIC_AUTO_TOOLS: frozenset[str] = frozenset(READ_TOOLS)
@@ -258,6 +291,17 @@ _TITLES = {
     "sim_set_theater": "Set the theater",
     "sim_set_time_scale": "Set sim speed",
     "ui_show_map": "Show on the map",
+    # Simulated wargame (M14a, WG spec §3.7); wargame_tools.TITLES matches.
+    "wg_session_start": "Start a simulated wargame",
+    "wg_session_status": "Wargame status",
+    "wg_session_end": "End the wargame",
+    "wg_generate_scenario": "Generate a scenario",
+    "wg_spawn_force": "Add simulated forces",
+    "wg_list_forces": "List forces",
+    "wg_list_classes": "List wargame classes",
+    "wg_plan_corridor": "Plan a corridor",
+    "wg_propose_strike": "Propose a simulated strike",
+    "wg_execute_engagement": "Execute a simulated engagement",
 }
 
 TAKEOFF_NOTE = "Takes off first if the aircraft is on the ground."
@@ -278,6 +322,41 @@ TIME_SCALE_CLOCK_NOTE = ("Safety checks and camera captures stay on a real-time 
                          "happen less often per simulated second.")
 TIME_SCALE_NORMAL_NOTE = ("Safety checks and camera captures run at their normal rate per "
                           "simulated second.")
+
+#: Simulated wargame consequences (WG spec §5.2.11), from the arguments only.
+WG_START_NOTE = ("Starts a simulated wargame session (M14a). The analyst gets the wargame "
+                 "tools; every engagement will still ask you first.")
+WG_NOTHING_REAL_NOTE = ("Nothing real is fired. Scenario units are simulated and kept away "
+                        "from mapped real places.")
+WG_RED_ENGAGES_NOTE = ("Red air defence may down drones automatically; a downed drone's "
+                       "current task is aborted and it stays down until the wargame ends.")
+WG_RED_HOLDS_NOTE = "Red forces won't fire in this session."
+WG_START_REFUSAL_NOTE = ("Refused under real AirSim, during a theater switch, and in theaters "
+                         "not cleared for the wargame.")
+WG_END_NOTES = (
+    ("Ends the simulated wargame: scenario units, their contacts and waiting engagements "
+     "are removed."),
+    "Downed drones are restored at home, landed. The after-action review is kept as a report.",
+    "Aircraft keep their current tasks.",
+)
+WG_GENERATE_SPACING_NOTE = ("Units are kept at least 500 m from mapped places and theater "
+                            "points and, for red, 1 km from home.")
+WG_GENERATE_REFUSAL_NOTE = "Refused if the area has no room for them."
+WG_SPAWN_REFUSAL_NOTE = ("Refused within 500 m of a mapped place or theater point, within 1 km "
+                         "of home (red), or within 200 m of another unit.")
+WG_ENGAGEMENT_NOTES = (
+    "Rolls one simulated outcome for this engagement against a scenario unit.",
+    "Nothing real is fired.",
+    "The outcome stands for the rest of this wargame; only ending the wargame clears it.",
+    "In blue view the outcome stays hidden until a re-look assesses damage.",
+)
+WG_PROPOSE_NOTE = ("Plan only: records a proposed simulated strike; the engagement itself "
+                   "asks you separately.")
+#: Template keys (`wargame_tables.TEMPLATES`) as words for the approval card.
+_WG_TEMPLATE_WORDS = {"air_defence_belt": "air-defence belt", "mech_advance": "mechanised advance",
+                      "strike_exercise": "strike exercise"}
+#: Longest model-written wargame id or key an approval text quotes.
+_WG_ID_MAX = 40
 
 
 def bare_name(tool: str) -> str:
@@ -519,10 +598,123 @@ def _theater_summary(name: str, args: dict) -> str | None:
     return text[:200] or None
 
 
+# ------------------------------------------------------------------ wargame --
+
+def _wg_text(value: Any) -> str | None:
+    """A model-written wargame id, key or word as one short line of plain text."""
+    return _clean_label(value, _WG_ID_MAX)
+
+
+def _wg_class_label(key: Any) -> str | None:
+    """The generic label of a wargame class key (``wargame_tables.CLASSES``),
+    lower-cased for the middle of a sentence; an unknown key is shown as text.
+
+    Lazy import, so the policy stays importable (and pure) on its own; a
+    missing table only costs the nicer wording.
+    """
+    text = _wg_text(key)
+    if text is None:
+        return None
+    try:
+        from .wargame_tables import CLASSES
+        label = getattr(CLASSES.get(text), "label", None)
+    except Exception:  # noqa: BLE001 -- wording only; never fails the card
+        label = None
+    if not isinstance(label, str) or not label:
+        return text
+    return label[:1].lower() + label[1:]
+
+
+def _wg_template(value: Any) -> str | None:
+    text = _wg_text(value)
+    return _WG_TEMPLATE_WORDS.get(text or "", text)
+
+
+def _wg_count(value: Any) -> str | None:
+    """``count`` as text; the tool's default is 1."""
+    if value is None:
+        return "1"
+    n = _finite(value)
+    return None if n is None else f"{n:g}"
+
+
+def _wg_summary(name: str, args: dict) -> str | None:
+    """The one-line digest for a ``wg_*`` tool, or None to use the generic one."""
+    parts: list[str | None] = []
+    if name == "wg_session_start":
+        seed = _num(_finite(args.get("seed")))
+        parts.append(f"seed {seed}" if seed is not None else None)
+        parts.append("red holds fire" if args.get("red_engages") is False else "red may fire")
+        parts.append("red revealed to the planner" if args.get("reveal_red") is True else None)
+    elif name == "wg_session_status":
+        events = _num(_finite(args.get("events")))
+        parts.append(f"{events} events" if events is not None else None)
+    elif name == "wg_list_forces":
+        parts.append(_wg_text(args.get("side")))
+    elif name == "wg_generate_scenario":
+        parts.append(_wg_template(args.get("template")))
+        parts.append(_wg_text(args.get("intensity")))
+        parts.append(_wg_class_label(args.get("ad_class")))
+    elif name == "wg_spawn_force":
+        parts.append(_wg_text(args.get("side")))
+        parts.append(_wg_class_label(args.get("wg_class")))
+        count = _wg_count(args.get("count")) if "count" in args else None
+        parts.append(f"×{count}" if count else None)
+        parts.append(_coords(args.get("lat"), args.get("lon"), 4))
+    elif name in ("wg_plan_corridor", "wg_propose_strike", "wg_execute_engagement"):
+        who = _wg_text(args.get("vehicle" if name == "wg_plan_corridor" else "shooter_id"))
+        track = _wg_text(args.get("target_track_id"))
+        if who or track:
+            parts.append(f"{who or '?'} → track {track or '?'}")
+        if name == "wg_plan_corridor":
+            alt = _num(_finite(args.get("alt_agl_m")))
+            parts.append(f"{alt} m AGL" if alt is not None else None)
+            if args.get("relook") is True:
+                radius = _num(_finite(args.get("relook_radius_m")))
+                parts.append(f"re-look, {radius} m radius" if radius else "re-look")
+        elif name == "wg_execute_engagement":
+            parts.append(_wg_text(args.get("pending_id")))
+    else:
+        return None
+    text = " · ".join(p for p in parts if p)
+    return text[:200] or None
+
+
+def _wg_consequences(name: str, args: dict) -> list[str]:
+    """WG spec §5.2.11: from the arguments only.  "Red holds fire" only for a
+    literal ``red_engages: false``; anything else warns that red may fire."""
+    if name == "wg_session_start":
+        red = WG_RED_HOLDS_NOTE if args.get("red_engages") is False else WG_RED_ENGAGES_NOTE
+        return [WG_START_NOTE, WG_NOTHING_REAL_NOTE, red, WG_START_REFUSAL_NOTE]
+    if name == "wg_session_end":
+        return list(WG_END_NOTES)
+    if name == "wg_generate_scenario":
+        template = _wg_template(args.get("template")) or "chosen"
+        intensity = _wg_text(args.get("intensity")) or "medium"
+        return [f"Places simulated scenario units for the {template} template ({intensity}).",
+                WG_GENERATE_SPACING_NOTE, WG_GENERATE_REFUSAL_NOTE]
+    if name == "wg_spawn_force":
+        who = " ".join(p for p in (_wg_count(args.get("count")), "simulated",
+                                   _wg_text(args.get("side")),
+                                   _wg_class_label(args.get("wg_class")) or "units") if p)
+        where = _coords(args.get("lat"), args.get("lon"), 4) or "the given point"
+        return [f"Adds {who} near {where}.", WG_SPAWN_REFUSAL_NOTE]
+    if name in ENGAGEMENT_TOOLS:
+        return list(WG_ENGAGEMENT_NOTES)
+    if name == "wg_plan_corridor":
+        return [PLAN_NOTE]
+    if name == "wg_propose_strike":
+        return [WG_PROPOSE_NOTE]
+    return []
+
+
 def _summary(name: str, args: dict, *, dry: bool) -> str:
     theater = _theater_summary(name, args)
     if theater:
         return theater
+    wargame = _wg_summary(name, args)
+    if wargame:
+        return wargame
     merged = {**_params(args), **args}
     parts: list[str] = []
     if name in ("mission_handoff_track", "uav_handoff_target"):
@@ -580,7 +772,7 @@ def _summary(name: str, args: dict, *, dry: bool) -> str:
             parts.append(merged[key][:80])
     if isinstance(merged.get("ids"), list):
         parts.append(_count(merged["ids"], "entity", "entities") or "")
-    if _has_lost_link_plan(args) and name not in THEATER_TOOLS:
+    if _has_lost_link_plan(args) and name not in _NO_LOST_LINK_TOOLS:
         parts.append("replaces lost-link plan")
     if dry:
         parts.append("dry run")
@@ -768,11 +960,13 @@ def _consequences(name: str, args: dict, klass: str, dry: bool) -> list[str]:
         out = [("Resets the sim: vehicles return to their start state and in-flight "
                 "tasks are dropped."),
                "Tracks, pattern of life, fuel and the BINGO latch are kept."]
+    elif name in WG_TOOLS:
+        out = _wg_consequences(name, a)
     elif klass == COMMAND and name not in KNOWN_TOOLS:
         out = ["Unknown tool: its effect is not known, so it is treated as a command."]
     else:
         out = []
-    if _has_lost_link_plan(a) and name not in THEATER_TOOLS:
+    if _has_lost_link_plan(a) and name not in _NO_LOST_LINK_TOOLS:
         out.append(f"Replaces {_who(a)}'s live lost-link plan.")
     return out
 
@@ -806,6 +1000,9 @@ def _nobidi(text: str) -> str:
 
 def _klass(name: str, args: dict) -> tuple[str, bool]:
     """(class, is_dry_run) for a bare tool name."""
+    if name in ENGAGEMENT_TOOLS:
+        # First, before every other rule: no argument makes an engagement anything else.
+        return ENGAGEMENT, False
     dry = args.get("dry_run") is True and name in DRY_RUN_TOOLS
     if name in READ_TOOLS:
         return READ, False
@@ -850,8 +1047,15 @@ def classify(tool: str, args: dict | None) -> Decision:
             acknowledge=klass in ACKNOWLEDGE_CLASSES,
         )
     except Exception:  # noqa: BLE001 -- a policy bug must never auto-approve
+        name = bare_name(str(tool))
+        if name in ENGAGEMENT_TOOLS:
+            # Fail closed means the STRICTER class: an engagement keeps its
+            # acknowledgement and the console-only approval path (D2).
+            return Decision(klass=ENGAGEMENT, auto=False, allow_session=False,
+                            title=_TITLES[name], summary="Unparsed arguments",
+                            consequences=WG_ENGAGEMENT_NOTES, acknowledge=True)
         return Decision(klass=COMMAND, auto=False, allow_session=False,
-                        title=_nobidi(f"Run {bare_name(str(tool))}"),
+                        title=_nobidi(f"Run {name}"),
                         summary="Unparsed arguments",
                         consequences=(("The call could not be classified, so it is "
                                        "treated as a command."),))

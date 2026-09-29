@@ -1764,3 +1764,189 @@
   gap: 4px;
   min-width: 0;
 }
+
+/* ------------------------------------------------ the simulated wargame */
+/* WG spec §5.3 (M14a). Sand is the umpire's ink; red and blue are never
+   hues here (sides are frames and words). Nothing wargame is green. */
+
+:where(.ic-root) .ic-kit-reg[data-register='scenario'],
+:where(.ic-root) .ic-kit-reg[data-register='simulated'] {
+  border-color: var(--ic-class-sim, #cdbc8c);
+  color: var(--ic-class-sim, #cdbc8c);
+}
+
+:where(.ic-root)
+  :is(
+    .ic-kit-threat,
+    .ic-inspector__status,
+    .ic-search__status
+  )[data-tone='sand'] {
+  color: var(--ic-class-sim, #cdbc8c);
+}
+
+:where(.ic-root) .ic-search__row[data-tone='sand'] {
+  --ic-row-ink: var(--ic-class-sim, #cdbc8c);
+}
+
+:where(.ic-root) .ic-search__row[data-tone='stale'] {
+  --ic-row-ink: var(--ic-stale, #8a98a2);
+}
+
+/* Rail: the Wargame section (§5.3.10), between Missions and Alarms. */
+:where(.ic-root) .ic-rail__wargame .ic-rail__head {
+  justify-content: flex-start;
+  align-items: center;
+}
+
+:where(.ic-root) .ic-rail__wg-toggle {
+  margin-left: auto;
+}
+
+:where(.ic-root) .ic-rail__wargame[data-open='false'] .ic-rail__wg-toggle {
+  transform: rotate(-90deg);
+}
+
+:where(.ic-root) .ic-rail__wg-side .ic-kit-part:first-child {
+  min-width: 36px;
+  color: var(--ic-film, #e6ecef);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-rail__wg-side,
+:where(.ic-root) .ic-rail__wg-recent {
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-rail__line[data-status='sand'],
+:where(.ic-root)
+  .ic-rail__wg-block[data-block='pending']
+  .ic-rail__wg-subtitle {
+  color: var(--ic-class-sim, #cdbc8c);
+}
+
+:where(.ic-root) .ic-rail__wg-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+:where(.ic-root) .ic-rail__wg-subtitle {
+  margin: 4px 0 0;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 500 12px/16px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-rail__wg-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
+:where(.ic-root) .ic-rail__wg-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-rail__wg-recent {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-height: 32px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--ic-pencil, #a3b0ba);
+  font: 400 13px/20px var(--ic-font-sans, inherit);
+  text-align: left;
+  cursor: pointer;
+}
+
+:where(.ic-root) .ic-rail__wg-recent:hover .ic-kit-part:first-child {
+  color: var(--ic-film, #e6ecef);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+:where(.ic-root) .ic-rail-strip__wargame[data-pending='true'] {
+  color: var(--ic-class-sim, #cdbc8c);
+}
+
+/* Inspector: forces, engagements and vectors (§5.3.4, §5.3.6). */
+:where(.ic-root) .ic-inspector__wg-side {
+  color: var(--ic-film, #e6ecef);
+}
+
+:where(.ic-root) .ic-inspector__wg-side[data-side='unknown'] {
+  color: var(--ic-unknown, #bba7e0);
+}
+
+:where(.ic-root) .ic-inspector__wg-fixed,
+:where(.ic-root) .ic-inspector__wg-context {
+  margin: 8px 0 0;
+  padding-left: 8px;
+  border-left: 2px solid var(--ic-class-sim, #cdbc8c);
+  color: var(--ic-film, #e6ecef);
+  font: 500 13px/20px var(--ic-font-sans, inherit);
+}
+
+:where(.ic-root) .ic-inspector__wg-mismatch {
+  display: block;
+  color: var(--ic-class-sim, #cdbc8c);
+}
+
+:where(.ic-root) .ic-inspector__legs {
+  border-collapse: collapse;
+  font: 400 12px/16px var(--ic-font-sans, inherit);
+  font-variant-numeric: tabular-nums;
+}
+
+:where(.ic-root) .ic-inspector__legcell {
+  padding: 2px 12px 2px 0;
+  text-align: left;
+}
+
+:where(.ic-root) th.ic-inspector__legcell {
+  color: var(--ic-pencil, #a3b0ba);
+  font-weight: 500;
+}
+
+:where(.ic-root)
+  .ic-inspector__legs
+  tr[data-exposure='moderate']
+  td:nth-child(2) {
+  color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-inspector__legs tr[data-exposure='high'] td:nth-child(2) {
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-inspector__aar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+:where(.ic-root) .ic-inspector__aar-title {
+  margin: 0;
+  color: var(--ic-film, #e6ecef);
+  font: 600 15px/24px var(--ic-font-sans, inherit);
+}
+
+@media (forced-colors: active) {
+  :where(.ic-root) .ic-kit-reg[data-register='scenario'],
+  :where(.ic-root) .ic-kit-reg[data-register='simulated'] {
+    border-color: CanvasText;
+  }
+
+  :where(.ic-root) .ic-inspector__wg-fixed,
+  :where(.ic-root) .ic-inspector__wg-context {
+    border-left-color: CanvasText;
+  }
+}

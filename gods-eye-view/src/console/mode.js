@@ -35,10 +35,17 @@
  * while tracking, only the toast. The operator's own Show on map acts at
  * once. Without `port.supports('showArea')` every request says the map
  * can't show areas in this build.
+ *
+ * Read view (WG spec §5.3.11): `requestRead(doc)` opens a report's full
+ * Markdown (the after-action review) in the stage. On the orb it opens at
+ * once; from the map or tracking the console first goes back to the orb
+ * and the read view opens on arrival (if that takes under READ_WAIT_MS).
+ * The shell draws it (`onRead`); Esc there returns to the covered view.
  */
 
 import { kindWords } from './chat/format.js';
 import { safeText } from './orb/placeText.js';
+import { readDocOf } from './readView.js';
 import { focusBack, rememberFocus } from './situation.js';
 
 export const MODE_STATES = Object.freeze([
@@ -56,6 +63,8 @@ export const IRIS_OPEN_MS = 600;
 export const MAIN_FADE_MS = 200;
 export const IRIS_CLOSE_MS = 400;
 export const CROSSFADE_MS = 150;
+/** How long a read request waits for the console to come back to the orb. */
+export const READ_WAIT_MS = 5000;
 
 /** Copy deck strings for tracking (UX spec §6.9, §8, §10). */
 export const MODE_COPY = Object.freeze({
@@ -348,8 +357,13 @@ export function createModeController({
   let returnTarget = null;
   let exitingFrom = null;
   let overlays = { sites: true };
+  // The wargame's kinds (WG §5.3.12) join only once the dock sets them, so
+  // an ISR call stays exactly `{sites}`.
+  // A read request made off the orb, opened when the orb shows again.
+  let pendingRead = null;
   const changeListeners = new Set();
   const noticeListeners = new Set();
+  const readListeners = new Set();
   const timers = new Set();
   const offs = [];
 
@@ -401,6 +415,29 @@ export function createModeController({
     root?.setAttribute?.('data-mode', state);
     emitChange(prev);
     bus?.emit?.('mode', { mode: state, vehicle });
+    // After the exit finishes its own work (select, inspect, focus back).
+    if (state === 'orb' && pendingRead)
+      Promise.resolve().then(() => {
+        if (!destroyed && state === 'orb') flushRead();
+      });
+  }
+
+  function emitRead(docToRead) {
+    for (const cb of [...readListeners]) {
+      try {
+        cb({ ...docToRead });
+      } catch (err) {
+        globalThis.console?.error?.(err);
+      }
+    }
+  }
+
+  function flushRead() {
+    const waiting = pendingRead;
+    pendingRead = null;
+    if (!waiting) return;
+    if (clock.now() - waiting.at > READ_WAIT_MS) return;
+    emitRead(waiting.doc);
   }
 
   function vehicleId(v) {
@@ -1309,11 +1346,32 @@ export function createModeController({
     doExit();
   }
 
-  /** The dock's overlay switches (Phase A: `sites`). */
+  /**
+   * Open a report in the read view (WG §5.3.11): `raw` is anything
+   * `readDocOf` accepts. On the orb it opens at once; elsewhere the console
+   * goes back to the orb first. Returns false when there is nothing to read.
+   */
+  function requestRead(raw) {
+    const docToRead = readDocOf(raw);
+    if (!docToRead || destroyed) return false;
+    if (state === 'orb') {
+      pendingRead = null;
+      emitRead(docToRead);
+      return true;
+    }
+    pendingRead = { doc: docToRead, at: clock.now() };
+    backToConsole();
+    return true;
+  }
+
+  /** The dock's overlay switches (Phase A: `sites`; WG §5.3.12: `forces`,
+   *  `engagements`, `vectors`). */
   function setOverlays(next) {
     if (!next || typeof next !== 'object') return;
-    if (typeof next.sites === 'boolean')
-      overlays = { ...overlays, sites: next.sites };
+    for (const kind of ['sites', 'forces', 'engagements', 'vectors']) {
+      if (typeof next[kind] === 'boolean')
+        overlays = { ...overlays, [kind]: next[kind] };
+    }
     if (state === 'map') port.setOverlayVisibility?.({ ...overlays });
   }
 
@@ -1402,6 +1460,7 @@ export function createModeController({
     requestTrack,
     requestOrb,
     requestMap,
+    requestRead,
     exit: () => exitInnermost(),
     backToConsole,
     setOverlays,
@@ -1424,6 +1483,13 @@ export function createModeController({
       noticeListeners.add(entry);
       return () => noticeListeners.delete(entry);
     },
+    /** `cb({id, title, markdown, simulated})` when the read view should open. */
+    onRead(cb) {
+      if (typeof cb !== 'function') return () => {};
+      const entry = (d) => cb(d);
+      readListeners.add(entry);
+      return () => readListeners.delete(entry);
+    },
     destroy() {
       if (destroyed) return;
       destroyed = true;
@@ -1433,6 +1499,8 @@ export function createModeController({
       for (const off of offs.splice(0)) off?.();
       changeListeners.clear();
       noticeListeners.clear();
+      readListeners.clear();
+      pendingRead = null;
       notices = [];
     },
   };

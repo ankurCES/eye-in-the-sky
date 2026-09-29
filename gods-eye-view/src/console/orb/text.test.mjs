@@ -340,14 +340,19 @@ const BIDI_CHARS = /[\u202A-\u202E\u2066-\u2069]/;
 
 test('fail-safe words: an unknown type reads "Unrecognised", its status is never read (WG §4.2.1)', () => {
   const node = {
-    id: 'frc:red-sam-1',
-    type: 'force',
+    id: 'stk:1',
+    type: 'strike_package',
     label: 'Red SAM 1',
     subtitle: 'Red · SAM · Active',
     status: 'ok',
   };
+  assert.equal(typeWord('strike_package'), 'Unrecognised');
+  assert.equal(typeLabel('strike_package'), 'Unrecognised (strike_package)');
+  // Surfaces that have not opted in to the wargame keep the fail-safe for
+  // its types; the orb opts in (WG §5.3.4).
   assert.equal(typeWord('force'), 'Unrecognised');
   assert.equal(typeLabel('force'), 'Unrecognised (force)');
+  assert.equal(typeLabel('force', { wargame: true }), 'Force');
   assert.equal(typeLabel('track'), 'Contact');
   assert.equal(unrecognisedItemTitle('force'), 'Unrecognised item (force)');
   assert.match(UNRECOGNISED_ITEM_LINE, /isn't a statement that it's safe\.$/);
@@ -360,14 +365,14 @@ test('fail-safe words: an unknown type reads "Unrecognised", its status is never
   assert.equal(registerOf(node), 'Not assessed');
   assert.equal(nodeLabel(node), 'Red SAM 1', 'label verbatim');
   assert.deepEqual(splitSegments(nodeSubtitle(node)), [
-    'Unrecognised (force)',
+    'Unrecognised (strike_package)',
     'Red',
     'SAM',
     'Active',
   ]);
   assert.equal(
     optionText(node),
-    'Red SAM 1, unrecognised (force), not assessed, Red, SAM, Active',
+    'Red SAM 1, unrecognised (strike_package), not assessed, Red, SAM, Active',
   );
   // A hostile type string stays text and is cut short.
   const odd = typeLabel(`${XSS}${BIDI}${'x'.repeat(80)}`);

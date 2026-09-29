@@ -1,3 +1,5 @@
+> Historical document. The ISR-only rule is amended by PLAN.md §4.5a (M14a).
+
 # godSeye — Agentic UAV Mission Simulation System
 ## Technical Implementation Plan (DRAFT v0.1 — pending expert review)
 

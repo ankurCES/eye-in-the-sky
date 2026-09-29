@@ -6,8 +6,9 @@ UAV backend (AirSim, or a built-in fake), the **MCP server** that is the only co
 of them, plus the console UI, as one process on one origin. The repository `README.md` covers
 installing and running the app; this file is the view from inside `godseye/`.
 
-**ISR-only.** There are no kinetic tools anywhere in the system. It observes, classifies and
-reports; command authority stays with the operator.
+**ISR by default.** In ISR mode there are no kinetic tools; the opt-in simulated wargame (M14a,
+PLAN.md §4.5a) engages simulated scenario units only. It observes, classifies and reports; command
+authority stays with the operator.
 
 ```
  python -m godseye_uav.app            (the app; start.sh runs it --headless)
@@ -15,6 +16,8 @@ reports; command authority stays with the operator.
  │ /                     console UI (gods-eye-view build)                   │
  │ /app/config /intel/* /chat/*        host routes (host.py, intel_graph,   │
  │                                     chat)                                │
+ │ /app/console-claim /wargame/*       simulated wargame (M14a): the        │
+ │                                     console key, End (wargame_tools)     │
  │ /mcp                  MCP server (server.py), bearer auth                │
  │ /health /snapshot /events ...       telemetry bridge (bridge.py)         │
  └────────────┬──────────────────────────────────────────────────────────────┘
@@ -60,11 +63,16 @@ The app's theater, map-data and airframe flags (`app.py`, WG v2 Phase A):
 | `--geodata on\|off` | `on` | On-demand map data over the network: place lookup, mapped sites and ground samples for new theaters. `off` keeps the app offline for these: places are given as coordinates, and a new area needs the operator's `ground_msl_m`. |
 | `--real-data off\|direct\|gev` | flag absent: `$GODSEYE_REAL_DATA`, unset = off | Real-world data for the safety loop (terrain AGL and LOS, geofence floor, weather). `direct` fetches Re:Earth and Open-Meteo itself; `gev` uses God's Eye View's proxies at `$GODSEYE_GEV_ORIGIN`. An explicit `off` wins over the environment. |
 | `--airframe quad_suas_electric\|group3_fixed_wing` | the restored theater's airframe, else `$GODSEYE_AIRFRAME`, else `quad_suas_electric` | The fuel-model profile. An explicit flag wins even over a restored theater's airframe. |
+| `--wargame-mcp` | off | Also publish the simulated wargame's ten `wg_*` tools on `/mcp` for external harnesses (M14a). Off, `/mcp` has none: ISR by default. Engagements are still approved in the console only. |
 
 The startup banner says whether the theater was restored from the store (with its epoch), prints a
 WARNING line when the persisted theater could not be used (the default is booted instead and the
 store's audit trail records `theater_restore_failed`), and adds a line
-`map data : on|off (geocoding and mapped sites); real-data hydration on|off`.
+`map data : on|off (geocoding and mapped sites); real-data hydration on|off`. With `--wargame-mcp`
+only, it also prints `wargame  : --wargame-mcp: simulated wg_* tools are also on /mcp; engagements
+are still approved in the console only`. The repository's `./eye-in-the-sky` launcher forwards its
+arguments, so `./eye-in-the-sky --wargame-mcp` works; `start.sh` passes a fixed argument list and
+never sets it.
 
 `godseye_uav.launch` (the older three-listener launcher) is unchanged and still used by tests.
 
@@ -74,8 +82,11 @@ The analyst (`chat.py`) runs the Claude Code CLI through the Claude Agent SDK, o
 chat session, with no built-in tools and only an in-process MCP server named `godseye`
 (`analyst_toolbelt.py`) whose tools are generated from the real server. Every call is classified by
 `analyst_policy.py`: reads and dry runs run at once; sensor, command, sim and safety-override calls
-wait for the operator's order slip in the console. Its system prompt is `analyst_prompt.md`,
-distilled from the skill below.
+wait for the operator's order slip in the console, and a simulated `engagement` asks every time,
+with an acknowledgement, from the console that holds the engagement key. Its system prompt is the
+base `analyst_prompt.md`, distilled from the skill below, followed by one identity file:
+`analyst_prompt_isr.md` by default, or `analyst_prompt_wargame.md` during a simulated wargame
+session (all three are package data).
 
 It needs the `app` extra (`pip install -e '.[app]'`, which brings `claude-agent-sdk` and
 `pywebview`) and a model provider: the Claude sign-in on this machine by default, or one chosen in
@@ -107,6 +118,35 @@ simulator up to ten times faster. A real place is **context only**: mapped strat
   `REAL_DATA_INTEGRATION.md` and `../THIRD_PARTY_NOTICES.md` §4.
 - The bridge's side (`/snapshot.theater`, the geofence re-read, the flown-track reset):
   `BRIDGE_CONTRACT.md`, "Runtime theaters".
+
+## The simulated wargame (M14a)
+
+ISR is the default (PLAN.md §4.5a). An opt-in, operator-approved **simulated wargame session** adds
+scenario forces (simulated units with generic designators such as "Red SAM 1"), notional
+engagements between them, red air defence that can down drones, corridors and axes, battle-damage
+re-looks and an after-action review. Nothing real is fired, and nothing real can be engaged: a
+mapped site, a theater point, a `sim_spawn_*` object or real air traffic is refused by provenance,
+and targets near mapped places are refused too. Drones never deliver effects; they fly recce and
+re-looks with the ordinary ISR tools. Every wargame output carries `simulated: true`.
+
+- **Code.** `wargame.py` (the engine, its red-adjudication thread and the propose → authorize →
+  execute rules), `wargame_tables.py` and `wargame_adjudicate.py` (notional tables and draws),
+  `wargame_vectors.py` (corridors and axes), `wargame_spawn.py`, `wargame_bda.py`, `wargame_aar.py`
+  (the after-action review and `<store>/wargame.json` crash persistence), `wargame_tools.py` (the ten
+  `wg_*` tools and `POST /wargame/session/end`) and `intel_scenario.py` (the wargame in the intel
+  graph and on the map). `threat.py`, `missions.py` and `targets.OB_LIBRARY` stay ISR-only.
+- **Tools.** `TOOL_CONTRACT.md` §4.6. They live on the server's own registry (`server.wargame_mcp`,
+  never mounted). The in-app analyst gets the three entry tools (`wg_session_start`,
+  `wg_session_status`, `wg_list_classes`) in ISR mode and all ten during a session. The default
+  `/mcp` publishes none; `--wargame-mcp` publishes all ten for external harnesses.
+- **Every engagement asks the operator.** `wg_execute_engagement` is class `engagement`: asked on
+  every call, never session-grantable, acknowledgement required, never automatic. The chat service
+  authorizes a pending engagement only after the console approves it with this launch's console key
+  (`POST /app/console-claim`, claimed once) and the acknowledgement, and the engine executes it only
+  inside that chat session's console context. `/mcp` and `/control/command` can never confirm one;
+  the bridge refuses every `wg_*` tool with 403.
+- **Operator flow, the console key, the Blue and Umpire views, the graph and map rows, the audit
+  rows and the known limits:** `INTEL_CONSOLE.md`, "Simulated wargame (M14a)".
 
 ## Connecting a harness
 
@@ -148,6 +188,9 @@ Note this SDK's `streamable_http_client` takes `http_client=` (not `headers=`) a
 Calls over `/mcp` do not pass through the console's order slips (those are for the in-app analyst);
 the server's own safety gates apply to every caller. That includes `sim_set_theater`: an `/mcp`
 caller can switch the theater with the same refusals, and the theater records `set_via: "mcp"`.
+The simulated wargame's `wg_*` tools are on `/mcp` only when the app runs with `--wargame-mcp`, and
+even then an `/mcp` caller can never confirm an engagement: `wg_execute_engagement` answers
+`engagement_requires_console_approval`. The skill below stays ISR-only and never calls them.
 
 ## The skill
 
@@ -183,25 +226,31 @@ stricter.
   airborne or busy, say) is refused before the switch blocks ticks and commands.
 - **Restart**: an interrupted route is re-gated against the booted theater before it resumes; one
   planned in another theater is aborted with a forced RTB (`restart_resume_regate_failed`).
+- **Simulated wargame** (M14a): a drone red air defence downs is lost until the session ends (its
+  task is aborted and every submit for it is refused with `vehicle_lost`); a theater switch and
+  `sim_reset` are refused while a session runs; ending the session parks every downed drone at
+  home, landed. A restart during a session never resumes it: the next boot deletes its scenario
+  tracks and files a partial after-action review.
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `mcp/godseye_uav/app.py`, `host.py` | Entry point (window, browser, headless, self-test) and the single-process host |
-| `mcp/godseye_uav/server.py` | MCP server: 51 tools, 8 resources |
+| `mcp/godseye_uav/server.py` | MCP server: 51 tools, 8 resources (plus the ten `wg_*` tools under `--wargame-mcp`) |
 | `mcp/godseye_uav/bridge.py` | Telemetry bridge |
-| `mcp/godseye_uav/intel_graph.py`, `intel_sites.py`, `intel_overlay.py` | Intel graph and `/intel/*` routes; mapped-site nodes; the map's `/intel/overlay` feed |
+| `mcp/godseye_uav/intel_graph.py`, `intel_sites.py`, `intel_overlay.py`, `intel_scenario.py` | Intel graph and `/intel/*` routes; mapped-site nodes; the map's `/intel/overlay` feed; the simulated wargame's rows in both |
 | `mcp/godseye_uav/theaters.py`, `theater_plan.py`, `theater_switch.py`, `theater_tools.py` | Theater table and dynamic registry; proposals; the switch and `theater.json`; the five theater and sim-speed tools |
 | `mcp/godseye_uav/geo_http.py`, `geocode.py`, `sites.py` | Direct map-data upstreams (User-Agent, rate gates, cache, egress switch); Photon/Nominatim lookup; OpenStreetMap sites |
-| `mcp/godseye_uav/chat.py`, `analyst_policy.py`, `analyst_toolbelt.py`, `analyst_prompt.md` | The analyst |
+| `mcp/godseye_uav/chat.py`, `analyst_policy.py`, `analyst_toolbelt.py`, `analyst_prompt.md`, `analyst_prompt_isr.md`, `analyst_prompt_wargame.md` | The analyst: service, approval policy, toolbelt, and the system prompt (base plus one identity per mode) |
+| `mcp/godseye_uav/wargame.py`, `wargame_tables.py`, `wargame_adjudicate.py`, `wargame_vectors.py`, `wargame_spawn.py`, `wargame_bda.py`, `wargame_aar.py`, `wargame_tools.py` | The opt-in simulated wargame (M14a): engine, notional tables, corridors, placement, battle damage, after-action review, the `wg_*` tools and the End route |
 | `mcp/godseye_uav/llm_settings.py`, `llm_providers.py` | The analyst's model providers: `/settings/llm*`, keys, connection checks, the catalog |
 | `mcp/godseye_uav/` (rest) | Safety, tasking, missions, targets, threat, geo, store, theaters, real data, fake sim |
 | `packaging/macos/` | PyInstaller spec, entry point and icon (built by `../scripts/build_desktop.sh`) |
 | `tests/` | Test suite; runs with no GPU and no Unreal |
 | `scripts/` | `demo_laptop.sh` (one-command demo), `demo_mission.py`, `ci.sh`, `_airsim_client.sh` |
 | `.agents/skills/godseye-uav/` | The harness skill |
-| `INTEL_CONSOLE.md` | Host, HTTP and SSE contract, approvals, analyst, data honesty |
+| `INTEL_CONSOLE.md` | Host, HTTP and SSE contract, approvals, analyst, the simulated wargame's console side, data honesty |
 | `TOOL_CONTRACT.md` | MCP tool and resource contract |
 | `BRIDGE_CONTRACT.md` | Bridge feed contract and the in-process accessors |
 | `REAL_DATA_INTEGRATION.md` | Which real-world data the sim can consume, and its limits |

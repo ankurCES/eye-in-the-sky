@@ -27,7 +27,8 @@ import math
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 
 # --------------------------------------------------------------------------
 # §4.6(a) — order-of-battle library (M13a)
@@ -802,6 +803,34 @@ def mint_origin(now: float | None = None) -> str:
 ELEMENT_RADIUS_M = 500.0     # SALUTE 'Size': how far apart peers can be
 _DWELL_RADIUS_M = 25.0       # movement below this counts as stationary
 
+#: M14a (WG §5.2.9): how a SALUTE and a threat assessment mark a contact that
+#: is a simulated wargame scenario unit. Never set on an ISR track.
+SCENARIO_CONTACT_NOTE = "Scenario contact (simulated)"
+
+_NOTIONAL_OB: dict[str, ObClass] = {}
+
+
+def notional_ob(row: ObClass) -> ObClass:
+    """M14a (D1, WG §5.2.2): the library row a scenario contact reports under.
+
+    The numbers stay (the ISR standoff and threat maths are unchanged); every
+    name-bearing field becomes the generic wargame label, so a SALUTE, threat
+    assessment or INTREP about a simulated unit never carries a real system
+    name. ISR tracks never reach this (`Track.scenario` is False for them).
+    """
+    if row is UNCLASSIFIED:  # already generic; callers test it by identity
+        return row
+    cached = _NOTIONAL_OB.get(row.key)
+    if cached is None:
+        # lazy: wargame_tables imports this module
+        from .wargame_tables import label_for_ob
+        cached = _NOTIONAL_OB[row.key] = replace(
+            row, name=f"{label_for_ob(row.key)} (notional)",
+            capabilities=("notional capability (simulated)",),
+            typical_unit_size="notional element",
+            signature_cues=(SCENARIO_CONTACT_NOTE,), keywords=())
+    return cached
+
 
 def _ground_m(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
     """Ground distance in metres (local equirectangular; <1 m error in an AO)."""
@@ -838,6 +867,10 @@ class Track:
     observations: list = field(default_factory=list)   # list[Observation]
     sim_epoch: int = 0
     max_observations: int = 50
+    #: M14a: the contact is a simulated wargame scenario unit. Only the
+    #: server's ingest hook sets it (after `srv.wargame.owns_name(name)`);
+    #: False everywhere else, so ISR tracks serialise exactly as before.
+    scenario: bool = False
 
     # ---- derived ----
     @property
@@ -845,11 +878,14 @@ class Track:
         """Order-of-battle row backing this track (M13a).
 
         Falls back to the category's representative row so tracks built before
-        ob_class existed still resolve to a real library entry.
+        ob_class existed still resolve to a real library entry. A simulated
+        scenario contact (M14a) resolves to its `notional_ob` row.
         """
         if self.ob_class in OB_LIBRARY:
-            return OB_LIBRARY[self.ob_class]
-        return ob_for_category(self.category)
+            row = OB_LIBRARY[self.ob_class]
+        else:
+            row = ob_for_category(self.category)
+        return notional_ob(row) if self.scenario else row
 
     @property
     def track_age_s(self) -> float:
@@ -913,7 +949,9 @@ class Track:
 
     # ---- (de)serialization for store.py persistence (M11/M12) ----
     def to_dict(self) -> dict:
-        return {
+        """JSON-ready row. `scenario` appears only when True (M14a), so an
+        ISR track's row is byte-identical to the pre-wargame shape."""
+        row = {
             "track_id": self.track_id, "uid": self.uid,
             "origin_run": self.origin_run, "name": self.name,
             "category": self.category, "ob_class": self.ob_class,
@@ -925,6 +963,9 @@ class Track:
             "history": [list(h) for h in self.history],
             "observations": [o.to_dict() for o in self.observations],
         }
+        if self.scenario:
+            row["scenario"] = True
+        return row
 
     @classmethod
     def from_dict(cls, d: dict) -> "Track":
@@ -942,6 +983,8 @@ class Track:
             ob_class=d.get("ob_class", "unclassified"),
             match_evidence=d.get("match_evidence") or {},
             sim_epoch=int(d.get("sim_epoch", 0)),
+            # strict: only the JSON literal true marks a scenario contact
+            scenario=d.get("scenario") is True,
         )
         t.history = [tuple(h) for h in d.get("history", [])]
         t.observations = [Observation.from_dict(o) for o in d.get("observations", [])]
@@ -1062,6 +1105,14 @@ class TrackManager:
         #: detections dropped because they carried no contact position (never
         #: back-filled from the observer) — auditable.
         self.rejected: list[dict] = []
+        #: M14a (WG §5.2.6, D1): "is this object name a simulated wargame
+        #: scenario unit?" The server injects `srv._wargame_owns`, so this module
+        #: stays engine-agnostic. A detection or track on the scenario side of
+        #: that line associates ONLY with the same object name: a non-scenario
+        #: object's detections never fold into a scenario track, nor the reverse.
+        #: With no session running it answers False everywhere, so ISR
+        #: association is exactly nearest-within-radius, as before.
+        self.segregate: Callable[[str], bool] | None = None
         if state:
             self.load_state(state)
 
@@ -1074,12 +1125,25 @@ class TrackManager:
                 self._minted.add(tid)
                 return tid
 
-    def _associate(self, lat: float, lon: float) -> Track | None:
+    def _associate(self, lat: float, lon: float,
+                   name: str | None = None) -> Track | None:
+        """The nearest track within `associate_radius_m`, or None.
+
+        Provenance split (M14a, D1): when the detection's object `name` or a
+        candidate track is a scenario one (`segregate`, or `Track.scenario`),
+        they associate only if the object names are equal.
+        """
+        owns = self.segregate
+        det_scenario = bool(owns is not None and name is not None and owns(name))
         best, best_d = None, self.associate_radius_m
         for t in self._tracks.values():
             d = _ground_m(t.lat, t.lon, lat, lon)
-            if d < best_d:
-                best, best_d = t, d
+            if d >= best_d:
+                continue
+            if t.name != name and (det_scenario or t.scenario
+                                   or (owns is not None and owns(t.name))):
+                continue
+            best, best_d = t, d
         return best
 
     def ingest(self, detections: list[dict], now: float | None = None,
@@ -1108,7 +1172,7 @@ class TrackManager:
                 continue
             alt = gp.get("altitude", 0.0)
             obs = self._observation(det, lat, lon, alt, now, sensor, observer, frame_id)
-            track = self._associate(lat, lon)
+            track = self._associate(lat, lon, name)
             if track is None:
                 entry, match_ev = match_ob(name)
                 track = Track(
@@ -1163,6 +1227,24 @@ class TrackManager:
         self._tracks[track.track_id] = track
         self._minted.add(track.track_id)
         return track
+
+    def remove(self, ids) -> list[str]:
+        """Drop tracks by id; return the ids actually removed, in call order.
+
+        Used when a simulated wargame session ends (M14a, WG §5.2.9) to delete
+        its scenario tracks. Unknown and repeated ids are skipped. A removed id
+        stays minted, so `new_track_id` never re-issues it (M11: an id always
+        denotes the same object). The store journal is the caller's job
+        (`store.tracks.delete`). A bare string is one id, not its characters.
+        """
+        if isinstance(ids, str):
+            ids = [ids]
+        removed: list[str] = []
+        for tid in ids:
+            if self._tracks.pop(tid, None) is not None:
+                self._minted.add(tid)
+                removed.append(tid)
+        return removed
 
     def mark_sim_reset(self, now: float | None = None) -> dict:
         """sim_reset happened: bump the sim epoch, keep every track (M12).
@@ -1320,6 +1402,25 @@ class PatternOfLife:
     def observe_track(self, track: Track, ts: float | None = None) -> list[str]:
         return self.observe(track.track_id, track.category, track.lat, track.lon,
                             ts if ts is not None else track.last_seen)
+
+    def forget(self, track_ids) -> int:
+        """Drop open visits for these tracks; return how many were dropped.
+
+        Used when a simulated wargame session ends or is aborted by a restart
+        (M14a, WG §5.2.9): its scenario tracks are deleted, so no visit of
+        theirs may later close into a dwell sample. Nothing else moves —
+        counts already folded into a baseline stay, and no dwell sample is
+        recorded for a visit that is forgotten. A bare string is one id.
+        """
+        if isinstance(track_ids, str):
+            track_ids = [track_ids]
+        ids = set(track_ids)
+        dropped = 0
+        for b in self._pois.values():
+            for tid in ids & b.open_visits.keys():
+                del b.open_visits[tid]
+                dropped += 1
+        return dropped
 
     # ---- deviation metric ----
     def deviation(self, poi: str, category: str | None = None,
@@ -1518,7 +1619,9 @@ def salute_report(track: Track, observer: str = "UAV",
     ob = track.ob
     conf = assess_confidence(track, now)
     best = track.best_observation()
-    return {
+    # M14a: a simulated scenario contact says so on the equipment line.
+    prefix = f"{SCENARIO_CONTACT_NOTE}. " if track.scenario else ""
+    report = {
         "format": "SALUTE",
         "track_id": track.track_id,
         "uid": track.uid,
@@ -1554,7 +1657,7 @@ def salute_report(track: Track, observer: str = "UAV",
             "acquisition_range_m": ob.acquisition_range_m,
             "mobility": ob.mobility,
             "signature_cues": list(ob.signature_cues),
-            "text": f"{ob.name} ({track.name})",
+            "text": f"{prefix}{ob.name} ({track.name})",
         },
         "confidence": conf,
         # flat convenience mirrors for roster/HUD consumers
@@ -1569,6 +1672,10 @@ def salute_report(track: Track, observer: str = "UAV",
         "speed_mps": track.speed_mps,
         "heading_deg": track.heading_deg,
     }
+    if track.scenario:
+        report["scenario"] = True
+        report["simulated"] = True
+    return report
 
 
 #: Default number of contacts an INTREP expands. See `intrep_report`.

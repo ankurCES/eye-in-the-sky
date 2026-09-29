@@ -528,3 +528,109 @@ def test_live_net_tests_are_skipped_unless_opted_in():
     # Only ever runs under GODSEYE_LIVE_NET=1, and then with the guard lifted.
     assert os.environ.get(LIVE_NET_ENV) == "1"
     assert NO_EGRESS_ENV not in os.environ
+
+
+# ------------------------------------------------------------------ wargame_ok (M14a, B3b)
+
+#: WG spec §5.2.4: which rows a simulated wargame session may start in.
+WARGAME_OK = {
+    "default": True,          # AirSim's stock synthetic origin
+    "iran-isfahan": False,    # urban AO beside declared facilities
+    "iran-natanz": False,     # the home coordinates name the facility
+    "iran-fordow": False,     # the home coordinates name the facility
+    "indo-pak-loc": False,    # a live line of control
+    "ukraine-donbas": False,  # an active front line
+    "taiwan-strait": False,   # maritime: ground templates can't be placed
+    "red-sea-hormuz": False,  # maritime: ground templates can't be placed
+}
+
+
+def test_wargame_ok_table_is_exact_and_exhaustive():
+    # A new preset row has to take a position here, not inherit the default.
+    assert set(theaters.ids()) == set(WARGAME_OK)
+    assert {t.id: t.wargame_ok for t in theaters.all_theaters()} == WARGAME_OK
+    for tid, ok in WARGAME_OK.items():
+        assert theaters.get(tid).wargame_ok is ok
+
+
+def test_a_dynamic_theater_is_cleared_and_stays_cleared_through_registration():
+    t = _make()
+    assert t.wargame_ok is True
+    assert theaters.register_dynamic(t).wargame_ok is True
+    assert theaters.get(t.id).wargame_ok is True
+    # register_dynamic's own replace(dynamic=True) keeps the flag
+    stored = theaters.register_dynamic(dataclasses.replace(t, dynamic=False))
+    assert stored.dynamic is True and stored.wargame_ok is True
+
+
+def test_wargame_ok_is_outside_the_row_equality_and_hash():
+    for t in [*theaters.all_theaters(), _make()]:
+        assert "wargame_ok" not in t.as_dict()
+        assert "wargame_ok" not in json.dumps(t.as_dict())
+        flipped = dataclasses.replace(t, wargame_ok=not t.wargame_ok)
+        assert flipped == t and hash(flipped) == hash(t)
+        assert flipped.wargame_ok is (not t.wargame_ok)
+
+
+@pytest.mark.parametrize("tid", sorted(WARGAME_OK))
+def test_from_dict_keeps_a_preset_rows_table_value(tid):
+    # The row carries no flag, so a static row read back from disk (or any
+    # export) can never clear a preset the table refuses.
+    row = json.loads(json.dumps(theaters.get(tid).as_dict()))
+    assert theaters.from_dict(row).wargame_ok is WARGAME_OK[tid]
+
+
+def test_from_dict_clears_a_dynamic_row_and_fails_closed_on_any_other_id():
+    row = json.loads(json.dumps(_make().as_dict()))
+    assert theaters.from_dict(row).wargame_ok is True
+    stray = {**theaters.get("default").as_dict(), "id": "somewhere-else"}
+    assert theaters.from_dict(stray).wargame_ok is False
+    # ...even when the row tries to say otherwise
+    assert theaters.from_dict({**stray, "wargame_ok": True}).wargame_ok is False
+
+
+@pytest.mark.parametrize("value", [1, "true", "yes", None, [True]])
+def test_only_the_literal_true_clears_a_theater(value):
+    t = dataclasses.replace(_make(), wargame_ok=value)
+    assert t.wargame_ok is False
+    assert dataclasses.replace(_make(), wargame_ok=True).wargame_ok is True
+
+
+# -------------------------------------- wargame_ok near refused presets (review fix)
+
+#: Preset rows the table refuses (WG §5.2.4); a runtime AO over any of them is too.
+_REFUSED = sorted(tid for tid, ok in WARGAME_OK.items() if not ok)
+
+
+@pytest.mark.parametrize("tid", _REFUSED)
+def test_a_dynamic_ao_on_a_refused_presets_home_is_not_cleared(tid):
+    pre = theaters.get(tid)
+    t = _make("Field AO", center=(pre.home_lat, pre.home_lon), half=2200.0,
+              home_alt_msl_m=pre.home_alt_msl_m)
+    assert t.wargame_ok is False
+    assert theaters.register_dynamic(t).wargame_ok is False
+    assert theaters.get(t.id).wargame_ok is False
+    # read back from disk (theater.json) it stays refused
+    row = json.loads(json.dumps(t.as_dict()))
+    assert theaters.from_dict(row).wargame_ok is False
+    # every POI of the preset, too
+    for poi in pre.pois:
+        assert _make("POI AO", center=(poi.lat, poi.lon), half=1000.0).wargame_ok is False
+
+
+def test_the_preset_margin_is_a_few_km_beyond_the_preset_box():
+    nat = theaters.get("iran-natanz")
+    north = max(lat for lat, _ in nat.ao)
+    half = 1000.0
+
+    def ao_north_of_the_box(gap_m: float) -> theaters.Theater:
+        clat = north + (gap_m + half) / 111_320.0
+        return _make("North AO", center=(clat, nat.home_lon), half=half)
+
+    margin = theaters.WARGAME_PRESET_MARGIN_M
+    assert ao_north_of_the_box(margin - 1000.0).wargame_ok is False
+    assert ao_north_of_the_box(margin + 1000.0).wargame_ok is True
+    assert theaters.wargame_clear_of_presets(nat.ao) is False
+    assert theaters.wargame_clear_of_presets(theaters.get("default").ao) is True
+    for bad in ((), None, [("x", 1.0)]):
+        assert theaters.wargame_clear_of_presets(bad) is False       # fails closed

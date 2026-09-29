@@ -7,6 +7,8 @@ import {
   ALARM_INSET_VAR,
   MAP_HIDDEN_CLASS,
   MAP_INSET_CLASS,
+  MAP_INSET_TOP_CLASS,
+  MAP_INSET_TOP_VAR,
   MAP_INSET_VAR,
   OVERVIEW_CLASS,
   SHOW_AREA_DEFAULT_RADIUS_M,
@@ -1281,4 +1283,113 @@ test('a failed start answers queued overview calls false', async () => {
   assert.equal(deferred.supports('showArea'), false);
   assert.equal(await deferred.showArea(KHERSON), false);
   assert.equal(deferred.enterOverview(), false);
+});
+
+// ---- the simulated wargame: the strip's top inset and the view (B16) -----------
+
+test('a top inset (the wargame strip) lowers the map and recentres the keyhole rules', () => {
+  const h = harness();
+  h.port.setViewportInset({ right: 446, top: 27.6 });
+  assert.equal(h.body.style.props.get(MAP_INSET_TOP_VAR), '28px');
+  assert.equal(h.body.classList.contains(MAP_INSET_TOP_CLASS), true);
+  assert.equal(h.body.classList.contains(MAP_INSET_CLASS), true);
+  assert.equal(h.port.viewportInsetTop(), 28);
+  assert.equal(h.port.viewportInset(), 446, 'the right inset is kept');
+  const top = `var(${MAP_INSET_TOP_VAR},0px)`;
+  const right = `var(${MAP_INSET_VAR},0px)`;
+  const rules = TRACKING_PORT_CSS.split('\n').filter((rule) =>
+    rule.includes(`body.${MAP_INSET_TOP_CLASS} `),
+  );
+  assert.ok(
+    rules.includes(
+      `html body.${MAP_INSET_TOP_CLASS} #cesiumContainer{height:auto;top:${top};bottom:0}`,
+    ),
+  );
+  assert.ok(
+    rules.includes(`html body.${MAP_INSET_TOP_CLASS} #cockpit-hud{top:${top}}`),
+  );
+  const rim = rules.find((rule) => rule.includes('.cockpit-altitude-rim{'));
+  assert.ok(
+    rim.includes(`calc((100vh - ${top}) * 0.52)`),
+    'radius from the map height',
+  );
+  assert.ok(
+    rim.includes(`calc((100vw - ${right}) * 0.4)`),
+    'and the map width',
+  );
+  assert.ok(
+    rim.includes(
+      `top:calc(50vh - ${top} / 2 - var(--cockpit-keyhole-radius) + 20px)`,
+    ),
+  );
+  const cloud = rules.find((rule) => rule.includes('#cockpit-cloud-effects{'));
+  assert.ok(
+    cloud.includes(`at calc(50vw - ${right} / 2) calc(50vh + ${top} / 2)`),
+  );
+  // The top rules come after the right-inset ones, so they win together.
+  const css = TRACKING_PORT_CSS;
+  assert.ok(
+    css.indexOf(`body.${MAP_INSET_TOP_CLASS} .cockpit-altitude-rim{`) >
+      css.indexOf(`body.${MAP_INSET_CLASS} .cockpit-altitude-rim{`),
+  );
+  // No top means 0: the strip is gone after the session.
+  h.port.setViewportInset({ right: 446 });
+  assert.equal(h.body.style.props.get(MAP_INSET_TOP_VAR), '0px');
+  assert.equal(h.body.classList.contains(MAP_INSET_TOP_CLASS), false);
+  h.port.setViewportInset({ top: 'x' });
+  assert.equal(h.port.viewportInsetTop(), 0);
+  h.port.setViewportInset({ top: 28 });
+  h.port.destroy();
+  assert.equal(h.body.classList.contains(MAP_INSET_TOP_CLASS), false);
+  assert.equal(h.body.style.props.has(MAP_INSET_TOP_VAR), false);
+});
+
+test('setOverlayTruth sets the wargame view on the context layer (Blue view unless true)', () => {
+  const h = overviewHarness();
+  let truth = false;
+  h.uavLayer.getContextStatus = () => ({ status: 'ok', truth });
+  const setVisibility = h.uavLayer.setContextVisibility;
+  h.uavLayer.setContextVisibility = (kinds) => {
+    if (typeof kinds.truth === 'boolean') truth = kinds.truth;
+    return setVisibility(kinds);
+  };
+  assert.equal(h.port.supports('setOverlayTruth'), true);
+  assert.equal(h.port.setOverlayTruth(true), true);
+  assert.deepEqual(h.context.visibility.at(-1), { truth: true });
+  assert.equal(
+    h.port.setOverlayTruth('yes'),
+    false,
+    'only true is Umpire view',
+  );
+  assert.deepEqual(h.context.visibility.at(-1), { truth: false });
+  // A layer with its own setter is used directly.
+  const direct = [];
+  h.uavLayer.setContextTruth = (on) => (direct.push(on), on);
+  assert.equal(h.port.setOverlayTruth(true), true);
+  assert.deepEqual(direct, [true]);
+  h.port.destroy();
+  assert.equal(h.port.setOverlayTruth(true), null);
+  const bare = harness();
+  assert.equal(bare.port.supports('setOverlayTruth'), false);
+  assert.equal(bare.port.setOverlayTruth(true), null);
+  bare.port.destroy();
+});
+
+test('the deferred port remembers the view and applies it before the queued overview', () => {
+  const deferred = createDeferredTrackingPort();
+  assert.equal(deferred.supports('setOverlayTruth'), true);
+  assert.equal(deferred.setOverlayTruth(false), null);
+  deferred.enterOverview();
+  assert.equal(deferred.setOverlayTruth(true), null, 'the latest wins');
+  const real = recordingPort();
+  real.setOverlayTruth = (on) => (real.calls.push(['setOverlayTruth', on]), on);
+  deferred.attach(real);
+  assert.deepEqual(real.calls, [['setOverlayTruth', true], ['enterOverview']]);
+  assert.equal(deferred.setOverlayTruth(false), false);
+  assert.deepEqual(real.calls.at(-1), ['setOverlayTruth', false]);
+  // An older real port without the method: nothing breaks (Blue view).
+  const older = createDeferredTrackingPort();
+  older.setOverlayTruth(true);
+  older.attach(recordingPort());
+  assert.equal(older.setOverlayTruth(true), null);
 });

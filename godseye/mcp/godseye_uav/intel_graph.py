@@ -35,6 +35,12 @@ theater block from the in-process server (which always wins, R22),
 `meta.theater_epoch` / `meta.overlay_rev` / `meta.sites`, and the map's
 `/intel/overlay` feed (`intel_overlay`).
 
+WG v2 (B10, M14a) adds the simulated wargame (`intel_scenario`): `force`,
+`engagement` and `vector` nodes with their edges, `meta.wargame`, vehicle loss
+attrs, generic labels on scenario contacts and the after-action review's
+report node. `truth=1` (graph, entity) is the console's Umpire view; without
+it every answer is the Blue view, and the analyst never passes it.
+
 `build_graph` is PURE (inputs in, dict out) so it is exhaustively testable
 without a sim. `IntelService` gathers the inputs from the bridge's in-process
 state (`app.state.godseye`, bridge.py `_godseye_context`) and, when given one,
@@ -96,11 +102,14 @@ THREAT_RANK = {"critical": 5, "high": 4, "moderate": 3, "low": 2, "none": 1}
 CONFIDENCE_RANK = {"confirmed": 3, "probable": 2, "possible": 1}
 
 #: Node type -> id prefix (CONTRACT §4 "Node types and ids"). `site` is the
-#: mapped OSM context around the active theater (WG v2 §3.2, `intel_sites`).
+#: mapped OSM context around the active theater (WG v2 §3.2, `intel_sites`);
+#: `force`, `engagement` and `vector` are the simulated wargame's scenario
+#: rows (M14a, WG v2 §3.2, `intel_scenario`).
 TYPE_PREFIX = {
     "vehicle": "veh", "mission": "msn", "track": "trk", "unit": "unit",
     "equipment": "ob", "report": "rpt", "theater": "thr", "poi": "poi",
     "alarm": "alarm", "feed": "feed", "site": "sit",
+    "force": "frc", "engagement": "eng", "vector": "vec",
 }
 PREFIX_TYPE = {v: k for k, v in TYPE_PREFIX.items()}
 
@@ -163,6 +172,12 @@ class GraphInputs:
     theater_state: dict | None = None
     #: `srv.sites` (a `sites.SiteSet`) when the server is in-process, else None.
     sites: Any = None
+    #: The console's Umpire view (`/intel/graph?truth=1`, WG v2 §3.2): red
+    #: truth from the simulated wargame. The analyst's reads are always False.
+    truth: bool = False
+    #: `intel_scenario.gather(srv, truth=)`: the wargame engine's rows for this
+    #: view `{nodes, edges, meta, revision, vehicles_lost}`, `{error}`, or None.
+    wargame: dict | None = None
     #: sources that could not be read while gathering, as sentences
     source_errors: list[str] = field(default_factory=list)
     #: wall clock for staleness; None = now. Tests pin it.
@@ -357,6 +372,8 @@ class _Track:
     threat: str | None
     row: dict
     compact: bool
+    #: M14a: a simulated wargame scenario contact (generic label, WG v2 §3.2)
+    scenario: bool = False
 
 
 @dataclass
@@ -414,6 +431,12 @@ def _track_from(row: dict | None, contact: dict | None) -> _Track | None:
         platform = OB_LIBRARY[ob_class].name
     if not platform:
         platform = _s(_d(contact.get("salute")).get("equipment")) or _humanize(category)
+    # M14a: a scenario contact reads as its generic label, never an OB name
+    scenario = src.get("scenario") is True or contact.get("scenario") is True
+    if scenario:
+        from .intel_scenario import scenario_label
+
+        platform = scenario_label(ob_class)
     confidence = (_s(src.get("confidence_level"))
                   or (_s(conf.get("level")) if isinstance(conf, dict) else _s(conf))
                   or _s(contact.get("confidence")))
@@ -427,7 +450,7 @@ def _track_from(row: dict | None, contact: dict | None) -> _Track | None:
         last_seen=last, confidence=confidence.lower(),
         confidence_score=_num(conf.get("score")) if isinstance(conf, dict) else None,
         sightings=sightings, threat=threat.lower() or None,
-        row=src, compact=row is None)
+        row=src, compact=row is None, scenario=scenario)
 
 
 def _normalise_tracks(rows: Iterable[dict], contacts: Iterable[dict]) -> list[_Track]:
@@ -521,8 +544,12 @@ class _GraphBuilder:
         self.site_index: dict[str, Any] = {}
         self.sites_current: Any = None
         self.meta_sites: dict = {}
-        #: caveats a context module adds (sites); `_caveats` places them
+        #: caveats a context module adds (sites, wargame); `_caveats` places them
         self.context_caveats: list[str] = []
+        # the simulated wargame (intel_scenario.add_nodes): drawn rows, meta
+        self.wargame_rows: dict[str, dict] = {}
+        self.wargame_full: dict[str, dict] = {}
+        self.meta_wargame: dict = {"active": False, "last": None}
         self.caveats: list[str] = []
         self.meta: dict = {}
         self.active: dict = {}
@@ -537,7 +564,7 @@ class _GraphBuilder:
 
     # ---- entry -------------------------------------------------------------
     def build(self) -> dict:
-        from . import intel_sites  # imports this module, so loaded on first build
+        from . import intel_scenario, intel_sites  # both import this module
 
         self._theaters()
         self._tracks()
@@ -549,6 +576,7 @@ class _GraphBuilder:
         self._alarm_nodes()
         self._feed_nodes()
         self._edges()
+        intel_scenario.add_nodes(self)
         intel_sites.add_site_nodes(self)
         self._caveats()
         counts: dict[str, int] = {}
@@ -575,8 +603,9 @@ class _GraphBuilder:
                 ("error", row.get("error")), ("at_ms", row.get("at_ms"))) if v is not None}
                 for name, row in self.feed_rows.items()},
             "theater_epoch": self.theater_epoch(),
-            "overlay_rev": self.overlay_rev(),
+            "overlay_rev": self.overlay_rev(truth=self.inp.truth is True),
             "sites": self.meta_sites,
+            "wargame": self.meta_wargame,
         }
         self.graph = {
             "schema": SCHEMA,
@@ -587,8 +616,10 @@ class _GraphBuilder:
             "edges": self.edges,
             "meta": self.meta,
         }
-        # sites give way first when the picture is over budget (WG v2 §3.2)
+        # sites give way first when the picture is over budget (WG v2 §3.2),
+        # then the wargame rows' long lists
         intel_sites.fit_sites_to_budget(self, GRAPH_TARGET_BYTES)
+        intel_scenario.fit_to_budget(self, GRAPH_TARGET_BYTES)
         return self.graph
 
     def resolve(self, entity_id: str) -> str | None:
@@ -599,7 +630,8 @@ class _GraphBuilder:
         if eid in self.alias:
             return self.alias[eid]
         if ":" not in eid:
-            for prefix in ("trk", "msn", "veh", "rpt", "thr", "ob", "feed", "alarm", "sit"):
+            for prefix in ("trk", "msn", "veh", "rpt", "thr", "ob", "feed", "alarm", "sit",
+                           "frc", "eng", "vec"):
                 cand = f"{prefix}:{eid}"
                 if cand in self.nodes:
                     return cand
@@ -672,8 +704,9 @@ class _GraphBuilder:
         from .intel_overlay import overlay_rev
         from .intel_sites import fetched_at_ms
 
+        revision = _int(_d(self.inp.wargame).get("revision")) or 0
         return overlay_rev(self.theater_epoch() or 0, fetched_at_ms(self.sites_current) or 0,
-                           0, truth)
+                           revision, truth)
 
     # ---- tracks --------------------------------------------------------------
     def _tracks(self) -> None:
@@ -724,8 +757,10 @@ class _GraphBuilder:
     def _units(self) -> None:
         """Co-located same-category contacts (SALUTE 'Size', ELEMENT_RADIUS_M),
         recomputed on the DEDUPED picture so a battery seen in ten runs is one
-        battery, not ten."""
-        located = [c for c in self.kept if not c.unlocated and c.rep.category]
+        battery, not ten. A simulated scenario contact is never part of one
+        (M14a: its element would read as an order-of-battle name)."""
+        located = [c for c in self.kept
+                   if not c.unlocated and c.rep.category and not c.rep.scenario]
         parent = list(range(len(located)))
 
         def find(i: int) -> int:
@@ -915,6 +950,8 @@ class _GraphBuilder:
                        else None}))
 
     def _track_nodes(self) -> None:
+        from . import intel_scenario
+
         ob_seen: dict[str, list[_Cluster]] = {}
         for c in self.kept:
             t = c.rep
@@ -929,6 +966,8 @@ class _GraphBuilder:
                 sub.append("custody lapsed")
             if t.equipment_name:
                 sub.insert(0, t.equipment_name)
+            if t.scenario:                          # M14a, WG v2 §3.2
+                sub.append(intel_scenario.SCENARIO_NOTE)
             self._add(_node(
                 c.node_id, "track", t.platform or t.id, subtitle=" · ".join(sub),
                 group=CATEGORY_GROUP.get(t.category, t.category or "unclassified"),
@@ -948,8 +987,12 @@ class _GraphBuilder:
                        "outside_ao": True if c.outside_ao else None,
                        "out_of_theater": (True if self.active_id and c.theater != self.active_id
                                           and not c.unlocated else None),
-                       "unlocated": True if c.unlocated else None}))
-            if t.ob_class and t.ob_class != "unclassified":
+                       "unlocated": True if c.unlocated else None,
+                       "scenario": True if t.scenario else None,
+                       "platform": t.platform if t.scenario else None,
+                       "simulated": True if t.scenario else None}))
+            # a scenario contact never names (or counts toward) an OB class node
+            if t.ob_class and t.ob_class != "unclassified" and not t.scenario:
                 ob_seen.setdefault(t.ob_class, []).append(c)
         for uid, members in self.units.items():
             reps = [m.rep for m in members]
@@ -1039,6 +1082,8 @@ class _GraphBuilder:
                                 attrs={"theater": tid, "out_of_theater": outside}))
 
     def _report_nodes(self) -> None:
+        from . import intel_scenario
+
         reports = _d(self.inp.reports)
         seen_objs: list[int] = []
         named = {k: v for k, v in reports.items() if k != "latest"}
@@ -1056,6 +1101,12 @@ class _GraphBuilder:
             rid = _s(rep.get("report_id")) or str(key)
             nid = f"rpt:{rid}"
             self.report_rows[nid] = rep
+            if intel_scenario.is_aar(rep):          # M14a: the wargame's after-action review
+                aar = intel_scenario.aar_node(rep, rid)
+                self._add(_node(nid, "report", aar["label"], subtitle=aar["subtitle"],
+                                group="reports", salience=0.6, status=aar["status"],
+                                ts_ms=aar["ts_ms"], attrs=aar["attrs"]))
+                continue
             fmt = _s(rep.get("format")) or "REPORT"
             as_of = _num(rep.get("as_of"))
             if fmt == "THREATREP":
@@ -1208,11 +1259,11 @@ class _GraphBuilder:
         for c in self.kept:
             nid = c.node_id
             self._edge(nid, c.unit_id, "member_of")
-            if c.rep.ob_class:
+            if c.rep.ob_class and not c.rep.scenario:
                 self._edge(nid, f"ob:{c.rep.ob_class}", "is_a")
             if c.theater:
                 self._edge(nid, f"thr:{c.theater}", "in_theater")
-            if c.unlocated:
+            if c.unlocated or c.rep.scenario:     # M14a: no scenario contact near a place
                 continue
             for pid, (_tid, p) in self.poi_rows.items():
                 plat, plon = _num(_d(p).get("lat")), _num(_d(p).get("lon"))
@@ -1598,15 +1649,17 @@ class IntelService:
         self.ctx = bridge_ctx
         self.server = server
         self._lock = threading.Lock()
-        self._cache: dict[str, tuple[float, _GraphBuilder]] = {}
+        #: keyed (scope, truth): the Umpire view is another picture (WG v2 §3.2)
+        self._cache: dict[tuple[str, bool], tuple[float, _GraphBuilder, str]] = {}
         self.cache_ttl_s = CACHE_TTL_S
         self.clock: Callable[[], float] = time.time
 
     # ---- gathering -------------------------------------------------------------
-    def gather(self) -> GraphInputs:
+    def gather(self, *, truth: bool = False) -> GraphInputs:
         """Snapshot every source once. A failing source is an empty section
-        plus a sentence in `source_errors` - never a crash, never a guess."""
-        inp = GraphInputs(now_ms=int(self.clock() * 1000))
+        plus a sentence in `source_errors` - never a crash, never a guess.
+        `truth` asks the wargame engine for the Umpire view (WG v2 §3.2)."""
+        inp = GraphInputs(now_ms=int(self.clock() * 1000), truth=truth is True)
         errors = inp.source_errors
         ctx = self.ctx
 
@@ -1706,24 +1759,49 @@ class IntelService:
 
         vs = attempt("vehicle safety state", status)
         inp.vehicle_status = vs if isinstance(vs, dict) else {}
+        # the simulated wargame (M14a, B10): the engine's rows for this view,
+        # and scenario tracks marked even when the bridge's row predates the flag
+        from . import intel_scenario
+
+        wg = attempt("wargame", lambda: intel_scenario.gather(srv, truth=inp.truth))
+        inp.wargame = wg if isinstance(wg, dict) else None
+        rows = attempt("scenario tracks",
+                       lambda: intel_scenario.mark_scenario_rows(inp.tracks, srv))
+        if isinstance(rows, list):
+            inp.tracks = rows
 
     # ---- graph -----------------------------------------------------------------
-    def _builder(self, scope: str) -> _GraphBuilder:
+    def _builder(self, scope: str, truth: bool = False) -> _GraphBuilder:
         if scope not in SCOPES:
             raise ValueError(f"scope must be one of {SCOPES}, got {scope!r}")
+        key = (scope, truth is True)
         now = time.monotonic()
+        mode = self._mode_key()
         with self._lock:
-            hit = self._cache.get(scope)
-            if hit and now - hit[0] <= self.cache_ttl_s:
+            hit = self._cache.get(key)
+            # a graph gathered before a wargame session started or ended is
+            # stale at once, not for the rest of its TTL (M14a)
+            if hit and now - hit[0] <= self.cache_ttl_s and hit[2] == mode:
                 return hit[1]
-        b = _GraphBuilder(self.gather(), scope)
+        b = _GraphBuilder(self.gather(truth=key[1]), scope)
         b.build()
         with self._lock:
-            self._cache[scope] = (now, b)
+            self._cache[key] = (now, b, mode)
         return b
 
-    def graph(self, scope: str = "theater") -> dict:
-        return self._builder(scope).graph
+    def _mode_key(self) -> str:
+        """The wargame engine's mode key ("isr" or "wargame:<id>"); "isr" when
+        there is no engine or it cannot be read."""
+        fn = getattr(getattr(self.server, "wargame", None), "mode_key", None)
+        try:
+            return str(fn()) if callable(fn) else "isr"
+        except Exception:  # noqa: BLE001 - a wargame read never takes the graph down
+            return "isr"
+
+    def graph(self, scope: str = "theater", truth: bool = False) -> dict:
+        """The graph for `scope`; `truth` is the console's Umpire view of the
+        simulated wargame (WG v2 §3.2). The analyst's reads never pass it."""
+        return self._builder(scope, truth).graph
 
     def invalidate(self) -> None:
         """Drop every cached graph (the host's theater listener calls this
@@ -1840,20 +1918,24 @@ class IntelService:
         return out
 
     # ---- entity ----------------------------------------------------------------
-    def entity(self, entity_id: str, *, max_bytes: int = ENTITY_MAX_BYTES) -> dict | None:
+    def entity(self, entity_id: str, *, max_bytes: int = ENTITY_MAX_BYTES,
+               truth: bool = False) -> dict | None:
         """Full detail for one graph entity (<= `max_bytes`), or None if unknown.
 
         Resolved against the scope="all" graph, so an out-of-theater contact
         or a collapsed duplicate's id is still inspectable (a duplicate id
-        resolves to the contact it was folded into, and says so).
+        resolves to the contact it was folded into, and says so). `truth`
+        resolves against the Umpire view (WG v2 §3.2), where red forces are.
         """
-        from . import intel_sites
+        from . import intel_scenario, intel_sites
 
-        b = self._builder("all")
+        b = self._builder("all", truth)
         nid = b.resolve(entity_id)
         if nid is None:
-            # a mapped site past the graph's 60-node cap (the map draws more)
-            node = intel_sites.offgraph_node(b, entity_id)
+            # a mapped site past the graph's 60-node cap (the map draws more),
+            # or a settled wargame row the byte budget left off (M14a)
+            node = intel_sites.offgraph_node(b, entity_id) \
+                or intel_scenario.offgraph_node(b, entity_id)
             if node is None:
                 return None
             nid = node["id"]
@@ -1866,6 +1948,9 @@ class IntelService:
             "equipment": self._equipment_entity, "report": self._report_entity,
             "alarm": self._alarm_entity, "feed": self._feed_entity,
             "site": intel_sites.site_entity,
+            "force": intel_scenario.wargame_entity,
+            "engagement": intel_scenario.wargame_entity,
+            "vector": intel_scenario.wargame_entity,
         }[node["type"]]
         fields, provenance, raw = builder(b, nid, node)
         related = []
@@ -1945,6 +2030,10 @@ class IntelService:
                                  "folded into this one (the freshest)") if len(c.members) > 1
             else None,
         }
+        if t.scenario:        # M14a: a scenario contact carries no OB system text (D1)
+            from .intel_scenario import scrub_track_entity
+
+            return scrub_track_entity(fields, provenance, t.ob_class)
         return fields, provenance, row
 
     def _live_threat(self, track_id: str) -> dict | None:
@@ -2132,7 +2221,11 @@ class IntelService:
         return fields, provenance, None
 
     def _report_entity(self, b: _GraphBuilder, nid: str, node: dict):
+        from . import intel_scenario
+
         rep = b.report_rows[nid]
+        if intel_scenario.is_aar(rep):          # M14a: `fields.markdown` for the read view
+            return intel_scenario.aar_entity(rep)
         fmt = _s(rep.get("format"))
         head = {k: v for k, v in rep.items() if not isinstance(v, (list, dict))}
         fields: dict[str, Any] = {"header": head}
@@ -2193,7 +2286,9 @@ class IntelService:
 
 def intel_router(service: IntelService, auth: Callable) -> Any:
     """GET /intel/graph, /intel/entity/{id}, /intel/events/recent (CONTRACT §3)
-    and /intel/overlay (WG v2 §3.3).
+    and /intel/overlay (WG v2 §3.3). `truth=1` on the graph, the entity and the
+    overlay is the console's Umpire view of a simulated wargame (WG v2 §3.2);
+    absent, every answer is exactly the ISR one.
 
     `auth` is a FastAPI dependency (the host's bearer check). Handlers are
     sync `def`s so graph building runs in the threadpool, never on the loop
@@ -2206,16 +2301,29 @@ def intel_router(service: IntelService, auth: Callable) -> Any:
 
     # Error bodies are top-level `{error, ...}` (CONTRACT §3), the same shape
     # the chat routes answer with - not FastAPI's `{detail: ...}` wrapper.
+    from .intel_overlay import parse_truth
+
+    def bad_truth() -> Any:
+        return JSONResponse({"error": "invalid_truth", "allowed": ["0", "1"]},
+                            status_code=422)
+
     @router.get("/graph")
-    def intel_graph(scope: str = "theater"):
+    def intel_graph(scope: str = "theater", truth: str = "0"):
+        """`truth=1` (WG v2 §3.2): the Umpire view of a simulated wargame."""
         if scope not in SCOPES:
             return JSONResponse({"error": "invalid_scope", "scope": scope,
                                  "allowed": list(SCOPES)}, status_code=422)
-        return service.graph(scope)
+        flag = parse_truth(truth)
+        if flag is None:
+            return bad_truth()
+        return service.graph(scope, truth=flag) if flag else service.graph(scope)
 
     @router.get("/entity/{entity_id:path}")
-    def intel_entity(entity_id: str):
-        out = service.entity(entity_id)
+    def intel_entity(entity_id: str, truth: str = "0"):
+        flag = parse_truth(truth)
+        if flag is None:
+            return bad_truth()
+        out = service.entity(entity_id, truth=True) if flag else service.entity(entity_id)
         if out is None:
             return JSONResponse({"error": "unknown_entity", "id": entity_id},
                                 status_code=404)
@@ -2229,12 +2337,9 @@ def intel_router(service: IntelService, auth: Callable) -> Any:
     def intel_overlay(truth: str = "0", rev: str | None = None):
         """WG v2 §3.3: the map's context features; `{rev, unchanged}` when
         `rev` is still current (the map polls every 3 s)."""
-        from .intel_overlay import parse_truth
-
         flag = parse_truth(truth)
         if flag is None:
-            return JSONResponse({"error": "invalid_truth", "allowed": ["0", "1"]},
-                                status_code=422)
+            return bad_truth()
         return service.overlay(truth=flag, rev=rev)
 
     return router

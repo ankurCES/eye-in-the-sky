@@ -22,6 +22,9 @@ Feeds served (BRIDGE_CONTRACT.md):
 READ-ONLY (BRIDGE_CONTRACT rule 1). Nothing here commands flight. `/control/*`
 forwards a body to the MCP server and returns its answer; the bridge adds no
 command of its own, and every other route is a pure read of cached state.
+It never forwards a simulated wargame `wg_*` tool (PLAN §4.5a M14a, WG §3.4):
+`/control/command` answers 403 `wargame_tools_not_forwarded` without calling
+MCP, so an engagement is confirmed only on the console's approval path.
 
 WHERE MISSION AND TRACK STATE COMES FROM
 ----------------------------------------
@@ -171,7 +174,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import theaters
@@ -263,6 +266,33 @@ GEOFENCE_REREAD_S = 30.0
 #: cannot see `launch.py`'s `--theater`; the only authority is the MCP server
 #: that is enforcing the envelope, so that is what is cited to the operator.
 ACTIVE_THEATER_SOURCE = "mcp:uav://safety/geofence"
+
+#: The simulated wargame's tool namespace (PLAN §4.5a M14a, WG §3.4 B9).
+#: `/control/command` never forwards a tool in it, even to a server started
+#: with `--wargame-mcp`: the browser proxy is not the console's approval path,
+#: and an engagement is confirmed only there (WG §3.8).
+WARGAME_TOOL_PREFIX = "wg_"
+WARGAME_NOT_FORWARDED = "wargame_tools_not_forwarded"
+WARGAME_NOT_FORWARDED_MESSAGE = (
+    "The bridge does not forward simulated wargame tools; use the console.")
+
+
+def is_wargame_tool(name: Any) -> bool:
+    """True when `name` is in the `wg_*` namespace (M14a).
+
+    Case and surrounding whitespace are ignored, so a near-miss spelling is
+    refused here rather than left to the MCP server's exact-name lookup. Only
+    a string can name a tool; anything else is not a wargame tool.
+    """
+    return (isinstance(name, str)
+            and name.strip().casefold().startswith(WARGAME_TOOL_PREFIX))
+
+
+def wargame_refusal() -> JSONResponse:
+    """The 403 `/control/command` answers for a `wg_*` tool (WG §3.4)."""
+    return JSONResponse(status_code=403, content={
+        "rejected": True, "error": WARGAME_NOT_FORWARDED,
+        "message": WARGAME_NOT_FORWARDED_MESSAGE})
 
 #: `alt_agl_source` for an AGL this bridge derived itself: the NED down-offset
 #: from the LAUNCH DATUM (the home plane). It is true AGL only over ground at
@@ -3070,6 +3100,9 @@ def create_app(adapter: AirSimAdapter | None = None, token: str = "dev-token",
             tool = body.get("tool")
             if not tool:
                 raise HTTPException(400, "command needs a tool name")
+            if is_wargame_tool(tool):
+                # M14a (WG §3.4 B9): refused before MCP is called at all.
+                return wargame_refusal()
             args = body.get("arguments", {})
             args.setdefault("vehicle", body.get("vehicle", "Drone1"))
         return _unwrap(call(tool, args), tool)

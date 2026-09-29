@@ -12,7 +12,17 @@
  * - `status` — `loading|live|stale|offline|unauthorized`;
  * - `lastLiveAt` — when the last graph arrived (ms), or null;
  * - `error` — `{kind:'auth'|'offline'|'timeout'|'http', message, status?, atMs}` or null;
- * - `scope` — `theater|all`.
+ * - `scope` — `theater|all`;
+ * - `view` — the simulated wargame view, `umpire|blue`, while a session runs
+ *   (`graph.meta.wargame.active`), else null (WG §5.3.3);
+ * - `truth` — whether the last graph was asked for with `truth=1`;
+ * - `wargameSession` — the running session's id, or null.
+ *
+ * Wargame view (WG §5.3.3): Umpire is the default when a session starts;
+ * the choice is kept per session in storage (try/catch: a failing storage
+ * keeps the flag in memory). Umpire view asks for `/intel/graph?truth=1`.
+ * It is a presentation filter, not a secrecy boundary. Outside a session
+ * the request is exactly the ISR one (`/intel/graph?scope=…`).
  *
  * Every `change` diff carries `theaterChanged`: `{from, to}` (each
  * `{id, epoch, label, place}`) when `graph.theater.id` or its epoch changed
@@ -36,6 +46,111 @@ export const CRITICAL_ALARM_KINDS = Object.freeze([
 const VIEWED_KEY = 'ic.alarms.viewed.v1';
 const VIEWED_MAX = 200;
 const LIVE_ALARMS_MAX = 50;
+/** Wargame views (WG §5.3.3); Umpire is the default at a session's start. */
+export const WARGAME_VIEWS = Object.freeze(['umpire', 'blue']);
+export const DEFAULT_WARGAME_VIEW = 'umpire';
+/** Storage key for the per-session view choice: `{[session_id]: view}`. */
+export const WARGAME_VIEW_KEY = 'ic.wargame.view.v1';
+const VIEW_SESSIONS_MAX = 20;
+
+/** The running wargame session id in a graph (`meta.wargame`), or null. */
+export function wargameSessionOf(graph) {
+  const w = graph?.meta?.wargame;
+  return w && typeof w === 'object' && w.active === true
+    ? typeof w.session_id === 'string' && w.session_id
+      ? w.session_id
+      : 'session'
+    : null;
+}
+
+/**
+ * The graph request path. Without `truth` it is exactly the ISR request;
+ * Umpire view adds `&truth=1` (WG §3.2).
+ */
+export function graphPath(scope, truth = false) {
+  const base = `/intel/graph?scope=${encodeURIComponent(scope)}`;
+  return truth ? `${base}&truth=1` : base;
+}
+
+/** Edge kinds only an Umpire (`truth=1`) graph carries (WG §3.2). */
+const TRUTH_EDGE_KINDS = new Set(['axis', 'threatens', 'correlates']);
+/** The attacker a Blue view names for a red engagement (§3.2 Fog). */
+const MASKED_ATTACKER = Object.freeze({
+  red_shot: 'Red air defence (not identified)',
+  red_ground: 'Red ground forces (not identified)',
+});
+
+function blueNode(node, showRed) {
+  const a = node?.attrs && typeof node.attrs === 'object' ? node.attrs : null;
+  if (node?.type === 'force') {
+    if (!showRed && a?.side !== 'blue') return null;
+    if (!a || !Object.hasOwn(a, 'correlated')) return node;
+    const attrs = { ...a };
+    delete attrs.correlated; // truth only (§3.2)
+    return { ...node, attrs };
+  }
+  if (node?.type === 'vector')
+    return showRed || (a?.kind === 'corridor' && a?.side !== 'red')
+      ? node
+      : null;
+  if (showRed || !a) return node;
+  if (node.type === 'engagement') {
+    let next = a;
+    if (Object.hasOwn(MASKED_ATTACKER, a.kind))
+      next = {
+        ...next,
+        attacker: null,
+        attacker_label: MASKED_ATTACKER[a.kind],
+        p_notional: null,
+        inputs: [],
+      };
+    if (a.kind === 'blue_strike' && !(Number(a.bda?.looks) >= 1))
+      next = { ...next, outcome_hidden: true };
+    if (next.outcome_hidden === true && next.outcome != null)
+      next = { ...next, outcome: null };
+    return next === a ? node : { ...node, attrs: next };
+  }
+  if (node.type === 'vehicle' && a.wargame_lost_by != null)
+    return { ...node, attrs: { ...a, wargame_lost_by: null } };
+  return node;
+}
+
+/**
+ * The Blue view of an Umpire graph, fogged as the host fogs it (WG §3.2):
+ * no `correlated[]` and no truth-only edges; unless the session reveals
+ * red, no force that is not blue, only non-red corridors, a red attacker
+ * masked, an unconfirmed strike outcome hidden, no downing unit named, and
+ * red counts cut to `seen`. A switch to Blue drops truth with it at once,
+ * not when (or if) the Blue graph lands. Outside a session: the graph.
+ */
+export function blueViewOf(graph) {
+  const wg = graph?.meta?.wargame;
+  if (!wg || typeof wg !== 'object' || wg.active !== true) return graph;
+  const showRed = wg.reveal_red === true;
+  const nodes = [];
+  const dropped = new Set();
+  for (const node of Array.isArray(graph.nodes) ? graph.nodes : []) {
+    const kept = blueNode(node, showRed);
+    if (kept) nodes.push(kept);
+    else if (node) dropped.add(node.id);
+  }
+  const edges = (Array.isArray(graph.edges) ? graph.edges : []).filter(
+    (e) =>
+      !TRUTH_EDGE_KINDS.has(e?.kind) &&
+      !dropped.has(e?.a) &&
+      !dropped.has(e?.b),
+  );
+  const counts = wg.counts && typeof wg.counts === 'object' ? wg.counts : {};
+  const seen = Number(counts.red?.seen);
+  const wargame = {
+    ...wg,
+    truth_view: showRed,
+    counts: showRed
+      ? counts
+      : { ...counts, red: { seen: Number.isFinite(seen) ? seen : 0 } },
+  };
+  return { ...graph, nodes, edges, meta: { ...graph.meta, wargame } };
+}
 
 const CRITICAL_SET = new Set(CRITICAL_ALARM_KINDS);
 
@@ -285,6 +400,54 @@ export function createIntelStore({
   const listeners = new Set();
   const entityInflight = new Map();
   const viewed = loadViewed();
+  // Wargame view (WG §5.3.3): the session it belongs to, the choice, and
+  // whether the graph in hand was asked for with truth=1.
+  let session = null;
+  let view = DEFAULT_WARGAME_VIEW;
+  let truth = false;
+  let refetched = false; // one immediate re-poll when the wanted view changed
+  const views = loadViews();
+
+  function loadViews() {
+    try {
+      const raw = storage?.getItem?.(WARGAME_VIEW_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      const out = new Map();
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const [id, v] of Object.entries(parsed))
+          if (WARGAME_VIEWS.includes(v)) out.set(id, v);
+      }
+      return out;
+    } catch {
+      return new Map();
+    }
+  }
+
+  function saveViews() {
+    try {
+      while (views.size > VIEW_SESSIONS_MAX)
+        views.delete(views.keys().next().value);
+      storage?.setItem?.(
+        WARGAME_VIEW_KEY,
+        JSON.stringify(Object.fromEntries(views)),
+      );
+    } catch {
+      /* private window or quota: the view still holds for this page */
+    }
+  }
+
+  /** Umpire view in a running session asks the host for truth. */
+  function truthWanted() {
+    return session != null && view === 'umpire';
+  }
+
+  /** Follow the session in a new graph: a new session starts in its kept view, else Umpire. */
+  function noteSession(next) {
+    const id = wargameSessionOf(next);
+    if (id === session) return;
+    session = id;
+    if (id) view = views.get(id) || DEFAULT_WARGAME_VIEW;
+  }
 
   function loadViewed() {
     try {
@@ -319,6 +482,9 @@ export function createIntelStore({
       error,
       scope,
       lastStageInputAt,
+      view: session ? view : null,
+      truth,
+      wargameSession: session,
     };
   }
 
@@ -336,6 +502,7 @@ export function createIntelStore({
       statusFrom: null,
       statusTo: status,
       scope: false,
+      view: false,
       // Always present, so the orb takes the store's answer (null: none).
       theaterChanged: null,
       ...diff,
@@ -450,7 +617,8 @@ export function createIntelStore({
     return Boolean(doc && doc.visibilityState === 'hidden');
   }
 
-  function schedule() {
+  /** Schedule the next poll: `delayMs` when given (a view re-poll), else the cadence. */
+  function schedule(delayMs = null) {
     if (!started || timer != null) return;
     if (hidden()) {
       pausedHidden = true;
@@ -461,7 +629,7 @@ export function createIntelStore({
         timer = null;
         poll();
       },
-      failing ? backoffMs : intervalMs,
+      delayMs ?? (failing ? backoffMs : intervalMs),
     );
   }
 
@@ -474,9 +642,11 @@ export function createIntelStore({
     if (inflight) return inflight;
     const seq = ++pollSeq;
     const wanted = scope;
+    const wantTruth = truthWanted();
+    let again = false;
     const request = Promise.resolve()
       .then(() =>
-        api.get(`/intel/graph?scope=${encodeURIComponent(wanted)}`, {
+        api.get(graphPath(wanted, wantTruth), {
           timeoutMs: GRAPH_TIMEOUT_MS,
         }),
       )
@@ -486,10 +656,20 @@ export function createIntelStore({
           failing = false;
           error = null;
           lastLiveAt = clock.now();
-          const diff = applyGraph(next && typeof next === 'object' ? next : {});
+          const body = next && typeof next === 'object' ? next : {};
+          const wasSession = session;
+          truth = wantTruth;
+          noteSession(body);
+          const diff = applyGraph(body);
           const st = setStatus('live');
-          if (diff.graph || diff.alarms || st)
-            emitChange({ ...diff, ...(st || {}) });
+          const viewMoved = wasSession !== session;
+          if (diff.graph || diff.alarms || st || viewMoved)
+            emitChange({ ...diff, ...(st || {}), view: viewMoved });
+          if (viewMoved) announceView();
+          // A session started or ended: ask again at once in the right view
+          // (once, so a host that disagrees can't loop the poll).
+          again = truthWanted() !== truth && !refetched;
+          refetched = again;
         },
         (err) => {
           if (seq !== pollSeq) return;
@@ -508,7 +688,7 @@ export function createIntelStore({
       .catch((err) => globalThis.console?.error?.(err))
       .finally(() => {
         if (inflight === request) inflight = null;
-        if (seq === pollSeq) schedule();
+        if (seq === pollSeq) schedule(again ? 0 : null);
       });
     inflight = request;
     return request;
@@ -629,15 +809,23 @@ export function createIntelStore({
     };
   }
 
-  /** Full details for one entity (`GET /intel/entity/{id}`); concurrent calls share one request. */
+  /**
+   * Full details for one entity (`GET /intel/entity/{id}`); concurrent calls
+   * share one request. Umpire view in a running session adds `?truth=1`
+   * (WG §3.2), so a red force opens; otherwise the path is exactly the ISR
+   * one.
+   */
   function entity(id) {
     const key = str(id);
     if (!key) return Promise.reject(new TypeError('entity needs an id'));
-    if (entityInflight.has(key)) return entityInflight.get(key);
+    const wantTruth = truthWanted();
+    const slot = wantTruth ? `${key}\u0000truth` : key;
+    if (entityInflight.has(slot)) return entityInflight.get(slot);
+    const path = `/intel/entity/${encodeURIComponent(key)}${wantTruth ? '?truth=1' : ''}`;
     const p = Promise.resolve()
-      .then(() => api.get(`/intel/entity/${encodeURIComponent(key)}`))
-      .finally(() => entityInflight.delete(key));
-    entityInflight.set(key, p);
+      .then(() => api.get(path))
+      .finally(() => entityInflight.delete(slot));
+    entityInflight.set(slot, p);
     return p;
   }
 
@@ -655,6 +843,46 @@ export function createIntelStore({
     lastStageInputAt = clock.now();
   }
 
+  /** Tell the bus which view the console shows (the orb, the map overlay). */
+  function announceView() {
+    bus?.emit?.('wargame:view', {
+      view: session ? view : null,
+      truth: truthWanted(),
+      session_id: session,
+    });
+  }
+
+  /**
+   * Choose the wargame view (WG §5.3.3): `'umpire'` or `'blue'`. Kept per
+   * session in storage when it works, in memory always. A poll for the old
+   * view must not land; the new one is asked for at once. Leaving Umpire
+   * drops the truth in hand now (`blueViewOf`), so search, the inspector
+   * and the rail never show it under Blue, even while the host is down.
+   * The view is announced first, so the orb hides red without a fade.
+   * @returns {boolean} whether the view changed
+   */
+  function setView(next) {
+    if (!WARGAME_VIEWS.includes(next) || next === view) return false;
+    view = next;
+    if (session) {
+      views.delete(session);
+      views.set(session, next);
+      saveViews();
+    }
+    pollSeq += 1;
+    inflight = null;
+    refetched = false;
+    let diff = null;
+    if (truth && !truthWanted()) {
+      truth = false;
+      if (graph) diff = applyGraph(blueViewOf(graph));
+    }
+    announceView();
+    emitChange({ ...(diff || {}), view: true });
+    if (started) poll();
+    return true;
+  }
+
   return {
     start,
     stop,
@@ -668,9 +896,14 @@ export function createIntelStore({
     markAlarmViewed,
     isAlarmViewed,
     setScope,
+    setView,
     noteStageInput,
     get lastStageInputAt() {
       return lastStageInputAt;
+    },
+    /** The wargame view while a session runs, else null. */
+    get view() {
+      return session ? view : null;
     },
     get status() {
       return status;

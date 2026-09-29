@@ -113,3 +113,210 @@ export function resolveBridge({
 
   return { base: stripSlash(base), token, source, tokenSource };
 }
+
+// ---------------------------------------------------------------------------
+// Engagement approval key (WG §3.5, §5.3.2). Platform-free like the rest of
+// this module: the caller passes `storage` (sessionStorage in the console)
+// and `claim` (api.claimConsole). The key is never logged, never put in a
+// URL, and only leaves this holder through `headers()` or `key()`.
+// ---------------------------------------------------------------------------
+
+/** Where the console keeps the key for this tab; a reload keeps it. */
+export const CONSOLE_KEY_STORAGE = 'godseye.consoleKey';
+/** The approval POST header that carries the key. */
+export const CONSOLE_KEY_HEADER = 'X-Godseye-Console';
+/**
+ * Holder states:
+ * - `idle`: nothing claimed yet;
+ * - `claiming`: the claim POST is in flight;
+ * - `held`: this console holds the key and may approve engagements;
+ * - `refused`: another client claimed first (409), final until reload;
+ * - `unsupported`: this host has no claim route (a Phase A host, the dev
+ *   bridge), final until reload;
+ * - `failed`: the claim didn't get an answer; `ensure()` may try again.
+ */
+export const CONSOLE_KEY_STATES = Object.freeze([
+  'idle',
+  'claiming',
+  'held',
+  'refused',
+  'unsupported',
+  'failed',
+]);
+/** Copy deck (Appendix B). `missing` covers every state but `refused`. */
+export const CONSOLE_KEY_COPY = Object.freeze({
+  banner: 'Another client claimed engagement approvals; restart to re-arm',
+  denyOnly:
+    "This console can't approve engagements: another client claimed them.",
+  missing:
+    "This console can't approve engagements: it doesn't hold the approval key.",
+});
+
+const KEY_SHAPE = /^[A-Za-z0-9_-]{16,256}$/;
+
+/** Whether `value` looks like a `secrets.token_urlsafe` key (header-safe). */
+export function isConsoleKey(value) {
+  return typeof value === 'string' && KEY_SHAPE.test(value);
+}
+
+function claimOutcome(error) {
+  const status = Number(error?.status) || 0;
+  const code = error?.code ?? error?.body?.error ?? null;
+  if (status === 409 || code === 'console_already_claimed') return 'refused';
+  if (status === 404 || status === 405 || status === 501) return 'unsupported';
+  return 'failed';
+}
+
+/**
+ * The console's engagement approval key.
+ *
+ * At creation the holder reads `storage[CONSOLE_KEY_STORAGE]`; a valid key
+ * there is `held` at once (a reload keeps the key). Otherwise `ensure()`
+ * POSTs the claim once: 200 stores the key, 409 is `refused` (the console
+ * shows the banner and every engagement slip is Deny-only), a missing
+ * route is `unsupported`, and anything else is `failed`, which a later
+ * `ensure()` retries. A 2xx without a usable key is `unsupported`: asking
+ * again would get the same answer. A storage that throws keeps the key in
+ * memory for this page only.
+ * @param {object} [options]
+ * @param {{getItem(k:string):string|null, setItem(k:string,v:string):void, removeItem?(k:string):void}|null} [options.storage]
+ * @param {(() => Promise<{console_key?:string}>)|null} [options.claim]
+ */
+export function createConsoleKey({ storage = null, claim = null } = {}) {
+  let key = null;
+  let state = 'idle';
+  let inflight = null;
+  let attempts = 0;
+  const listeners = new Set();
+
+  const stored = readStorage(storage, CONSOLE_KEY_STORAGE);
+  if (isConsoleKey(stored)) {
+    key = stored;
+    state = 'held';
+  }
+
+  function set(next) {
+    if (next === state) return;
+    state = next;
+    const info = { state, canApprove: state === 'held' };
+    for (const cb of [...listeners]) {
+      try {
+        cb(info);
+      } catch (error) {
+        globalThis.console?.error?.(error);
+      }
+    }
+  }
+
+  function remember(value) {
+    try {
+      storage?.setItem?.(CONSOLE_KEY_STORAGE, value);
+    } catch {
+      /* private window: the key lives in memory for this page */
+    }
+  }
+
+  function forget() {
+    try {
+      storage?.removeItem?.(CONSOLE_KEY_STORAGE);
+    } catch {
+      /* nothing stored */
+    }
+  }
+
+  /**
+   * Claim the key unless it is held or the answer is final. Concurrent
+   * calls share one POST. Resolves with the state; never rejects.
+   * @returns {Promise<string>}
+   */
+  function ensure() {
+    if (state === 'held' || state === 'refused' || state === 'unsupported')
+      return Promise.resolve(state);
+    if (inflight) return inflight;
+    if (typeof claim !== 'function') {
+      set('unsupported');
+      return Promise.resolve(state);
+    }
+    attempts += 1;
+    set('claiming');
+    inflight = Promise.resolve()
+      .then(() => claim())
+      .then(
+        (body) => {
+          const value =
+            body && typeof body === 'object' ? body.console_key : '';
+          if (isConsoleKey(value)) {
+            key = value;
+            remember(value);
+            set('held');
+          } else {
+            set('unsupported');
+          }
+        },
+        (error) => set(claimOutcome(error)),
+      )
+      .then(() => {
+        inflight = null;
+        return state;
+      });
+    return inflight;
+  }
+
+  /**
+   * Drop a key the host no longer accepts (an approval answered 422
+   * `console_required`, for example after the app restarted under a tab
+   * that kept its sessionStorage), then claim again. A refused holder stays
+   * refused: the banner persists until reload.
+   * @returns {Promise<string>}
+   */
+  function invalidate() {
+    if (state === 'refused') return Promise.resolve(state);
+    key = null;
+    forget();
+    if (state === 'held' || state === 'unsupported') set('idle');
+    return ensure();
+  }
+
+  return {
+    /** One of CONSOLE_KEY_STATES. */
+    get state() {
+      return state;
+    },
+    /** Whether the claim was refused (409): banner and Deny-only. */
+    get refused() {
+      return state === 'refused';
+    },
+    /** How many claim POSTs this holder has sent. */
+    get attempts() {
+      return attempts;
+    },
+    /** The key, or null. For the approval header only. */
+    key: () => (state === 'held' ? key : null),
+    /** Whether this console may approve an engagement. */
+    canApprove: () => state === 'held' && key != null,
+    /** `{[CONSOLE_KEY_HEADER]: key}` while held, else `{}`. */
+    headers: () =>
+      state === 'held' && key ? { [CONSOLE_KEY_HEADER]: key } : {},
+    /** The Deny-only line for an engagement slip, or null while held. */
+    denyOnlyLine: () =>
+      state === 'held'
+        ? null
+        : state === 'refused'
+          ? CONSOLE_KEY_COPY.denyOnly
+          : CONSOLE_KEY_COPY.missing,
+    /** The persistent warn banner's text, or null. */
+    bannerText: () => (state === 'refused' ? CONSOLE_KEY_COPY.banner : null),
+    ensure,
+    invalidate,
+    /**
+     * Subscribe to state changes: `cb({state, canApprove})` (never the key).
+     * @returns {() => void} unsubscribe
+     */
+    onChange(cb) {
+      if (typeof cb !== 'function') return () => {};
+      const entry = (info) => cb(info);
+      listeners.add(entry);
+      return () => listeners.delete(entry);
+    },
+  };
+}

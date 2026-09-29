@@ -5,6 +5,8 @@ It is PLAN.md §4.1–§4.8 made concrete. Where the shipped code deviates, this
 
 **Baseline measured before the work started:** 19 tools, **0 resources**, 0 prompts.
 **Shipped now:** 51 tools (46 + the five runtime-theater tools of §4.5), 8 resources (3 concrete + 5 templates) — verified over the real transport.
+The ten simulated wargame tools of §4.6 (M14a) are not in that count: they are on `/mcp` only when the
+host runs with `--wargame-mcp`.
 
 ## Conventions (apply to every tool)
 
@@ -22,8 +24,9 @@ It is PLAN.md §4.1–§4.8 made concrete. Where the shipped code deviates, this
   — the harness decides what to do (T2). Never silently queue behind an unbounded backlog.
 - **Errors** are structured: `{"error": {"code": "...", "message": "...", "retryable": bool}}`.
   Safety rejections are NOT errors — they return the gate result so the harness can re-plan.
-- **ISR-only (M14)**: no kinetic tool exists. Threat output carries no engagement recommendation;
-  sensor-posture advice only. Command authority stays with the operator.
+- **ISR by default (M14, M14a)**: no kinetic tool exists in the default catalog. Threat output
+  carries no engagement recommendation; sensor-posture advice only. Simulated `wg_*` tools (M14a)
+  are published only under `--wargame-mcp`. Command authority stays with the operator.
 
 ## §4.1 Flight control
 
@@ -111,6 +114,26 @@ Doctrine that must be *server-derived*, never taken from the caller (M1–M7):
 real-data layer has it, else the running theater's ground elevation (the return says which). An
 earlier default of `0.0` buried targets ~1550 m underground in the shipped theaters.
 
+**Simulated wargame guards (M14a, WG v2 §5.2.6).** These sim tools keep the wargame's scenario units
+apart from every other object. Their refusals are `{"rejected": true, "error": "<code>", "message":
+"<one sentence>"}` and change nothing:
+
+- `sim_spawn_target`: `scenario_name` (the name belongs to a scenario unit), `duplicate_name` (a
+  target of that name already exists; it used to be overwritten), and during a session
+  `near_scenario_unit` (within 150 m of a scenario unit, or a `mobile_route` that passes within
+  150 m of one). An automatic label skips names already taken.
+- `sim_move_target`: `scenario_name`. Only the wargame moves its own units. During a session also
+  `near_scenario_unit`: a route whose legs (from where the object is now, and back to the first
+  waypoint when `loop`) pass within 150 m of a scenario unit.
+- Detections of any other object never join a scenario unit's track, however close they are: a
+  scenario contact associates only with detections of its own object (D1).
+- `sim_spawn_order_of_battle`: a mapped site that would take a scenario unit's name or land within
+  150 m of one is skipped, not spawned. The result then carries `skipped: [{osm_id, name, category,
+  reason}]`; the key is absent when nothing was skipped. A second run refuses every site it already
+  spawned as `duplicate_name`.
+- `sim_reset`: `wargame_active` ("end the wargame first") while a session is starting or running.
+- Any command for a drone the wargame downed: `vehicle_lost` until the wargame ends.
+
 ## Also shipped (not in the tables above)
 
 These tools are registered by the server and listed by `tools/list`; their descriptions there are
@@ -178,6 +201,65 @@ caveats say what stays on wall time: link-loss timers, detections and scans, the
 safety checks ("Safety checks run every 0.5 sim-seconds.") and, above ×3, camera captures (coverage gaps).
 `time_scale` is not persisted; a restart runs at ×1.
 
+## §4.6 Simulated wargame (M14a; not on /mcp unless --wargame-mcp)
+
+SIMULATION only (PLAN.md §4.5a). Registered by `mcp/godseye_uav/wargame_tools.py` on the wargame's own
+registry (`godseye-wargame`, never mounted); the in-app analyst reaches it through its toolbelt (the
+three entry tools in ISR mode, all ten during a session). The default `/mcp` publishes none of them.
+`--wargame-mcp` is an explicit opt-in for external harnesses that also publishes all ten on `/mcp`.
+`/control/command` never forwards a `wg_*` tool (403 `wargame_tools_not_forwarded`).
+
+- **Scenario units only.** The forces are simulated units the wargame places (provenance `scenario`,
+  generic designators such as "Red SAM 1", ids `frc:{side}-{prefix}-{n}`). Nothing else can be
+  planned against or engaged: a mapped site, a theater point, a `sim_spawn_*` object, a phantom or
+  real air traffic is refused `not_a_scenario_unit`. So is a target within 500 m of a mapped place
+  or theater point (`target_near_real_site`) or within 1 km of a protected place
+  (`target_protected`), checked on the unit's true position and on the track's.
+- **Notional.** Effects are play-balance table draws, with no real system names and no
+  weaponeering. Every result, refusals included, carries `simulated: true` and `note` ("Notional
+  simulation parameters chosen for play balance. Not weapon data."). Wargame text names no real
+  place: positions are AO-relative and the theater is named by `theater_id` only.
+- **Drones never deliver effects.** They fly recce and battle-damage re-looks with the ordinary ISR
+  tools (`mission_recon_route`, `uav_scan_targets`). Shooters are blue scenario units.
+- **Session scoped.** Every tool except the entry tools (`wg_session_start`, `wg_session_status`,
+  `wg_list_classes`) refuses `wargame_inactive` ("Start a simulated wargame session first
+  (wg_session_start).") when no session runs, before anything else is checked (only a replayed
+  `idempotency_key` is answered first).
+- **Fog of war.** Answers are the blue view: red units are listed only when the session was started
+  with `reveal_red`, and a strike's outcome stays hidden until a re-look assesses it.
+
+| Tool | Class | Params | Returns |
+|---|---|---|---|
+| `wg_session_start` | **sim** (operator approval every time; never session-grantable) | seed?, red_engages=true, reveal_red=false, idempotency_key | `{session_id, started_at_ms, seed, engine, table_version, red_engages, reveal_red, theater_id, ao: {half_extent_m, half_diagonal_m}, classes_that_fit, caveats}`. Refusals: `wargame_active`, `wargame_requires_fake_sim`, `theater_switching`, `theater_integrity`, `theater_not_cleared` (every preset except `default`, and a chat theater whose AO, grown by 5 km, overlaps one of those presets), `exclusion_incomplete` (a chat theater whose mapped places couldn't all be loaded), `invalid_parameter`. |
+| `wg_session_status` | read | events=20 (0–100) | No session: `{active: false, starting, last}`. In a session: `{active, session_id, started_at_ms, seed, engine, table_version, time_scale, red_engages, reveal_red, truth_view, theater_id, ao, counts, units, pending, engagements, vehicles_lost, events, caveats, revision, step_ms, errors}`, blue view. |
+| `wg_list_classes` | read | — | `{classes: [{key, side, ob_key, prefix_slug, label, role, threat_range_m, threat_ceiling_m (height above the unit), detection_range_m, strike_range_m, cycle_s, ammo, …, fits_ao, covers_ao, caveats}], theater_id, ao, classes_that_fit, table_version}` for the running AO. Works with no session. |
+| `wg_session_end` | **sim** | idempotency_key | `{ended, session_id, aar_id, resource, revived}`. Scenario objects, their tracks and waiting engagements are removed; drones the wargame downed are parked at home, landed; aircraft keep their tasks. The after-action review is filed as `uav://reports/aar-<session id>`, never as `latest`. Refusals: `wargame_inactive`, `wargame_ending`. |
+| `wg_generate_scenario` | **sim** | template (air_defence_belt, mech_advance, strike_exercise), intensity=medium (low, medium, high), ad_class?, idempotency_key | `{template, intensity, ad_class, units, blue_placed, red_placed, moved_by_spiral, caveats}`, all or nothing; red units are listed only when revealed. Refusals: `no_room`, `unknown_template`, `unknown_class`, `max_units`, `spawn_busy`, `spawn_failed`. |
+| `wg_spawn_force` | **sim** | side (red, blue), wg_class, lat, lon, count=1 (1–6), objective_id?, idempotency_key | `{units: [{unit_id, id, designator, side, wg_class, kind_label, state, damaged, ammo, lat, lon, alt_msl_m, position, mobile, objective, threat_range_m, threat_ceiling_m, detection_range_m, strike_range_m, provenance: "scenario", caveats}], caveats}`. The first unit sits at lat/lon, the rest spiral round it. Refusals: `outside_ao`, `near_real_site`, `near_theater_point` (500 m), `too_close_home` (red, 1 km), `too_close_unit` (200 m), `near_existing_object` (150 m), `max_units` (60), `unknown_class`, `side_mismatch`, `unknown_objective`, `spawn_busy`, `spawn_failed`. |
+| `wg_list_forces` | read | side? (red, blue) | `{forces, counts, truth_view}`, blue view. |
+| `wg_plan_corridor` | plan | vehicle, **target_track_id** (required; omitting it is a validation error), alt_agl_m=60, relook=false, relook_radius_m=400 (150–1500) | `{waypoints, alt_agl_m, length_m, eta_s, exposure_s, p_survive, straight, delta_exposure_s, delta_length_m, legs, threat_basis, threats_considered, terrain_masking, relook_points, caveats, recon_args, vector_id, target}`. One altitude (metres AGL); planned against gated sensed threats unless red is revealed. `recon_args` go to `mission_recon_route` unchanged (dry run first), through the normal gate and slip. 20 per 10 min, else `rate_limited`. Refusals: `not_a_scenario_unit`, `target_near_real_site`, `target_protected`, `vehicle_unknown`, `vehicle_lost`, `no_route`, `start_outside_fence`, `target_outside_fence`, `route_too_complex`, `plan_budget`. |
+| `wg_propose_strike` | plan | shooter_id, target_track_id | `{pending_id, shooter: {id, unit_id, designator}, target: {track_id, label, perceived_class, confidence}, range_m, p_estimate, corridor, expires_at_ms, execute_args, caveats}`. Nothing is fired; the pending engagement expires after 10 min. 20 per 10 min, else `rate_limited`. Refusals: `shooter_unavailable`, `not_a_scenario_unit`, `insufficient_confidence` (below probable), `target_near_real_site`, `target_protected`, `out_of_range`, `pending_limit` (8 waiting). |
+| `wg_execute_engagement` | **engagement** (asks every call; never session-grantable; acknowledgement required; never automatic) | pending_id, shooter_id, target_track_id, idempotency_key | `{executed: true, engagement_id, fired_at_ms, outcome, outcome_note}`; `outcome` is null unless red is revealed ("Unknown until a re-look (battle damage assessment)."). Refusals: `engagement_requires_console_approval`, or the gate refusal when a re-check fails (the engagement then expires). |
+
+**Engagement protocol (WG v2 §3.8).** `wg_propose_strike` returns `execute_args`; the analyst calls
+`wg_execute_engagement(**execute_args)` exactly. The console's engagement slip asks the operator, who
+approves with the acknowledgement; only then does the chat service authorize the pending engagement,
+and the analyst's toolbelt runs the call inside that chat session's console context. The engine
+executes only an authorized engagement, only from that console session, only with the same arguments,
+only before it expires, and only once, re-running every gate first. `/mcp` (even under
+`--wargame-mcp`) and `/control/command` never have that context, so they can never confirm.
+
+**Refusals and keys.** Refusals are `{"rejected": true, "error": "<code>", "message": "<one
+sentence>", "simulated": true, "note": …}`; the console shows `message` verbatim, as text. Malformed
+arguments give `invalid_parameter`; an unexpected engine error gives `wargame_failed`. A replayed
+`idempotency_key` returns the original result and runs nothing again; a refusal is never recorded.
+`wg_execute_engagement` keys are recorded per console session, so no other caller can replay one.
+
+**Ending.** `wg_session_end`, or the bearer route `POST /wargame/session/end` (no body is read): 200
+`{ok: true, aar_id, session_id, resource, revived, simulated: true}`, or 409 `{error:
+"wargame_inactive" | "wargame_ending", message}`. The AAR records who ended it: `operator` (the
+route), `analyst` (the approved analyst call) or `mcp` (a direct `/mcp` call).
+
 ## Report size — summary by default, full traces on request
 
 The consumer is an LLM harness, and the intel reports grow with the track store, **which persists
@@ -208,6 +290,10 @@ ISR report contains.
 
 `uav://safety/geofence` matters most for the skill: PLAN §4.5 says "skill ROE may only be stricter",
 which the skill cannot honour without being able to read the envelope it must stay inside.
+It also carries `doctrine: {mode: "isr"|"wargame", wargame_session, wargame_mcp, rule}` (M14a):
+`mode` is `wargame` only while a simulated wargame session runs, `wargame_mcp` says whether `/mcp`
+publishes the `wg_*` tools, and `rule` is "M14a: ISR by default; simulated wargame tools exist only
+in an operator-approved session." `isr_only` is unchanged.
 
 ## Watchdog (T2)
 

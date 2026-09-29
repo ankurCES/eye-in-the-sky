@@ -38,6 +38,15 @@ The analyst's model-provider settings (BYOK spec §7): ``LlmSettings`` is built
 before ``ChatService`` (which resolves every turn through it), its
 ``/settings/llm*`` routes sit before the ``/api/*`` catch-all and the static
 mount, and ``SettingsGuardMiddleware`` wraps them inside the Host check.
+
+The simulated wargame (M14a, WG v2 §3.5, §5.2.12 B11): ``build_host`` makes
+this launch's console key (``ConsoleClaim``) and hands it to ``ChatService``,
+which requires it on every engagement approval. ``POST /app/console-claim``
+(bearer) gives it out ONCE; every later claim is 409 and audited. The key is
+never in ``window.__GODSEYE__``, ``/app/config``, ``mcp.json`` or a log.
+``POST /wargame/session/end`` (``wargame_tools.wargame_router``) is added
+here, outside ``create_app``. ``HostConfig.wargame_mcp`` (``--wargame-mcp``)
+reaches ``build_server``: only then does ``/mcp`` list the ``wg_*`` tools.
 """
 from __future__ import annotations
 
@@ -129,6 +138,10 @@ class HostConfig:
     real_data: Any = None
     #: Airframe id. None keeps a restored theater's airframe (else the default).
     airframe: str | None = None
+    #: ``--wargame-mcp`` (M14a, WG v2 §5.2.12): also publish the simulated
+    #: wargame's ``wg_*`` tools on ``/mcp`` for external harnesses. Off: ISR by
+    #: default. Engagements are approved in the console either way.
+    wargame_mcp: bool = False
     #: Provider/credential variables ``app.capture_llm_env`` took out of the
     #: launch environment (BYOK spec §3.3). Holds secrets: never log or print it.
     llm_env: dict[str, str] | None = field(default=None, repr=False)
@@ -348,6 +361,94 @@ def sse_auth(token: str) -> Callable[..., bool]:
         raise HTTPException(status_code=401, detail="unauthorized")
 
     return _auth
+
+
+# ---------------------------------------------------------------------------
+# the console's engagement approval key (M14a; WG v2 §3.5, §3.8)
+# ---------------------------------------------------------------------------
+
+CONSOLE_CLAIM_PATH = "/app/console-claim"
+#: The 409 body of every claim after the first. The console that gets it shows
+#: its "restart to re-arm" banner and keeps every engagement slip Deny-only.
+CONSOLE_ALREADY_CLAIMED = {
+    "rejected": True, "error": "console_already_claimed",
+    "message": "Another client already claimed engagement approvals for this launch; "
+               "restart the app to re-arm.",
+}
+
+
+class ConsoleClaim:
+    """This launch's console key, made once in ``build_host``.
+
+    ``POST /app/console-claim`` hands it out once; ``ChatService`` requires it
+    (header ``X-Godseye-Console``) on every engagement approval. It never
+    appears in ``window.__GODSEYE__``, ``/app/config``, ``mcp.json``, a log
+    line, an audit row or ``repr``. Of any number of concurrent claims,
+    exactly one wins.
+    """
+
+    __slots__ = ("_key", "_lock", "claimed_at_ms", "refused")
+
+    def __init__(self, key: str | None = None) -> None:
+        self._key = key or secrets.token_urlsafe(24)
+        self._lock = threading.Lock()
+        self.claimed_at_ms: int | None = None
+        self.refused = 0
+
+    @property
+    def key(self) -> str:
+        return self._key
+
+    @property
+    def claimed(self) -> bool:
+        return self.claimed_at_ms is not None
+
+    def claim(self) -> tuple[str | None, int]:
+        """``(key, 0)`` on the first call, ``(None, n)`` on the n-th refusal."""
+        with self._lock:
+            if self.claimed_at_ms is None:
+                self.claimed_at_ms = int(time.time() * 1000)
+                return self._key, 0
+            self.refused += 1
+            return None, self.refused
+
+    def __repr__(self) -> str:
+        return f"ConsoleClaim(claimed={self.claimed}, refused={self.refused})"
+
+
+def _audit(store: Any, kind: str, message: str, **fields: Any) -> None:
+    try:
+        store.log_audit(kind, message, **fields)
+    except Exception as exc:  # noqa: BLE001 - the answer still goes out
+        log.warning("audit %s not written: %s", kind, type(exc).__name__)
+
+
+def console_claim_router(claim: ConsoleClaim, store: Any,
+                         auth: Callable[..., bool]) -> APIRouter:
+    """``POST /app/console-claim`` (bearer only, never ``?token=``): the first
+    call is 200 ``{console_key}`` and audits ``console_claimed``; every later
+    one is 409 ``console_already_claimed`` and audits ``console_claim_refused``.
+    The body is not read. A sync route, so the fsync'd audit append runs on
+    the threadpool, not the loop.
+    """
+    router = APIRouter()
+
+    @router.post(CONSOLE_CLAIM_PATH, include_in_schema=False)
+    def console_claim(_: bool = Depends(auth)) -> JSONResponse:
+        key, refused = claim.claim()
+        if key is None:
+            _audit(store, "console_claim_refused",
+                   "a second client tried to claim engagement approvals; refused",
+                   attempt=refused, claimed_at_ms=claim.claimed_at_ms)
+            log.warning("a second client tried to claim engagement approvals; "
+                        "refused (attempt %d)", refused)
+            return JSONResponse(dict(CONSOLE_ALREADY_CLAIMED), status_code=409,
+                                headers=NO_STORE_HEADERS)
+        _audit(store, "console_claimed", "the console claimed engagement approvals",
+               claimed_at_ms=claim.claimed_at_ms)
+        return JSONResponse({"console_key": key}, headers=NO_STORE_HEADERS)
+
+    return router
 
 
 # ---------------------------------------------------------------------------
@@ -749,6 +850,8 @@ class Host:
         self.intel_error: str | None = None
         self.chat_error: str | None = None
         self.chat_reason: str | None = None
+        self.wargame_error: str | None = None
+        self.console: ConsoleClaim | None = None        # build_host sets it
         self._uvicorn: uvicorn.Server | None = None
         self._stopping: asyncio.Event | None = None      # set by serve() at shutdown
         self._loop: asyncio.AbstractEventLoop | None = None   # the loop serve() runs on
@@ -790,6 +893,9 @@ class Host:
         if fut is not None:
             with contextlib.suppress(Exception):
                 fut.result(timeout=3.0)
+        # The wargame engine's thread and pools may still submit to the
+        # tasking loop, so they stop first.
+        _close_wargame(srv)
         with contextlib.suppress(Exception):
             srv.tasking.shutdown()
         with contextlib.suppress(Exception):
@@ -825,6 +931,16 @@ class Host:
         if ref:
             out["provider"] = ref
         return out
+
+
+def _close_wargame(srv: Any) -> None:
+    """Stop the wargame engine's thread and worker pools (``WargameEngine.
+    close``; a session stays in memory and ``wargame.json`` on disk, so a
+    restart recovers it as WG §5.2.9 says). Never raises."""
+    close = getattr(getattr(srv, "wargame", None), "close", None)
+    if callable(close):
+        with contextlib.suppress(Exception):
+            close()
 
 
 def _bridge_ctx(bridge_app: FastAPI, adapter: Any, token: str) -> Any:
@@ -946,6 +1062,8 @@ def build_host(cfg: HostConfig) -> Host:
     t = boot.theater                                # KeyError names the known ids
     home = launch.home_geopoint(t)                  # MSL -> HAE, once (T1)
     token = cfg.token or secrets.token_urlsafe(24)
+    # M14a (WG v2 §3.5): the console key, per launch, never GET-able.
+    console = ConsoleClaim(secrets.token_urlsafe(24))
     ui_dir = Path(cfg.ui_dir).expanduser().resolve() if cfg.ui_dir else default_ui_dir()
 
     acquired: list[Callable[[], Any]] = []
@@ -994,8 +1112,10 @@ def build_host(cfg: HostConfig) -> Host:
         server = launch.build_server(t, backend, store, token=token,
                                      public_url=f"http://{url_host}:{port}",
                                      airframe=boot.airframe, real_data=cfg.real_data,
-                                     geodata=cfg.geodata)
+                                     geodata=cfg.geodata,
+                                     wargame_mcp=bool(cfg.wargame_mcp))
         acquired.append(server.tasking.shutdown)
+        acquired.append(lambda: _close_wargame(server))
         if server.theater_mismatch is not None:
             raise RuntimeError(
                 f"server resolved theater {server.theater.id!r} for a {t.id!r} "
@@ -1019,7 +1139,7 @@ def build_host(cfg: HostConfig) -> Host:
         store_dir=store_dir, backend=backend, adapter=adapter, sockets=sockets,
         port=port, mcp_port=mcp_port, url=f"http://{url_host}:{port}/",
         mcp_url=mcp_url, ui_dir=ui_dir, ui_built=(ui_dir / "index.html").is_file(),
-        _store_lock=store_lock, _stop_requested=False,
+        _store_lock=store_lock, _stop_requested=False, console=console,
     )
     try:
         _wire(host, mcp_asgi, adapter)
@@ -1130,6 +1250,9 @@ def _wire(host: Host, mcp_asgi: ASGIApp, adapter: Any) -> None:
                 "chat": host.chat_summary(), "mcp_path": MCP_PATH,
                 "ui": "built" if host.ui_built else "missing"}
 
+    # -- the console key, claimed once (M14a; never on a GET) ----------------
+    app.include_router(console_claim_router(host.console, host.store, auth))
+
     # -- intel ------------------------------------------------------------
     try:
         from . import intel_graph
@@ -1148,7 +1271,7 @@ def _wire(host: Host, mcp_asgi: ASGIApp, adapter: Any) -> None:
         host.chat = chat.ChatService(
             server=host.server, intel=host.intel, store_dir=host.store_dir,
             model=cfg.model, effort=cfg.effort, cli_path=cli_path, enabled=cfg.chat,
-            llm=host.llm)
+            llm=host.llm, console_key=host.console.key)
         app.include_router(chat.chat_router(host.chat, auth, auth_sse))
     except Exception as exc:  # noqa: BLE001 - the console still works without the analyst
         host.chat = None
@@ -1156,6 +1279,15 @@ def _wire(host: Host, mcp_asgi: ASGIApp, adapter: Any) -> None:
         host.chat_error = f"{type(exc).__name__}: {exc}"
         log.warning("analyst chat unavailable: %s", host.chat_error)
         app.include_router(_chat_fallback_router(host, auth))
+
+    # -- simulated wargame (M14a): the operator's End route -------------------
+    try:
+        from . import wargame_tools
+        app.include_router(wargame_tools.wargame_router(host.server, auth))
+    except Exception as exc:  # noqa: BLE001 - ISR keeps working; End answers 503
+        host.wargame_error = f"{type(exc).__name__}: {exc}"
+        log.warning("wargame routes unavailable: %s", host.wargame_error)
+        app.include_router(_unavailable_router("/wargame", "wargame_unavailable", auth))
 
     # -- analyst settings (BYOK spec §7): header bearer only, never ?token= --
     settings_router = None

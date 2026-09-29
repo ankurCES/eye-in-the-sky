@@ -41,11 +41,31 @@ chunks). A turn whose events or final blocks needed redacting also gets its
 CLI transcript scrubbed. Before a CLI is spawned, ``llm.preflight(rp)`` may
 refuse the provider (an endpoint that now redirects). Without ``llm`` the
 service runs exactly as before this spec (Claude login, no ``env`` option).
+
+Simulated wargame (M14a; WG v2 §3.5, §3.8, §5.2.11, unit B8):
+
+* **Mode.** ISR is the default. The CLI is built for the server's mode
+  (``server.wargame.mode_key()``: ``"isr"`` or ``"wargame:<id>"``): the system
+  prompt is the base plus that mode's identity (``_load_prompt(mode)``) and
+  the toolbelt carries the ``wg_*`` tools for that mode. The actor's reconnect
+  key is ``(provider, mode)``, so a mode change rebuilds the CLI on the next
+  message, which is prefixed "[Mode changed: …]".
+* **Engagements.** A ``wg_execute_engagement`` call is class ``engagement``
+  whatever the policy table says: it asks every time, is never
+  session-grantable and carries ``acknowledge_required`` plus the engine's
+  ``engagement`` preview. Approving it needs this console's key
+  (``X-Godseye-Console``, compared with ``hmac.compare_digest``) and
+  ``acknowledged: true`` (422 otherwise). Only then does ``_decide`` call
+  ``server.wargame.authorize``; a refusal denies the call with its message.
+  Any other verdict calls ``server.wargame.deny``. The key is never logged or
+  emitted.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import hmac
 import importlib
 import inspect
 import json
@@ -63,7 +83,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from fastapi import Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from . import theater_tools, theaters
 from .analyst_policy import (
@@ -115,8 +135,10 @@ RESUME_LOST_MESSAGE = ("The analyst could not resume this conversation: Claude C
 _AUTH_RX = re.compile(r"(?i)(authenticat|unauthori[sz]ed|invalid api key|not logged in|"
                       r"/login|oauth|\b401\b|credential)")
 # POI ids carry the POI's name, which may contain spaces ("poi:default:North Field").
+#: A focused graph id: the intel graph's prefixes (``frc``/``eng``/``vec`` are
+#: the simulated wargame's, WG v2 R26), then the chip grammar's id.
 _FOCUS_ID_RX = re.compile(
-    r"^(?:veh|msn|trk|unit|ob|rpt|thr|poi|sit|alarm|feed):[^\r\n\[\]|]{1,160}$")
+    r"^(?:veh|msn|trk|unit|ob|rpt|thr|poi|sit|frc|eng|vec|alarm|feed):[^\r\n\[\]|]{1,160}$")
 
 _ASSISTANT_ERRORS = {
     "authentication_failed": ("The analyst could not sign in to Claude.", SIGN_IN_HINT, False),
@@ -557,6 +579,16 @@ class NotAllowed(ChatError):
     """``approve_session`` for a class that must be approved call by call (HTTP 422)."""
 
 
+class ConsoleRequired(ChatError):
+    """An engagement approval without this console's key (HTTP 422
+    ``console_required``, WG v2 §3.5 rule 1)."""
+
+
+class AcknowledgementRequired(ChatError):
+    """An engagement ``approve`` without ``acknowledged: true`` (HTTP 422
+    ``acknowledgement_required``, WG v2 §3.5 rule 2)."""
+
+
 class Unavailable(ChatError):
     """The analyst cannot run (SDK missing, CLI missing, disabled)."""
 
@@ -576,6 +608,9 @@ class _Pending:
     decision: Decision
     future: asyncio.Future
     expires_at_ms: int
+    #: A simulated engagement (M14a): approving it needs the console key and
+    #: the acknowledgement (WG v2 §3.5).
+    engagement: bool = False
 
 
 @dataclass
@@ -639,6 +674,9 @@ class _Session:
         self.interrupt_evt = asyncio.Event()
         self.closed = False
         self.last_active = time.monotonic()
+        #: The server mode key (``"isr"`` / ``"wargame:<id>"``) this session's
+        #: last turn ran in; a different one prefixes the next prompt (M14a).
+        self.mode: str | None = None
         self.claude_session_id: str | None = None
         #: tool -> {param: default} from the server's input schemas (toolbelt).
         self.tool_defaults: dict[str, dict] = {}
@@ -851,6 +889,29 @@ PREVIEW_FIELDS = {"sim_set_theater": "theater_preview",
 #: Classes whose slip asks for the acknowledgement box (WG v2 §3.6), used when
 #: ``Decision`` has no ``acknowledge`` of its own.
 ACKNOWLEDGE_CLASSES = frozenset({"safety_override", "engagement"})
+#: The simulated-engagement approval class (M14a; WG v2 §3.7, §3.8).
+ENGAGEMENT = "engagement"
+#: Tools that are an engagement whatever the policy table says (defence in
+#: depth: never auto, never session-grantable, always acknowledged).
+ENGAGEMENT_TOOLS = frozenset({"wg_execute_engagement"})
+#: The approval_request field carrying the engine's engagement preview (§3.6).
+ENGAGEMENT_PREVIEW_FIELD = "engagement"
+#: The header the console sends its engagement key in (WG v2 §3.5).
+CONSOLE_HEADER = "X-Godseye-Console"
+#: Server modes (``server.wargame.mode_key()`` is ``"isr"`` or ``"wargame:<id>"``).
+MODE_ISR, MODE_WARGAME = "isr", "wargame"
+_WARGAME_KEY_PREFIX = "wargame:"
+#: The prompt's base and the identity file per mode (WG v2 §5.2.11).
+PROMPT_BASE = "analyst_prompt.md"
+PROMPT_IDENTITY = {MODE_ISR: "analyst_prompt_isr.md", MODE_WARGAME: "analyst_prompt_wargame.md"}
+#: Prefixed to the first prompt after the mode changed (WG v2 §5.2.11).
+MODE_CHANGED_WARGAME = "[Mode changed: simulated wargame session {id} is active]"
+MODE_CHANGED_ISR = "[Mode changed: back to ISR]"
+#: The chat session's stub prompt when a prompt file is missing (ISR only).
+STUB_PROMPT = ("You are the ISR analyst inside the Eye in the Sky console. ISR only: observe, "
+               "classify and report; never plan or recommend engagement. The operator approves "
+               "every command in the UI; never claim a command ran until its result says so.")
+_IDENTITY_SECTION = re.compile(r"(?ms)^## Identity\b.*?(?=^## |\Z)")
 
 
 def _acknowledge_required(decision: Any) -> bool:
@@ -858,6 +919,53 @@ def _acknowledge_required(decision: Any) -> bool:
     if isinstance(flag, bool):
         return flag
     return getattr(decision, "klass", None) in ACKNOWLEDGE_CLASSES
+
+
+def _engagement_decision(tool: str, decision: Decision) -> Decision:
+    """``decision`` as an ``engagement`` when the tool or its class is one:
+    asked on every call, never automatic or session-grantable, acknowledged
+    (D2). A no-op for every other call and for a policy that already says so."""
+    if decision.klass != ENGAGEMENT and tool not in ENGAGEMENT_TOOLS:
+        return decision
+    return dataclasses.replace(decision, klass=ENGAGEMENT, auto=False, allow_session=False,
+                               acknowledge=True)
+
+
+def console_matches(key: Any, header: Any) -> bool:
+    """True only for a configured key and an equal ``X-Godseye-Console``
+    header, compared in constant time (WG v2 §3.5 rule 1)."""
+    if not (isinstance(key, str) and key and isinstance(header, str) and header):
+        return False
+    return hmac.compare_digest(header.encode("utf-8"), key.encode("utf-8"))
+
+
+def mode_name(mode_key: Any) -> str:
+    """``"wargame"`` for a ``"wargame:<id>"`` key, else ``"isr"``."""
+    if isinstance(mode_key, str) and mode_key.startswith(_WARGAME_KEY_PREFIX):
+        return MODE_WARGAME
+    return MODE_ISR
+
+
+def mode_changed_line(mode_key: str) -> str:
+    """The line prefixed to the first prompt in a new mode (WG v2 §5.2.11)."""
+    if mode_name(mode_key) == MODE_WARGAME:
+        return MODE_CHANGED_WARGAME.format(id=mode_key[len(_WARGAME_KEY_PREFIX):])
+    return MODE_CHANGED_ISR
+
+
+def mode_change_prefix(mode_key: str) -> str:
+    """What the first prompt in a new mode starts with: the mode line, then
+    that mode's identity section (WG v2 §5.2.11, §7).
+
+    The bundled CLI keeps a RESUMED conversation's first system prompt (its
+    prompt snapshot; seen in E2E B1), so the new mode's identity would never
+    reach the model through ``system_prompt`` alone. It rides in the
+    conversation as well; a missing identity file leaves the line alone.
+    """
+    line = mode_changed_line(mode_key)
+    identity = _read_prompt_file(PROMPT_IDENTITY[mode_name(mode_key)])
+    identity = identity.strip() if isinstance(identity, str) else ""
+    return f"{line}\n\n{identity}" if identity else line
 
 
 def _theater_directive(payload: Mapping) -> dict | None:
@@ -946,19 +1054,42 @@ def _effective_plan(tool: str, args: Any, *, schema_defaults: dict | None = None
     return json.loads(dumps_compact(out))
 
 
-def _load_prompt() -> str:
+def _read_prompt_file(name: str) -> str | None:
+    """A prompt file from the package data, else beside this module; None if missing."""
     try:
         from importlib.resources import files
 
-        return files("godseye_uav").joinpath("analyst_prompt.md").read_text(encoding="utf-8")
-    except Exception:  # noqa: BLE001 -- fall back to the source tree, then a stub
-        path = pathlib.Path(__file__).with_name("analyst_prompt.md")
+        return files("godseye_uav").joinpath(name).read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001 -- fall back to the source tree
+        path = pathlib.Path(__file__).with_name(name)
         if path.is_file():
             return path.read_text(encoding="utf-8")
+        return None
+
+
+def _load_prompt(mode: str = MODE_ISR) -> str:
+    """The system prompt for ``mode`` (``"isr"`` or ``"wargame"``; WG v2 §5.2.11):
+    the base (``analyst_prompt.md``) followed by that mode's identity file.
+
+    A base that still carries its own ``## Identity`` section (the prompt
+    before the split) is complete for ISR by itself. Any other missing file
+    gives the ISR stub, so a packaging gap never yields a wargame identity.
+    """
+    mode = MODE_WARGAME if mode == MODE_WARGAME else MODE_ISR
+    base = _read_prompt_file(PROMPT_BASE)
+    if base is None:
         log.warning("analyst_prompt.md is missing; the analyst runs with a stub prompt")
-        return ("You are the ISR analyst inside the Eye in the Sky console. ISR only: observe, "
-                "classify and report; never plan or recommend engagement. The operator approves "
-                "every command in the UI; never claim a command ran until its result says so.")
+        return STUB_PROMPT
+    identity = _read_prompt_file(PROMPT_IDENTITY[mode])
+    if identity is None:
+        if mode == MODE_ISR and _IDENTITY_SECTION.search(base):
+            return base
+        log.warning("%s is missing; the analyst runs with the ISR stub prompt",
+                    PROMPT_IDENTITY[mode])
+        return STUB_PROMPT
+    # Exactly one identity: drop any the base still carries.
+    base = _IDENTITY_SECTION.sub("", base).rstrip("\n")
+    return f"{base}\n\n{identity.strip()}\n"
 
 
 # ----------------------------------------------------------------- service --
@@ -968,9 +1099,13 @@ class ChatService:
                  model: str | None = None, effort: str | None = None,
                  cli_path: str | None = None, sdk: Any = None,
                  approval_timeout_s: float = 600.0, enabled: bool = True,
-                 llm: Any = None):
+                 llm: Any = None, console_key: str | None = None):
         self._server = server
         self._intel = intel
+        #: The console's engagement approval key (WG v2 §3.5; made by the host,
+        #: claimed once by the console). None: no engagement can be approved.
+        #: Never logged, emitted or reported by ``status()``.
+        self.console_key = console_key if isinstance(console_key, str) and console_key else None
         self._store_dir = pathlib.Path(store_dir)
         #: ``llm_settings.LlmSettings`` (or None: today's Claude login, no ``env``).
         self._llm = llm
@@ -994,7 +1129,8 @@ class ChatService:
         self._approval_timeout_s = float(approval_timeout_s)
         self._enabled = bool(enabled)
         self._sessions: dict[str, _Session] = {}
-        self._prompt: str | None = None
+        #: mode ("isr" / "wargame") -> system prompt, loaded once each.
+        self._prompts: dict[str, str] = {}
         self.heartbeat_s = HEARTBEAT_S
         #: Seconds without a turn before a session's CLI is disconnected (0 = never).
         self.idle_disconnect_s = IDLE_DISCONNECT_S
@@ -1162,10 +1298,26 @@ class ChatService:
             raise NotFound(f"no chat session {sid!r}")
         return s
 
-    def _prompt_text(self) -> str:
-        if self._prompt is None:
-            self._prompt = _load_prompt()
-        return self._prompt
+    def _prompt_text(self, mode: str = MODE_ISR) -> str:
+        """The system prompt for a mode NAME (``"isr"`` / ``"wargame"``)."""
+        mode = MODE_WARGAME if mode == MODE_WARGAME else MODE_ISR
+        if mode not in self._prompts:
+            self._prompts[mode] = _load_prompt(mode)
+        return self._prompts[mode]
+
+    def _mode_key(self) -> str:
+        """The server's mode key: ``"wargame:<id>"`` during a simulated wargame
+        session, else ``"isr"`` (also for a server without a wargame engine, or
+        one whose engine fails to answer)."""
+        fn = getattr(getattr(self._server, "wargame", None), "mode_key", None)
+        if not callable(fn):
+            return MODE_ISR
+        try:
+            key = fn()
+        except Exception as exc:  # noqa: BLE001 -- fail safe: ISR
+            log.warning("analyst: the wargame mode key failed: %s", type(exc).__name__)
+            return MODE_ISR
+        return key if mode_name(key) == MODE_WARGAME else MODE_ISR
 
     def _analyst_dir(self) -> pathlib.Path:
         path = self._store_dir / "analyst"
@@ -1251,13 +1403,30 @@ class ChatService:
         return f"[Console context: the operator has these entities focused: {refs}]\n\n{text}"
 
     async def resolve_approval(self, sid: str, approval_id: str, decision: str,
-                               note: str | None = None) -> None:
+                               note: str | None = None, *, acknowledged: bool = False,
+                               console: bool = False) -> None:
+        """Resolve a parked approval. ``console`` is True only when the request
+        carried this console's key (the router checks ``X-Godseye-Console``).
+
+        An engagement approval is checked in the WG v2 §3.5 order: no key
+        configured or ``console`` false -> ``ConsoleRequired`` (for ``approve``
+        and ``approve_session``); ``approve`` without ``acknowledged is True``
+        -> ``AcknowledgementRequired``; ``approve_session`` -> ``NotAllowed``.
+        A deny needs neither.
+        """
         s = self._get(sid)
         if decision not in ("approve", "deny", "approve_session"):
             raise ValueError(f"unknown decision {decision!r}")
         p = s.pending.get(approval_id)
         if p is None or p.future.done():
             raise NotFound(f"no pending approval {approval_id!r}")
+        if p.engagement and decision in ("approve", "approve_session"):
+            if self.console_key is None or console is not True:
+                raise ConsoleRequired("Simulated engagements can only be approved from the "
+                                      "console that holds the engagement approval key.")
+            if decision == "approve" and acknowledged is not True:
+                raise AcknowledgementRequired("Tick the acknowledgement before approving a "
+                                              "simulated engagement.")
         if decision == "approve_session" and not p.decision.allow_session:
             raise NotAllowed(f"{p.decision.klass} calls must be approved one at a time")
         self._resolve(s, approval_id, decision, note)
@@ -1371,7 +1540,9 @@ class ChatService:
     # ---------------------------------------------------------------- actor --
     async def _actor(self, s: _Session) -> None:
         client = None
-        client_key: tuple | None = None  # the provider the connected CLI was built from
+        #: (provider, server mode) the connected CLI was built from (spec §8;
+        #: WG v2 §5.2.11: a mode change rebuilds the prompt and the toolbelt).
+        client_key: tuple | None = None
         try:
             while True:
                 if client is not None and self.idle_disconnect_s > 0:
@@ -1395,10 +1566,13 @@ class ChatService:
                         if s.turn is not None:
                             s.turn.stop = "interrupted"
                         continue
-                    if client is not None and client_key != _conn_key(rp):
-                        # The settings changed since this CLI started: the
-                        # running turn finished on the old provider; this one
-                        # gets a CLI built from the new one (spec §8).
+                    mode = self._mode_key()
+                    key = (_conn_key(rp), mode)
+                    if client is not None and client_key != key:
+                        # The settings (or the wargame mode) changed since this
+                        # CLI started: the running turn finished on the old
+                        # provider; this one gets a CLI built from the new one
+                        # (spec §8; WG v2 §5.2.11).
                         await self._disconnect(client)
                         client = None
                     opts = provider_options(rp, model_override=self._model_override)
@@ -1410,8 +1584,11 @@ class ChatService:
                         if refusal:
                             self._fail_preflight(s, rp, refusal)  # no CLI is spawned
                             continue
-                        client = await self._connect(s, rp)
-                        client_key = _conn_key(rp)
+                        client = await self._connect(s, rp, mode=mode)
+                        client_key = key
+                    if s.mode is not None and s.mode != mode:
+                        prompt = f"{mode_change_prefix(mode)}\n\n{prompt}"
+                    s.mode = mode
                     await self._run_turn(s, client, prompt)
                 except asyncio.CancelledError:
                     if s.turn is not None and s.turn.stop is None:
@@ -1468,15 +1645,19 @@ class ChatService:
             s.turn.stop = "error"
             s.turn.error = message
 
-    async def _connect(self, s: _Session, rp: Any = None) -> Any:
+    async def _connect(self, s: _Session, rp: Any = None, *, mode: str = MODE_ISR) -> Any:
+        """A CLI for ``s`` built for provider ``rp`` and server mode key ``mode``
+        (the mode's prompt and ``wg_*`` tools, WG v2 §5.2.11)."""
         sdk = self._sdk
         if rp is None:
             rp = await self._resolve_provider()
         toolbelt = await build_toolbelt(self._server, self._intel,
-                                        lambda directive: self._emit_ui(s, directive), sdk)
+                                        lambda directive: self._emit_ui(s, directive), sdk,
+                                        session_id=s.sid, mode=mode_name(mode))
         s.tool_defaults = dict(getattr(toolbelt, "defaults", None) or {})
         s.stderr_tail.clear()  # a failure below must be judged on THIS process's stderr
-        options = self._options(s, toolbelt, rp)  # never logged: its env holds the key
+        # never logged: its env holds the key
+        options = self._options(s, toolbelt, rp, mode=mode_name(mode))
         s.config_dir = self._config_dir(rp)
         client = sdk.ClaudeSDKClient(options=options)
         await client.connect()
@@ -1500,11 +1681,12 @@ class ChatService:
 
     def _base_options(self, *, allowed_tools: list, disallowed_tools: list,
                       mcp_servers: dict, can_use_tool: Callable, max_turns: int,
-                      stderr: Callable[[str], None]) -> dict[str, Any]:
+                      stderr: Callable[[str], None], mode: str = MODE_ISR) -> dict[str, Any]:
         """Every option that is the SAME for every provider (spec §0.1, §9.9).
-        The BYOK code never touches these: only ``provider_options`` varies."""
+        The BYOK code never touches these: only ``provider_options`` varies.
+        ``mode`` picks the system prompt's identity (WG v2 §5.2.11)."""
         kw: dict[str, Any] = {
-            "system_prompt": self._prompt_text(),
+            "system_prompt": self._prompt_text(mode),
             "tools": [],
             "allowed_tools": list(allowed_tools),
             "disallowed_tools": list(disallowed_tools),
@@ -1523,14 +1705,15 @@ class ChatService:
             kw["cli_path"] = self._cli_path
         return kw
 
-    def _options(self, s: _Session, toolbelt: Any, rp: Any = None) -> Any:
+    def _options(self, s: _Session, toolbelt: Any, rp: Any = None, *,
+                 mode: str = MODE_ISR) -> Any:
         if rp is None:
             rp = _LegacyProvider(model=self._model_override or DEFAULT_MODEL, effort=self.effort)
         kw = self._base_options(
             allowed_tools=toolbelt.allowed_tools, disallowed_tools=toolbelt.disallowed_tools,
             mcp_servers={SDK_SERVER_NAME: toolbelt.server_config},
             can_use_tool=self._can_use_tool_for(s), max_turns=MAX_TURNS,
-            stderr=s.stderr_line)
+            stderr=s.stderr_line, mode=mode)
         kw.update(provider_options(rp, model_override=self._model_override,
                                    effort_override=self.effort))
         if s.claude_session_id:
@@ -1843,8 +2026,8 @@ class ChatService:
 
     def _on_tool_use(self, s: _Session, turn: _Turn, block: Any) -> None:
         args = block.input if isinstance(block.input, dict) else {}
-        decision = classify(block.name, args)
         tool = bare_name(block.name)
+        decision = _engagement_decision(tool, classify(block.name, args))
         s.remember_call(block.id, {"tool": tool, "args": args, "decision": decision,
                                    "turn_id": turn.turn_id})
         s.emit("tool_call", {
@@ -2021,13 +2204,17 @@ class ChatService:
         sdk = self._sdk
         allow, deny = sdk.PermissionResultAllow, sdk.PermissionResultDeny
         args = input_data if isinstance(input_data, dict) else {}
-        decision = classify(tool_name, args)
-        call_id = getattr(ctx, "tool_use_id", None) or f"call-{uuid.uuid4().hex[:12]}"
         tool = bare_name(tool_name)
+        decision = _engagement_decision(tool, classify(tool_name, args))
+        engagement = decision.klass == ENGAGEMENT
+        call_id = getattr(ctx, "tool_use_id", None) or f"call-{uuid.uuid4().hex[:12]}"
         if decision.auto:
             return allow(updated_input=input_data)
+        preview = await self._engagement_preview(args) if engagement else None
         if s.closed or s.interrupt_evt.is_set():
             s.mark_not_run(call_id)
+            if engagement:
+                await self._deny_engagement(args)
             return deny(message="The operator interrupted the turn; the call was not run.",
                         interrupt=True)
         if decision.allow_session and tool in s.grants:
@@ -2037,7 +2224,8 @@ class ChatService:
         loop = asyncio.get_running_loop()
         pending = _Pending(approval_id=approval_id, call_id=call_id, tool=tool,
                            decision=decision, future=loop.create_future(),
-                           expires_at_ms=_now_ms() + int(self._approval_timeout_s * 1000))
+                           expires_at_ms=_now_ms() + int(self._approval_timeout_s * 1000),
+                           engagement=engagement)
         s.pending[approval_id] = pending
         request: dict = {
             "approval_id": approval_id, "call_id": call_id, "tool": pending.tool,
@@ -2054,6 +2242,9 @@ class ChatService:
         if tool in PREVIEW_FIELDS:
             # Always present for these tools: `{}` makes the slip Deny-only.
             request[PREVIEW_FIELDS[tool]] = self._approval_preview(tool, args)
+        if engagement:
+            # Always present: `{}` makes the engagement slip Deny-only (§3.6).
+            request[ENGAGEMENT_PREVIEW_FIELD] = preview if isinstance(preview, dict) else {}
         dry = self._dry_run_for(s, tool_name, args)
         if dry is not None:
             request["dry_run"] = dry
@@ -2066,15 +2257,33 @@ class ChatService:
         except asyncio.CancelledError:
             # client.interrupt() cancels a parked callback (control_cancel_request).
             self._resolve(s, approval_id, "cancelled")
+            if engagement:
+                self._deny_engagement_later(args)
             raise
         finally:
             s.pending.pop(approval_id, None)
         if verdict in ("approve", "approve_session"):
+            if engagement:
+                # The console approved it with its key (resolve_approval): only
+                # now may the engine authorize it, for THIS chat session (§3.8).
+                try:
+                    refusal = await self._authorize_engagement(s, approval_id, args)
+                except asyncio.CancelledError:
+                    s.mark_not_run(call_id)
+                    self._deny_engagement_later(args)
+                    raise
+                if refusal is not None:
+                    s.mark_not_run(call_id)
+                    return deny(message=(f"The simulated engagement was not authorized: "
+                                         f"{refusal} Nothing was fired. Do not retry it "
+                                         "unless the operator asks."), interrupt=False)
             if verdict == "approve_session" and decision.allow_session:
                 s.grants.setdefault(tool, _now_ms())
             s.mark_approved(call_id)
             return allow(updated_input=input_data)
         s.mark_not_run(call_id)
+        if engagement:
+            await self._deny_engagement(args)
         if verdict == "deny":
             message = ("The operator denied this call in the approval panel. Do not retry it; "
                        "ask the operator how they want to proceed.")
@@ -2187,6 +2396,65 @@ class ChatService:
             log.warning("approval preview for %s failed: %s", tool, type(exc).__name__)
             return {}
 
+    # ----------------------------------------------------------- engagements --
+    def _wargame_fn(self, name: str) -> Callable | None:
+        fn = getattr(getattr(self._server, "wargame", None), name, None)
+        return fn if callable(fn) else None
+
+    async def _engagement_preview(self, args: dict) -> dict:
+        """``server.wargame.preview(pending_id)`` as plain JSON, read in a worker
+        thread (it takes the engine lock); ``{}`` without an engine or on any
+        error (the slip is then Deny-only, WG v2 §3.6)."""
+        fn = self._wargame_fn("preview")
+        if fn is None:
+            return {}
+        try:
+            out = await asyncio.to_thread(fn, args.get("pending_id"))
+            return json.loads(dumps_compact(out)) if isinstance(out, Mapping) else {}
+        except Exception as exc:  # noqa: BLE001 -- a preview never blocks the request
+            log.warning("engagement preview failed: %s", type(exc).__name__)
+            return {}
+
+    async def _authorize_engagement(self, s: _Session, approval_id: str,
+                                    args: dict) -> str | None:
+        """Authorize the approved engagement for this chat session (WG v2 §3.8
+        step 4), in a worker thread (the engine audits). None when it was
+        authorized, else the refusal message the call is denied with."""
+        fn = self._wargame_fn("authorize")
+        if fn is None:
+            return "The simulated wargame isn't running in this host."
+        try:
+            await asyncio.to_thread(fn, args.get("pending_id"), approval_id,
+                                    chat_session=s.sid, args=dict(args))
+        except Exception as exc:  # noqa: BLE001 -- any failure denies the call
+            code = getattr(exc, "code", None)
+            message = getattr(exc, "message", None)
+            log.info("engagement authorization refused: %s",
+                     code if isinstance(code, str) else type(exc).__name__)
+            if isinstance(message, str) and message.strip():
+                return message.strip()[:500]
+            return "The engagement couldn't be authorized."
+        return None
+
+    def _deny_engagement_sync(self, args: dict) -> None:
+        fn = self._wargame_fn("deny")
+        if fn is None:
+            return
+        try:
+            fn(args.get("pending_id"))
+        except Exception as exc:  # noqa: BLE001 -- best effort; the engine expires it anyway
+            log.warning("engagement deny failed: %s", type(exc).__name__)
+
+    async def _deny_engagement(self, args: dict) -> None:
+        """Tell the engine the operator did not approve it (phase ``denied``)."""
+        await asyncio.to_thread(self._deny_engagement_sync, args)
+
+    def _deny_engagement_later(self, args: dict) -> None:
+        """``_deny_engagement`` from a path being cancelled: fire and forget on
+        the default executor (it must not block the loop or wait)."""
+        with contextlib.suppress(RuntimeError):
+            asyncio.get_running_loop().run_in_executor(None, self._deny_engagement_sync, args)
+
     def _envelope_summary(self) -> dict | None:
         env = getattr(self._server, "envelope", None)
         if env is None:
@@ -2225,6 +2493,8 @@ class MessageBody(BaseModel):
 class ApprovalBody(BaseModel):
     decision: Literal["approve", "deny", "approve_session"]
     note: str | None = Field(default=None, max_length=2000)
+    #: The console's acknowledgement box (WG v2 §3.5): only a JSON ``true`` counts.
+    acknowledged: StrictBool | None = None
 
 
 def chat_router(service: ChatService, auth: Any, sse_auth: Any):
@@ -2289,12 +2559,23 @@ def chat_router(service: ChatService, auth: Any, sse_auth: Any):
                      "Connection": "keep-alive"})
 
     @api.post("/chat/sessions/{sid}/approvals/{approval_id}")
-    async def chat_approval(sid: str, approval_id: str, body: ApprovalBody):
+    async def chat_approval(sid: str, approval_id: str, body: ApprovalBody, request: Request):
+        # WG v2 §3.5: the console's engagement key rides in a header; only the
+        # comparison's verdict reaches the service, never the header itself.
+        console = console_matches(service.console_key, request.headers.get(CONSOLE_HEADER))
         try:
-            await service.resolve_approval(sid, approval_id, body.decision, body.note)
+            await service.resolve_approval(sid, approval_id, body.decision, body.note,
+                                           acknowledged=body.acknowledged is True,
+                                           console=console)
         except NotFound:
             return JSONResponse({"error": "unknown_approval", "approval_id": approval_id},
                                 status_code=404)
+        except ConsoleRequired as exc:
+            return JSONResponse({"error": "console_required", "message": str(exc)},
+                                status_code=422)
+        except AcknowledgementRequired as exc:
+            return JSONResponse({"error": "acknowledgement_required", "message": str(exc)},
+                                status_code=422)
         except NotAllowed as exc:
             return JSONResponse({"error": "not_allowed", "message": str(exc)}, status_code=422)
         except ValueError as exc:
@@ -2338,7 +2619,8 @@ def chat_router(service: ChatService, auth: Any, sse_auth: Any):
 
 
 __all__ = [
-    "DEFAULT_MODEL", "Busy", "ChatError", "ChatService", "NotAllowed", "NotFound",
-    "Unavailable", "chat_router", "classify_provider_error", "provider_error_copy",
+    "CONSOLE_HEADER", "DEFAULT_MODEL", "ENGAGEMENT", "AcknowledgementRequired", "Busy",
+    "ChatError", "ChatService", "ConsoleRequired", "NotAllowed", "NotFound", "Unavailable",
+    "chat_router", "classify_provider_error", "console_matches", "provider_error_copy",
     "provider_options", "scrub_transcripts",
 ]

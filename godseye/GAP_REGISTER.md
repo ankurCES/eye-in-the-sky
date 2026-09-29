@@ -1,3 +1,5 @@
+> Historical document. The ISR-only rule is amended by PLAN.md §4.5a (M14a).
+
 # godSeye — verified gap register (audit wf_effd1b75-fc1, 150 agents)
 Adversarially verified: each gap was re-checked by an agent told to REFUTE it.
 

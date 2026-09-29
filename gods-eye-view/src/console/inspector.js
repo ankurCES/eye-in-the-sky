@@ -35,6 +35,23 @@ import {
   unknownTitle,
 } from './inspectorPlaces.js';
 import {
+  engagementBody,
+  forceBody,
+  strikePrefill,
+  vectorBody,
+  wargameHeadWords,
+  wargameMapRequest,
+  wargameTitle,
+} from './inspectorWargame.js';
+import {
+  AAR_TITLE,
+  SITE_CONTEXT_ONLY_TEXT,
+  STRIKE_ACTION_TEXT,
+  isTruthView,
+  isWargameType,
+  wargameActive,
+} from './railWargame.js';
+import {
   ICON,
   NOT_IN_PICTURE,
   PHASE_WORD,
@@ -62,9 +79,11 @@ import {
   humanize,
   icon,
   isAssessed,
+  isPanelType,
   linkLines,
   missionKindTitle,
   noReading,
+  nodeGlyph,
   nodeOf,
   notAssessed,
   num,
@@ -312,6 +331,10 @@ const PREFIX_TYPE = Object.freeze({
   alarm: 'alarm',
   feed: 'feed',
   sit: 'site',
+  // The simulated wargame (WG §3.1 chip grammar, M14a).
+  frc: 'force',
+  eng: 'engagement',
+  vec: 'vector',
 });
 
 /**
@@ -412,6 +435,8 @@ export function createInspector(host, ctx, opts = {}) {
   const nodeFor = (id) => nodeOf(state(), id);
   /** The sim speed when it isn't ×1: durations then say "in sim time". */
   const simScale = () => timeScaleOf(state().graph?.theater);
+  /** Whether the graph shows the wargame umpire's truth (WG §5.3.3). */
+  const truthView = () => isTruthView(state().graph, state().truth);
 
   // ---- small builders -------------------------------------------------------
 
@@ -481,9 +506,12 @@ export function createInspector(host, ctx, opts = {}) {
         title: known ? undefined : NOT_IN_PICTURE,
         'aria-label': `Inspect ${shown || id}`,
       },
-      glyph(node?.type || type, node?.status || 'unknown', 10, undefined, {
-        category: node?.attrs?.category,
-      }),
+      // A wargame chip draws its frame, burst or arrow (WG §5.3.4).
+      isWargameType(node?.type)
+        ? nodeGlyph(node, 10)
+        : glyph(node?.type || type, node?.status || 'unknown', 10, undefined, {
+            category: node?.attrs?.category,
+          }),
       h(
         'span',
         {
@@ -605,6 +633,15 @@ export function createInspector(host, ctx, opts = {}) {
     }
     const inTheater = theaterNote(a, f);
     if (inTheater) rows.push(field('Theater', inTheater));
+    // A scenario contact (WG §3.2): a sensor's report of a simulated unit.
+    if (a.scenario === true || f.scenario === true)
+      rows.push(
+        field(
+          'Wargame',
+          'Scenario contact (simulated)',
+          registerTag('scenario'),
+        ),
+      );
     const dups = Array.isArray(f.duplicates) ? f.duplicates : [];
     const dupIds = dups.length
       ? dups.map((d) => d?.track_id).filter(Boolean)
@@ -964,6 +1001,28 @@ export function createInspector(host, ctx, opts = {}) {
       );
     }
     const kids = [fields(...rows), section('Gaps', gaps)];
+    // A simulated wargame's after-action review (WG §5.3.11): Read in full
+    // opens the read view, which renders its Markdown safely.
+    if (format === 'AAR' || f.report_type === 'AAR') {
+      const id = node?.id || cur?.id;
+      kids.unshift(
+        h(
+          'div',
+          { class: 'ic-inspector__aar' },
+          h('p', { class: 'ic-inspector__aar-title' }, AAR_TITLE),
+          button('Read in full', {
+            icon: ICON.open,
+            key: 'act:read',
+            onClick: () =>
+              emit('read:open', {
+                id,
+                title: AAR_TITLE,
+                markdown: typeof f.markdown === 'string' ? f.markdown : null,
+              }),
+          }),
+        ),
+      );
+    }
     const summary = f.mission_summary ?? header.detail ?? a.detail;
     if (summary) {
       kids.push(
@@ -1232,7 +1291,24 @@ export function createInspector(host, ctx, opts = {}) {
     poi: placeBody,
     alarm: alarmBody,
     feed: feedBody,
-    site: (node, entity) => siteBody(kit, node, entity),
+    site: (node, entity) => [
+      ...siteBody(kit, node, entity),
+      // During a wargame a mapped site says, again, that it is context only.
+      wargameActive(state().graph)
+        ? h(
+            'p',
+            { class: 'ic-inspector__line ic-inspector__wg-context' },
+            SITE_CONTEXT_ONLY_TEXT,
+          )
+        : null,
+    ],
+    // The simulated wargame (WG §5.3.4, §5.3.6).
+    force: (node, entity) =>
+      forceBody(kit, node, entity, state().graph, { truth: truthView() }),
+    engagement: (node, entity) =>
+      engagementBody(kit, node, entity, state().graph, { truth: truthView() }),
+    vector: (node, entity) =>
+      vectorBody(kit, node, entity, state().graph, { scale: simScale() }),
   };
 
   function provenanceSection(entity) {
@@ -1350,9 +1426,23 @@ export function createInspector(host, ctx, opts = {}) {
     const entity = cur.entity;
     const type = node?.type || entity?.type || typeFromId(cur.id);
     const stat = node?.status || entity?.status || 'unknown';
-    const known = isKnownType(type);
+    const known = isPanelType(type);
     const site = type === 'site' ? siteHeader(node, entity) : null;
+    // Wargame nodes (WG §5.3.4, §5.3.6): their own title, side and tags.
+    const wg = isWargameType(type)
+      ? {
+          ...wargameHeadWords(type, node, entity),
+          title: wargameTitle(type, node, entity, state().graph),
+          glyphNode: {
+            ...(node || {}),
+            type,
+            status: stat,
+            attrs: { ...(entity?.fields || {}), ...(node?.attrs || {}) },
+          },
+        }
+      : null;
     const labelText =
+      wg?.title ||
       (node ? displayLabel(node) : '') ||
       (type === 'feed' ? displayLabel({ type, id: cur.id }) : '') ||
       entity?.label ||
@@ -1419,7 +1509,9 @@ export function createInspector(host, ctx, opts = {}) {
       h(
         'div',
         { class: 'ic-inspector__titlebar' },
-        glyph(type, stat, 20, undefined, { category: site?.category }),
+        wg
+          ? nodeGlyph(wg.glyphNode, 20)
+          : glyph(type, stat, 20, undefined, { category: site?.category }),
         h(
           'h2',
           { class: 'ic-inspector__title', id: titleId, tabindex: '-1' },
@@ -1435,6 +1527,28 @@ export function createInspector(host, ctx, opts = {}) {
           },
           known ? TYPE_WORD[type] || humanize(type) : unknownTitle(type),
         ),
+        wg?.sideWord
+          ? h(
+              'span',
+              {
+                class: 'ic-inspector__category ic-inspector__wg-side',
+                'data-side': wg.glyphNode.attrs.side || 'unknown',
+              },
+              wg.sideWord,
+            )
+          : null,
+        wg?.status
+          ? h(
+              'span',
+              {
+                class: 'ic-inspector__status',
+                'data-status': stat,
+                'data-tone': wg.tone,
+              },
+              wg.status,
+            )
+          : null,
+        wg ? wg.tag : null,
         site
           ? h(
               'span',
@@ -1445,7 +1559,7 @@ export function createInspector(host, ctx, opts = {}) {
               site.categoryWord,
             )
           : null,
-        word
+        word && !wg
           ? h(
               'span',
               {
@@ -1471,7 +1585,7 @@ export function createInspector(host, ctx, opts = {}) {
       ),
     );
     // A site's subtitle repeats its category and status words, shown above.
-    const sub = feedNode || site ? '' : cleanSubtitle(node?.subtitle);
+    const sub = feedNode || site || wg ? '' : cleanSubtitle(node?.subtitle);
     if (sub) kids.push(segments(sub, 'ic-inspector__subtitle-line'));
     replaceKids(head, kids);
   }
@@ -1620,12 +1734,49 @@ export function createInspector(host, ctx, opts = {}) {
             draft: true,
           }),
       }),
-      button('Focus', {
-        icon: ICON.focus,
-        key: 'act:focus',
-        onClick: () => focusEntity(id, entity),
-      }),
     ];
+    // A vector has no Focus (WG §5.3.6): it is a line, not a place.
+    if (type !== 'vector')
+      kids.push(
+        button('Focus', {
+          icon: ICON.focus,
+          key: 'act:focus',
+          onClick: () => focusEntity(id, entity),
+        }),
+      );
+    // The simulated wargame (WG §5.3.4, §5.3.6): Show on map, and on a red
+    // force sensed as a contact, a drafted strike plan (never sent).
+    if (isWargameType(type)) {
+      const req = wargameMapRequest(id, node, entity);
+      if (req)
+        kids.push(
+          button('Show on map', {
+            icon: ICON.map,
+            key: 'act:map',
+            onClick: () => emit('map:request', req),
+          }),
+        );
+      const prefill =
+        type === 'force'
+          ? strikePrefill(
+              { ...(node || {}), type, attrs: { ...f, ...attrs } },
+              state().graph,
+            )
+          : null;
+      if (prefill)
+        kids.push(
+          button(STRIKE_ACTION_TEXT, {
+            icon: ICON.strike,
+            key: 'act:strike',
+            onClick: () =>
+              emit('ask', {
+                text: prefill,
+                focused_ids: [id],
+                draft: true,
+              }),
+          }),
+        );
+    }
     // Places (WG §4.2.5, §4.2.6): Show on map and a drafted recce. A site is
     // context only, so it never gets any other action.
     if (isPlaceType(type)) {

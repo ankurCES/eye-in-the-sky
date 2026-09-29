@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 
 import {
   CHAT_EVENTS,
+  CONSOLE_HEADER,
+  CONSOLE_KEY_STORAGE,
   ChatError,
   SESSION_KEY,
   bodyOf,
@@ -445,4 +447,151 @@ test('error helpers read status and body in any shape', () => {
   const e = new ChatError('busy', 'x');
   assert.equal(chatError(e), e);
   assert.throws(() => createChatClient({}), /needs an api/);
+});
+
+// ---- engagement approvals (WG spec §3.5; B14) -----------------------------------------
+
+/** A fake api that also records the request options (headers). */
+function headerApi(routes = {}) {
+  const api = fakeApi(routes);
+  const post = api.post;
+  api.opts = [];
+  api.post = (path, body, opts) => {
+    api.opts.push(opts ?? null);
+    return post(path, body);
+  };
+  return api;
+}
+
+test('approve sends acknowledged:true only on an acknowledged approval, never on a deny', async () => {
+  const api = headerApi({
+    'POST /chat/sessions': { session_id: 's' },
+    'POST *': (body) => ({ ok: true, body }),
+  });
+  const client = createChatClient({ api, storage: memoryStorage() });
+  await client.open();
+  let res = await client.approve('e1', 'approve', null, { acknowledged: true });
+  assert.deepEqual(res.body, { decision: 'approve', acknowledged: true });
+  res = await client.approve('e1', 'deny', 'no', { acknowledged: true });
+  assert.deepEqual(res.body, { decision: 'deny', note: 'no' });
+  res = await client.approve('e1', 'approve', null, { acknowledged: 'yes' });
+  assert.deepEqual(res.body, { decision: 'approve' }, 'only a real true');
+  res = await client.approve('e1', 'approve');
+  assert.deepEqual(res.body, { decision: 'approve' });
+});
+
+test('the console key rides as X-Godseye-Console on every approval POST once held', async () => {
+  assert.equal(CONSOLE_HEADER, 'X-Godseye-Console');
+  assert.equal(CONSOLE_KEY_STORAGE, 'godseye.consoleKey');
+  const storage = memoryStorage();
+  const api = headerApi({
+    'POST /chat/sessions': { session_id: 's' },
+    'POST *': (body) => ({ ok: true, body }),
+  });
+  const client = createChatClient({ api, storage });
+  await client.open();
+  assert.deepEqual(client.consoleAccess(), { held: false, refused: false });
+  await client.approve('e1', 'approve', null, { acknowledged: true });
+  assert.equal(api.opts.at(-1), null, 'no key yet: no header');
+  // The shell stores the claimed key in sessionStorage (B15a).
+  storage.setItem(CONSOLE_KEY_STORAGE, 'k3y-abc');
+  assert.deepEqual(client.consoleAccess(), { held: true, refused: false });
+  await client.approve('e1', 'approve', null, { acknowledged: true });
+  assert.deepEqual(api.opts.at(-1), {
+    headers: { 'X-Godseye-Console': 'k3y-abc' },
+  });
+  await client.approve('e2', 'deny');
+  assert.deepEqual(api.opts.at(-1), {
+    headers: { 'X-Godseye-Console': 'k3y-abc' },
+  });
+  // The key never shows in anything the client hands out.
+  assert.ok(!JSON.stringify(client.consoleAccess()).includes('k3y'));
+  // Messages never carry it.
+  api.opts.length = 0;
+  await client.send('hello');
+  assert.deepEqual(api.opts, [null]);
+});
+
+test('an injected key getter and a refused claim (409) are reported, not the key', async () => {
+  let key = null;
+  let refused = false;
+  const api = headerApi({
+    'POST /chat/sessions': { session_id: 's' },
+    'POST *': (body) => ({ ok: true, body }),
+  });
+  const client = createChatClient({
+    api,
+    storage: memoryStorage({ [CONSOLE_KEY_STORAGE]: 'ignored' }),
+    consoleKey: () => key,
+    consoleRefused: () => refused,
+  });
+  await client.open();
+  assert.deepEqual(client.consoleAccess(), { held: false, refused: false });
+  refused = true;
+  assert.deepEqual(client.consoleAccess(), { held: false, refused: true });
+  key = '  k2  ';
+  assert.deepEqual(client.consoleAccess(), { held: true, refused: false });
+  await client.approve('e1', 'approve', null, { acknowledged: true });
+  assert.deepEqual(api.opts.at(-1), { headers: { 'X-Godseye-Console': 'k2' } });
+  const throwing = createChatClient({
+    api,
+    storage: memoryStorage(),
+    consoleKey: () => {
+      throw new Error('storage blocked');
+    },
+    consoleRefused: () => {
+      throw new Error('nope');
+    },
+  });
+  assert.deepEqual(throwing.consoleAccess(), { held: false, refused: false });
+});
+
+test('a held key the host rejects (422 console_required) calls onConsoleRejected once, then throws', async () => {
+  let rejected = 0;
+  const api = headerApi({
+    'POST /chat/sessions': { session_id: 's' },
+    'POST *': () => {
+      throw new HttpError(422, { error: 'console_required' });
+    },
+  });
+  const client = createChatClient({
+    api,
+    storage: memoryStorage(),
+    consoleKey: () => 'stale-key-0123456789',
+    onConsoleRejected: () => {
+      rejected += 1;
+    },
+  });
+  await client.open();
+  await assert.rejects(
+    client.approve('e1', 'approve', null, { acknowledged: true }),
+    (err) => err.code === 'console_required',
+  );
+  assert.equal(rejected, 1);
+  // No key held: a 422 console_required is not a stale key, no hook.
+  const bare = createChatClient({
+    api,
+    storage: memoryStorage(),
+    consoleKey: () => null,
+    onConsoleRejected: () => {
+      rejected += 1;
+    },
+  });
+  await bare.open();
+  await assert.rejects(bare.approve('e1', 'approve'), (err) => Boolean(err));
+  assert.equal(rejected, 1);
+});
+
+test('422 console_required and acknowledgement_required become their own codes', () => {
+  const needKey = chatError(new HttpError(422, { error: 'console_required' }));
+  assert.equal(needKey.code, 'console_required');
+  assert.equal(
+    needKey.message,
+    "the server didn't accept this console's engagement key",
+  );
+  const needAck = chatError(
+    new HttpError(422, { error: 'acknowledgement_required' }),
+  );
+  assert.equal(needAck.code, 'acknowledgement_required');
+  assert.equal(chatError(new HttpError(422, { message: 'x' })).code, 'invalid');
 });

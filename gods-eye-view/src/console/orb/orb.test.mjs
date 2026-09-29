@@ -1027,22 +1027,22 @@ const animating = (fe) => {
   return fe.pendingFrames > 0;
 };
 
-test('fail-safe: an injected force node draws a lilac "?" in Other, never green, its status ignored (WG §4.2.1)', () => {
+test('fail-safe: an injected unknown node draws a lilac "?" in Other, never green, its status ignored (WG §4.2.1)', () => {
   const graph = sparse();
   graph.nodes.push({
-    id: 'frc:red-sam-1',
-    type: 'force',
-    label: 'Red SAM 1',
+    id: 'stk:1',
+    type: 'strike_package',
+    label: 'Package 1',
     status: 'ok',
     salience: 0.6,
     attrs: { side: 'red' },
   });
   const { orb, fe } = mount({ graph });
-  const i = orb.layout.index.get('frc:red-sam-1');
+  const i = orb.layout.index.get('stk:1');
   assert.equal(orb.layout.band[i], 'other');
-  const v = orb.visual('frc:red-sam-1');
+  const v = orb.visual('stk:1');
   assert.equal(v.status, 'unknown', 'status is not read');
-  face(orb, 'frc:red-sam-1');
+  face(orb, 'stk:1');
   orb.renderNow();
   const sprites = spritesWith(fe, UNRECOGNISED_GLYPH);
   assert.ok(sprites.length > 0, 'the unrecognised glyph is drawn');
@@ -1057,10 +1057,10 @@ test('fail-safe: an injected force node draws a lilac "?" in Other, never green,
   // A status flip on it rings nothing; the same flip on a vehicle does.
   assert.equal(animating(fe), false);
   const flipped = structuredClone(graph);
-  flipped.nodes.find((n) => n.id === 'frc:red-sam-1').status = 'critical';
+  flipped.nodes.find((n) => n.id === 'stk:1').status = 'critical';
   orb.setGraph(flipped);
   assert.equal(animating(fe), false, 'no ripple, no halo for an unknown type');
-  assert.equal(orb.visual('frc:red-sam-1').status, 'unknown');
+  assert.equal(orb.visual('stk:1').status, 'unknown');
   const vehicle = structuredClone(flipped);
   vehicle.nodes.find((n) => n.id === 'veh:Drone1').status = 'warn';
   orb.setGraph(vehicle);

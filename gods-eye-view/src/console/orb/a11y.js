@@ -7,12 +7,21 @@
  * sortable table (type, name, status, register, salience, last seen in Z):
  * the full visual alternative to the orb.
  *
+ * The simulated wargame (WG §5.3.3–§5.3.5): forces, engagements and
+ * vectors are grouped in their session bands, read "Force", "Engagement" and
+ * "Vector" with their state or phase words, and sit in the Scenario register
+ * (a Sand tag, "Set by the wargame, not seen by a sensor."). List view has
+ * the orb's Blue view too: `setView({umpire: false})` drops every force that
+ * is not provably blue and every red axis.
+ *
  * Built only with the uavDom helpers so the stub DOM used by node:test works.
  */
 
 import { h, replaceKids, setHidden } from '../../ui/uavDom.js';
-import { isKnownType } from './glyphs.js';
-import { BANDS, BAND_ORDER, bandOfType } from './layout.js';
+import { isOrbType } from './glyphs.js';
+import { BANDS, BAND_ORDER, bandOfNode } from './layout.js';
+import { filterForView, isWargameType } from './wargameStyles.js';
+import { SCENARIO_TOOLTIP, wargameDisplayStatus } from './wargameText.js';
 import {
   formatZ,
   nodeLabel,
@@ -35,8 +44,9 @@ const bySalience = (a, b) =>
  * status is never read (WG §4.2.1), and a site's is context, not a state.
  */
 export function displayStatus(node) {
-  if (!isKnownType(node?.type)) return 'unknown';
+  if (!isOrbType(node?.type)) return 'unknown';
   if (node.type === 'site') return 'mapped';
+  if (isWargameType(node.type)) return wargameDisplayStatus(node);
   return String(node.status || 'unknown');
 }
 
@@ -48,7 +58,7 @@ export function groupByBand(nodes) {
   const groups = new Map(BAND_ORDER.map((key) => [key, []]));
   for (const node of nodes || []) {
     if (node && typeof node.id === 'string')
-      groups.get(bandOfType(node.type)).push(node);
+      groups.get(bandOfNode(node)).push(node);
   }
   const out = [];
   for (const [key, list] of groups) {
@@ -248,7 +258,7 @@ export function sortRows(nodes, key = 'type', dir = 'ascending') {
       case 'seen':
         return Number.isFinite(node.ts_ms) ? node.ts_ms : -Infinity;
       default:
-        return BAND_RANK.get(bandOfType(node.type)) ?? 99;
+        return BAND_RANK.get(bandOfNode(node)) ?? 99;
     }
   };
   return [...nodes].sort((a, b) => {
@@ -266,6 +276,8 @@ export function sortRows(nodes, key = 'type', dir = 'ascending') {
  */
 export function createOrbListView(host, { onSelect } = {}) {
   let nodes = [];
+  let graphIn = null;
+  let viewMode = { umpire: true };
   let predicate = null;
   let sort = { key: 'type', dir: 'ascending' };
   /** The rows on screen: [{id, key, tr, open}], in table order. */
@@ -357,14 +369,24 @@ export function createOrbListView(host, { onSelect } = {}) {
       'tr',
       { class: 'ic-orb-list__row', 'data-id': node.id },
       cell(
-        typeLabel(node.type),
-        isKnownType(node.type)
+        typeLabel(node.type, { wargame: true }),
+        isOrbType(node.type)
           ? 'ic-orb-list__td'
           : 'ic-orb-list__td ic-orb-list__type--unrecognised',
       ),
       name,
       status,
-      cell(registerOf(node), 'ic-orb-list__td ic-orb-list__register'),
+      isWargameType(node.type)
+        ? h(
+            'td',
+            {
+              class: 'ic-orb-list__td ic-orb-list__register',
+              'data-register': 'scenario',
+              title: SCENARIO_TOOLTIP,
+            },
+            registerOf(node),
+          )
+        : cell(registerOf(node), 'ic-orb-list__td ic-orb-list__register'),
       cell(
         Number.isFinite(salience) ? salience.toFixed(2) : 'No reading',
         'ic-orb-list__td ic-orb-list__num',
@@ -430,10 +452,27 @@ export function createOrbListView(host, { onSelect } = {}) {
   const view = {
     element,
     setGraph(graph) {
-      nodes = Array.isArray(graph?.nodes)
-        ? graph.nodes.filter((n) => n && typeof n.id === 'string')
+      graphIn = graph;
+      const shown = filterForView(graph, viewMode);
+      nodes = Array.isArray(shown?.nodes)
+        ? shown.nodes.filter((n) => n && typeof n.id === 'string')
         : [];
       return render();
+    },
+    /**
+     * Blue view (`umpire: false`) or Umpire view (`umpire: true`, the
+     * default), as on the orb (WG §5.3.3). Anything but a boolean is ignored.
+     * @returns {{umpire: boolean}} the view now in force
+     */
+    setView({ umpire } = {}) {
+      if (typeof umpire === 'boolean' && umpire !== viewMode.umpire) {
+        viewMode = { umpire };
+        view.setGraph(graphIn);
+      }
+      return { ...viewMode };
+    },
+    get view() {
+      return { ...viewMode };
     },
     filter(pred) {
       predicate = typeof pred === 'function' ? pred : null;

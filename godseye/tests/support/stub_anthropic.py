@@ -114,6 +114,18 @@ def _account_present(metadata) -> bool:
     return bool(_ACCOUNT_RX.search(uid))
 
 
+_IDENTITY_RX = re.compile(r"^## Identity: [^\n]+", re.MULTILINE)
+
+
+def _system_text(system) -> str:
+    """The request's system prompt as one string (a string or text blocks)."""
+    if isinstance(system, str):
+        return system
+    if isinstance(system, list):
+        return "\n".join(str(b.get("text") or "") for b in system if isinstance(b, dict))
+    return ""
+
+
 def _summary(body) -> dict:
     if not isinstance(body, dict):
         return {"parsed": False}
@@ -131,7 +143,28 @@ def _summary(body) -> dict:
         "messages": len(msgs), "roles": [m.get("role") for m in msgs],
         "tool_results": tool_results,
         "account_uuid_present": _account_present(body.get("metadata")),
+        # The system prompt (E2E B1 step 8 reads which identity it carries), and
+        # the "## Identity: …" headers the conversation carries (a mode change
+        # sends the new mode's identity with the operator's next message).
+        "system": _system_text(body.get("system")),
+        "message_identities": sorted({m for msg in msgs for t in _texts(msg.get("content"))
+                                      for m in _IDENTITY_RX.findall(t)}),
+        # D1 (E2E B1): which real-system token patterns the tool results in the
+        # conversation match, by pattern name only (never the text).
+        "tool_result_tokens": _result_tokens(msgs),
     }
+
+
+def _result_tokens(msgs: list[dict]) -> list[str]:
+    from .wg_tokens import find_real_system_tokens
+    hits: set[str] = set()
+    for m in msgs:
+        content = m.get("content")
+        for c in content if isinstance(content, list) else []:
+            if isinstance(c, dict) and c.get("type") == "tool_result":
+                hits.update(name for _path, name, _text in
+                            find_real_system_tokens(c.get("content")))
+    return sorted(hits)
 
 
 def _probe(rec: dict) -> bool:

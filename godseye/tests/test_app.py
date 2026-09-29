@@ -1497,3 +1497,95 @@ def test_headless_app_never_prints_or_serves_a_launch_key(tmp_path):
         assert APP_KEY not in app.output()
     finally:
         app.kill()
+
+
+# ---------------------------------------------------------------------------
+# M14a (WG v2 §5.2.12 B11): --wargame-mcp and the console key
+# ---------------------------------------------------------------------------
+
+def test_the_wargame_mcp_flag_is_off_by_default_and_reaches_the_host_config():
+    assert build_parser().parse_args([]).wargame_mcp is False
+    assert appmod._config_from_args(build_parser().parse_args([]), "tok").wargame_mcp is False
+    on = appmod._config_from_args(build_parser().parse_args(["--wargame-mcp"]), "tok")
+    assert on.wargame_mcp is True
+    assert HostConfig(theater=None).wargame_mcp is False       # in-process hosts: ISR only
+    helptext = build_parser().format_help()
+    assert "--wargame-mcp" in helptext and "--wargame " not in helptext
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_the_startup_banner_names_the_wargame_flag_only_when_it_is_on(tmp_path, capsys, flag):
+    host = types.SimpleNamespace(
+        theater=types.SimpleNamespace(id="default", place="Redmond", label="AirSim default"),
+        url="http://127.0.0.1:1/", mcp_url="http://127.0.0.1:1/mcp", mcp_port=None,
+        token="t", store_dir=tmp_path / "store", ui_built=True, ui_dir=tmp_path,
+        server=types.SimpleNamespace(geodata_enabled=False, real=None,
+                                     wargame_mcp_enabled=flag),
+        chat_summary=lambda: {"available": False, "reason": "off"})
+    appmod._describe(host, token_source="generated", harness_file=None)
+    lines = [ln.removeprefix(f"{appmod.PREFIX} ") for ln in capsys.readouterr().out.splitlines()]
+    wargame = [ln for ln in lines if ln.startswith("wargame  :")]
+    assert wargame == ([("wargame  : --wargame-mcp: simulated wg_* tools are also on /mcp; "
+                         "engagements are still approved in the console only")] if flag else [])
+    assert lines[-1].startswith("analyst  :")
+
+
+def test_the_package_check_needs_all_three_analyst_prompt_files(tmp_path, monkeypatch):
+    """B7 split the prompt: a frozen build that drops the ISR identity or the
+    wargame addendum fails `package_data` like one without the base."""
+    import importlib.resources as ir
+
+    assert appmod.ANALYST_PROMPT_FILES == (
+        "analyst_prompt.md", "analyst_prompt_isr.md", "analyst_prompt_wargame.md")
+    host = types.SimpleNamespace(ui_built=True)
+    assert appmod.selftest_package_facts(host)["analyst_prompt"] is True   # the real package
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(ir, "files", lambda _name: pkg)
+    for present in ((), appmod.ANALYST_PROMPT_FILES[:1], appmod.ANALYST_PROMPT_FILES[:2]):
+        for p in pkg.iterdir():
+            p.unlink()
+        for name in present:
+            (pkg / name).write_text("x", encoding="utf-8")
+        assert appmod.selftest_package_facts(host)["analyst_prompt"] is False, present
+    (pkg / appmod.ANALYST_PROMPT_FILES[2]).write_text("x", encoding="utf-8")
+    assert appmod.selftest_package_facts(host)["analyst_prompt"] is True
+
+
+def test_headless_app_hands_the_console_key_out_once_and_never_prints_it(tmp_path):
+    """End to end (E2E B2's first bullet, on this module's ports): the key is
+    on no GET, not in mcp.json or the log; the first claim is 200, the next
+    409; `--wargame-mcp` publishes `wg_*` on /mcp and says so."""
+    app = AppProc(tmp_path, ["--wargame-mcp"], _child_env())
+    try:
+        token = json.loads((tmp_path / "data" / "mcp.json").read_text())["token"]
+        base = f"http://127.0.0.1:{app.port}"
+        auth = {"Authorization": f"Bearer {token}"}
+        page = httpx.get(f"{base}/", timeout=10).text
+        cfg = httpx.get(f"{base}/app/config", timeout=10).text
+        assert httpx.post(f"{base}/app/console-claim", timeout=10).status_code == 401
+        first = httpx.post(f"{base}/app/console-claim", headers=auth, json={}, timeout=10)
+        assert first.status_code == 200
+        key = first.json()["console_key"]
+        assert re.fullmatch(r"[A-Za-z0-9_-]{32}", key) and key != token
+        second = httpx.post(f"{base}/app/console-claim", headers=auth, json={}, timeout=10)
+        assert second.status_code == 409
+        assert second.json()["error"] == "console_already_claimed"
+        for text in (page, cfg, second.text, (tmp_path / "data" / "mcp.json").read_text()):
+            assert (key in text) is False
+        mcp = httpx.post(
+            f"{base}/mcp", timeout=20,
+            headers={**auth, "Accept": "application/json, text/event-stream"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        assert mcp.status_code == 200 and "wg_execute_engagement" in mcp.text
+        end = httpx.post(f"{base}/wargame/session/end", headers=auth, timeout=10)
+        assert end.status_code == 409 and end.json()["error"] == "wargame_inactive"
+        assert "wargame  : --wargame-mcp" in app.output()
+        assert app.stop(signal.SIGTERM) == 0
+        out = app.output()
+        assert (key in out) is False and (token in out) is False
+        audit = (tmp_path / "data" / "store" / "audit.jsonl").read_text()
+        assert '"console_claimed"' in audit and '"console_claim_refused"' in audit
+        assert (key in audit) is False
+    finally:
+        app.kill()

@@ -73,3 +73,62 @@ export function siteCategoryKey(category) {
 export function siteGlyphPath(category) {
   return SITE_GLYPHS[siteCategoryKey(category)];
 }
+
+// ---- Phase B: the simulated wargame (WG spec §5.3.4, §5.3.6, Appendix A) ----
+
+/**
+ * Force frames by side. A frame is drawn ONLY on a `force` node whose
+ * provenance is `scenario` (§5.3.4): it marks a simulated scenario unit, so
+ * no real object ever wears one. Sides read by shape, never by hue: blue is
+ * a rectangle, red a diamond, and a side the console does not know a lilac
+ * quatrefoil ("Side not set").
+ */
+export const FRAME_SIDES = Object.freeze(['blue', 'red', 'unknown']);
+
+/** Frame outlines (Appendix A without the bar), so a frame can dash alone. */
+export const FRAME_OUTLINES = Object.freeze({
+  blue: 'M2.5 6.5H21.5V17.5H2.5Z',
+  red: 'M12 2L22 12L12 22L2 12Z',
+  unknown: 'M8 8A4 4 0 0 1 16 8A4 4 0 0 1 16 16A4 4 0 0 1 8 16A4 4 0 0 1 8 8Z',
+});
+
+/** The state bar inside a frame: solid while the unit is not damaged. */
+export const FRAME_BARS = Object.freeze({
+  blue: 'M7 12H17',
+  red: 'M7 12H17',
+  unknown: 'M9 12H15',
+});
+
+/** The bar broken in two: "Damaged" (§5.3.4). */
+export const FRAME_BARS_BROKEN = Object.freeze({
+  blue: 'M7 12H10.5M13.5 12H17',
+  red: 'M7 12H10.5M13.5 12H17',
+  unknown: 'M9 12H11M13 12H15',
+});
+
+/** Whole frames exactly as Appendix A lists them (outline, then bar). */
+export const FRAME_GLYPHS = Object.freeze({
+  blue: `${FRAME_OUTLINES.blue}${FRAME_BARS.blue}`,
+  red: `${FRAME_OUTLINES.red}${FRAME_BARS.red}`,
+  unknown: `${FRAME_OUTLINES.unknown}${FRAME_BARS.unknown}`,
+});
+
+/** The slash across a destroyed unit's frame. */
+export const FRAME_SLASH = 'M3 21.5L21 2.5';
+
+/** An engagement: the burst (a simulated adjudication, never an effect area). */
+export const ENGAGEMENT_GLYPH =
+  'M12 2L14.2 9.8L22 12L14.2 14.2L12 22L9.8 14.2L2 12L9.8 9.8Z';
+
+/** A vector (a red axis or a planned corridor): the arrow. */
+export const VECTOR_GLYPH = 'M3 12H17M11 6L17 12L11 18';
+
+/** A force side from the closed vocabulary (§3.9), else `unknown`. */
+export function frameSideKey(side) {
+  return side === 'blue' || side === 'red' ? side : 'unknown';
+}
+
+/** The whole frame `d` for a side (unknown sides get the quatrefoil). */
+export function frameGlyphPath(side) {
+  return FRAME_GLYPHS[frameSideKey(side)];
+}

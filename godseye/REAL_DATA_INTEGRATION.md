@@ -157,7 +157,7 @@ matching category wins, and a category that fills its cap is flagged `capped`.
    `sim_set_theater`), and its mapped sites come with it.
 5. **ISR-only.** Real installation data is used for *observation and reporting* context. No targeting
    for strike — the system reports, the operator decides (M14). Mapped sites are never targets and
-   never enter the target list.
+   never enter the target list. Under M14a it is never a wargame target either.
 
 ## Honest limits to document
 

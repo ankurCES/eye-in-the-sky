@@ -246,7 +246,11 @@ test('the Key lists every site glyph and word, then the unrecognised map item', 
     const dock = createMapDock();
     const key = byClass(dock.element, 'ic-mapdock__key');
     assert.equal(key.tag, 'details');
-    const rows = all(key, hasClass('ic-mapdock__keyrow'));
+    // The site list (the wargame's rows sit in their own hidden block).
+    const rows = all(
+      byClass(key, 'ic-mapdock__keylist'),
+      hasClass('ic-mapdock__keyrow'),
+    );
     assert.equal(rows.length, 14);
     assert.equal(rows[0].attrs['data-category'], 'airfield');
     assert.match(textOf(rows[10]), /Medical, protected/);
@@ -317,4 +321,63 @@ test('rows without data hide; the Track buttons are rebuilt only when the fleet 
     dock.destroy();
     dock.update(model);
     assert.equal(dock.model.line[1], 'Y', 'a destroyed dock ignores updates');
+  }));
+
+test('wargame: the Show row and the Key additions appear only in a session (§5.3.12, B17)', () =>
+  withDom(() => {
+    const switched = [];
+    const dock = createMapDock({ onWargame: (k) => switched.push(k) });
+    dock.element.removeAttribute('hidden');
+    const isr = mapDockModel({
+      target: { label: 'AO', bbox: BBOX_5KM },
+      graph: { nodes: [], meta: {} },
+    });
+    assert.equal(isr.wargame, null);
+    dock.update(isr);
+    const show = byClass(dock.element, 'ic-mapdock__wgshow');
+    const wkey = byClass(dock.element, 'ic-mapdock__wgkey');
+    assert.equal(
+      show.attrs.hidden != null && show.attrs.hidden !== false,
+      true,
+    );
+    assert.equal(
+      wkey.attrs.hidden != null && wkey.attrs.hidden !== false,
+      true,
+    );
+    const graph = {
+      nodes: [
+        { id: 'frc:red-sam-1', type: 'force' },
+        { id: 'frc:blue-artillery-1', type: 'force' },
+        { id: 'eng:WG-1-E1', type: 'engagement' },
+      ],
+      meta: { wargame: { active: true, session_id: 'WG-1' } },
+    };
+    const model = mapDockModel({
+      target: { label: 'AO', bbox: BBOX_5KM },
+      graph,
+      overlay: { wargame: { force: { drawn: 1 } } },
+      wargameOn: { vectors: false },
+    });
+    assert.deepEqual(
+      model.wargame.rows.map((r) => [r.key, r.on, r.label]),
+      [
+        ['forces', true, 'Forces 1'],
+        ['engagements', true, 'Engagements 1'],
+        ['vectors', false, 'Vectors 0'],
+      ],
+    );
+    dock.update(model);
+    assert.ok(!show.attrs.hidden);
+    const text = textOf(dock.element);
+    assert.match(text, /Rings mark outcomes\. They are not effect areas\./);
+    assert.match(
+      text,
+      /Everything on this layer from the wargame is simulated\./,
+    );
+    assert.match(text, /Red unit \(diamond frame\)/);
+    assert.doesNotMatch(text, /·|SIMULATED/);
+    const box = byClass(show, 'ic-mapdock__check');
+    box.checked = false;
+    box.fire('change');
+    assert.deepEqual(switched, [{ forces: false }]);
   }));

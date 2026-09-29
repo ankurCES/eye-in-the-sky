@@ -19,6 +19,13 @@ Built per chat session (contract §5.1):
 * Every proxied call runs with ``theater_tools.CALL_VIA`` set to ``"console"``,
   so a theater switch the analyst makes is recorded as ``set_via: "console"``
   (WG v2 §4.1.3 step 6); ``/mcp`` callers keep the default ``"mcp"``.
+* Simulated wargame tools (M14a; WG v2 §5.2.11, unit B8) come only from the
+  server's own never-mounted registry ``server.wargame_mcp``; any ``wg_*`` on
+  ``server.mcp`` (``--wargame-mcp``) is skipped. ``mode="isr"`` (the default)
+  carries only ``WG_ENTRY_TOOLS``; ``mode="wargame"`` carries every ``wg_*``
+  tool. Each ``wg_*`` proxy calls ``server.wargame_mcp.call_tool`` inside
+  ``wargame.console_call(session_id)``: that is the only way an engagement
+  the console authorized for this chat session can execute (§3.8).
 
 Result shaping (every result, proxied or curated): compact JSON; tools that
 take ``detail`` / ``top_n`` get ``detail="summary"`` / ``top_n=10`` when the
@@ -40,7 +47,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from . import theater_tools
+from . import analyst_policy, theater_tools
 from .analyst_policy import (
     DRY_RUN_TOOLS,
     SDK_SERVER_NAME,
@@ -54,6 +61,16 @@ if TYPE_CHECKING:  # pragma: no cover
 
 #: Server tools never exposed to the analyst (module docstring says why).
 EXCLUDED_TOOLS = ("uav_list_tracks", "sim_set_environment", "uav_handoff_target")
+
+#: The simulated wargame's tool namespace (M14a, D3).
+WG_PREFIX = "wg_"
+#: Toolbelt modes: ISR (the default) and a simulated wargame session.
+MODE_ISR, MODE_WARGAME = "isr", "wargame"
+#: The only ``wg_*`` tools the ISR toolbelt carries (WG v2 §3.7).
+#: ``analyst_policy.WG_ENTRY_TOOLS`` owns the set; the literal is the same set.
+WG_ENTRY_TOOLS: frozenset[str] = frozenset(
+    getattr(analyst_policy, "WG_ENTRY_TOOLS", None)
+    or {"wg_session_start", "wg_session_status", "wg_list_classes"})
 
 #: Hard cap on the text of any tool result handed to the model.
 RESULT_CHAR_LIMIT = 24_000
@@ -78,9 +95,11 @@ RESOURCE_ALLOWLIST = (
 _OFFLOAD_CHARS = 200_000
 
 #: An intel-graph id: one of the graph's type prefixes (``sit`` is a mapped
-#: site, WG v2 §3.1, R26), then the rest of the chip grammar ``[[prefix:id|label]]``.
+#: site, WG v2 §3.1, R26; ``frc``/``eng``/``vec`` are the simulated wargame's
+#: forces, engagements and vectors, R26), then the rest of the chip grammar
+#: ``[[prefix:id|label]]``.
 _ENTITY_ID = re.compile(
-    r"^(?:veh|msn|trk|unit|ob|rpt|thr|poi|sit|alarm|feed):[^\r\n\[\]|]{1,160}$")
+    r"^(?:veh|msn|trk|unit|ob|rpt|thr|poi|sit|frc|eng|vec|alarm|feed):[^\r\n\[\]|]{1,160}$")
 _MAX_ENTITIES = 20
 #: ``ui_show_map`` takes 1 to this many graph ids (WG v2 §3.7, R12).
 MAP_IDS_MAX = 50
@@ -99,6 +118,8 @@ class Toolbelt:
     #: approval card compares a dry run with the live call on EFFECTIVE plans,
     #: i.e. with each path's own defaults filled in.
     defaults: dict[str, dict] = field(default_factory=dict)
+    #: ``"isr"`` or ``"wargame"``: which ``wg_*`` tools the belt carries.
+    mode: str = MODE_ISR
 
     @property
     def disallowed_tools(self) -> list[str]:
@@ -368,8 +389,13 @@ def _approval_hint(name: str) -> str:
     return " [Console: waits for the operator to approve it.]"
 
 
-def _proxy_tool(sdk: Any, server: Any, info: Any) -> Any:
+def _proxy_tool(sdk: Any, server: Any, info: Any, *, registry: Any = None,
+                session_id: str | None = None) -> Any:
+    """One SDK tool that calls ``info.name`` on ``registry`` (default
+    ``server.mcp``) in-process. A ``wg_*`` tool runs inside
+    ``wargame.console_call(session_id)`` (WG v2 §3.8 step 5)."""
     name = info.name
+    wargame = name.startswith(WG_PREFIX)
     schema = dict(getattr(info, "input_schema", None) or {})
     schema.setdefault("type", "object")
     schema.setdefault("properties", {})
@@ -388,8 +414,17 @@ def _proxy_tool(sdk: Any, server: Any, info: Any) -> Any:
         # The call source for the theater switch's `set_via` (WG v2 §4.1.3):
         # set around the in-process call only, so nothing else inherits it.
         token = theater_tools.CALL_VIA.set("console")
+        target = server.mcp if registry is None else registry
         try:
-            result = await server.mcp.call_tool(name, call_args)
+            if wargame:
+                # The console's approval path (§3.8): the engine executes an
+                # engagement only for the chat session that authorized it.
+                from .wargame import console_call
+
+                with console_call(session_id or ""):
+                    result = await target.call_tool(name, call_args)
+            else:
+                result = await target.call_tool(name, call_args)
         except Exception as exc:  # noqa: BLE001 -- surfaced to the model, never raised
             return _err("tool_failed", _exc_message(exc), tool=name)
         finally:
@@ -598,8 +633,15 @@ def map_ids(value: Any) -> tuple[str | None, list[str]]:
 
 
 async def build_toolbelt(server: Any, intel: IntelService | None,
-                         emit_ui: Callable[[dict], Any], sdk: Any) -> Toolbelt:
-    """Generate the ``godseye`` SDK server for one chat session."""
+                         emit_ui: Callable[[dict], Any], sdk: Any, *,
+                         session_id: str | None = None, mode: str = MODE_ISR) -> Toolbelt:
+    """Generate the ``godseye`` SDK server for one chat session.
+
+    ``session_id`` is the chat session the ``wg_*`` proxies speak for
+    (``wargame.console_call``); ``mode`` is ``"isr"`` (only ``WG_ENTRY_TOOLS``)
+    or ``"wargame"`` (every ``wg_*`` tool). Anything else is ISR.
+    """
+    mode = MODE_WARGAME if mode == MODE_WARGAME else MODE_ISR
     curated = _curated_tools(sdk, server, intel, emit_ui)
     curated_names = {t.name for t in curated}
     proxied: list = []
@@ -609,17 +651,29 @@ async def build_toolbelt(server: Any, intel: IntelService | None,
         for info in await server.mcp.list_tools():
             if info.name in EXCLUDED_TOOLS:
                 continue
+            if info.name.startswith(WG_PREFIX):
+                continue  # `--wargame-mcp` copies: the wargame registry supplies them
             if info.name in curated_names:
                 excluded.append(info.name)  # the curated tool of that name wins
                 continue
             proxied.append(_proxy_tool(sdk, server, info))
+            defaults[info.name] = schema_defaults(getattr(info, "input_schema", None))
+        registry = getattr(server, "wargame_mcp", None)
+        for info in (await registry.list_tools()) if registry is not None else ():
+            if not info.name.startswith(WG_PREFIX) or info.name in curated_names:
+                continue
+            if mode == MODE_ISR and info.name not in WG_ENTRY_TOOLS:
+                continue  # only a wargame session carries it
+            proxied.append(_proxy_tool(sdk, server, info, registry=registry,
+                                       session_id=session_id))
             defaults[info.name] = schema_defaults(getattr(info, "input_schema", None))
     tools = proxied + curated
     names = [t.name for t in tools]
     allowed = [f"{TOOL_PREFIX}{n}" for n in names if n in STATIC_AUTO_TOOLS]
     config = sdk.create_sdk_mcp_server(name=SDK_SERVER_NAME, version="1.0.0", tools=tools)
     return Toolbelt(server_config=config, tool_names=names, allowed_tools=allowed,
-                    excluded=sorted(set(excluded)), tools=tools, defaults=defaults)
+                    excluded=sorted(set(excluded)), tools=tools, defaults=defaults,
+                    mode=mode)
 
 
 def schema_defaults(schema: Any) -> dict:
@@ -636,6 +690,7 @@ __all__ = [
     "MAP_IDS_MAX",
     "RESOURCE_ALLOWLIST",
     "RESULT_CHAR_LIMIT",
+    "WG_ENTRY_TOOLS",
     "Toolbelt",
     "build_toolbelt",
     "dumps_compact",

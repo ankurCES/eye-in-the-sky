@@ -20,8 +20,42 @@ export const SITE_BAND = Object.freeze({
   slotsPerSector: 12,
 });
 
-/** Context node types and their bands (Phase B adds forces and engagements). */
-export const CONTEXT_BANDS = Object.freeze({ site: SITE_BAND });
+/**
+ * The session profile (WG §5.3.5): while a simulated wargame is on, red
+ * forces sit at −41° (anchored at their category's sector, so `correlates`
+ * edges from their contacts run vertically), blue forces at −47° (anchored
+ * at their group's sector; equipment collapses to ticks to make room),
+ * reports move up from −58° to −54°, and engagements and vectors share
+ * −61° (engagements at their target's longitude, vectors as smaller glyphs).
+ * Outside a session none of this applies and the ISR bands are unchanged.
+ */
+export const WARGAME_BANDS = Object.freeze({
+  force_red: Object.freeze({
+    caption: 'Simulated red forces',
+    lat: -41,
+    slotsPerSector: 12,
+  }),
+  force_blue: Object.freeze({
+    caption: 'Simulated blue forces',
+    lat: -47,
+    slotsPerSector: 12,
+  }),
+  engagement: Object.freeze({
+    caption: 'Simulated engagements',
+    lat: -61,
+    min: 72,
+    anchored: true,
+  }),
+});
+
+/** Where the report band sits in the session profile (−58° otherwise). */
+export const SESSION_REPORT_LAT = -54;
+
+/** Context node types and their bands. */
+export const CONTEXT_BANDS = Object.freeze({
+  site: SITE_BAND,
+  ...WARGAME_BANDS,
+});
 
 /** Sector width in degrees; sector 0 is centred on longitude 0 (layout.js). */
 const SECTOR_WIDTH_DEG = 36;
@@ -160,4 +194,59 @@ export function placeSectorRow(
   }
   overflow.sort(compareIds);
   return { slots: out, overflow };
+}
+
+/** Node types that live in the wargame bands. */
+const WARGAME_NODE_TYPES = new Set(['force', 'engagement', 'vector']);
+
+/**
+ * The wargame band a node sits in: blue forces at −47°, every other force
+ * (red, or a side the console does not know) at −41°, engagements and
+ * vectors at −61°; null for any other node.
+ */
+export function wargameBandKey(node) {
+  const type = node?.type;
+  if (type === 'force')
+    return node?.attrs?.side === 'blue' ? 'force_blue' : 'force_red';
+  if (type === 'engagement' || type === 'vector') return 'engagement';
+  return null;
+}
+
+/**
+ * Whether the orb draws the session profile: the graph says a wargame
+ * session is active (`meta.wargame.active`), or it carries wargame nodes.
+ * An ISR picture never does, so its layout is unchanged.
+ */
+export function sessionProfile(graph) {
+  if (graph?.meta?.wargame?.active === true) return true;
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+  return nodes.some((node) => WARGAME_NODE_TYPES.has(node?.type));
+}
+
+/**
+ * The sector a force sits in: its `group` when that is a sector key (the
+ * server groups red by category and blue by kind, §3.2), else
+ * `unclassified`.
+ * @param {object} node a `force` graph node
+ * @param {Set<string>|string[]} sectorKeys the known sector keys
+ */
+export function forceSectorKey(node, sectorKeys) {
+  const keys = sectorKeys instanceof Set ? sectorKeys : new Set(sectorKeys);
+  return typeof node?.group === 'string' && keys.has(node.group)
+    ? node.group
+    : 'unclassified';
+}
+
+/**
+ * Slots a force row needs in one sector: 12 (3° each), doubling past that,
+ * so a crowded sector packs tighter instead of hiding a unit. Forces are
+ * never overflowed: a hidden red air-defence unit would be a lie.
+ */
+export function forceSlotsFor(
+  count,
+  base = WARGAME_BANDS.force_red.slotsPerSector,
+) {
+  let slots = base;
+  while (count > slots) slots *= 2;
+  return slots;
 }

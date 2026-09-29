@@ -101,10 +101,12 @@ test('server strings split on " · " and the console never adds one', () => {
 test('unknown classes fail safe to a non-approvable "unknown" (WG D7 #8)', () => {
   assert.equal(classKey('sensor'), 'sensor');
   // Replaces the old fail-closed-to-command pin: a new server class (e.g.
-  // `engagement`) must never become an approvable command slip.
+  // `engage`, the name M14a rejected) must never become an approvable
+  // command slip. `engagement` itself is known since Phase B (B14).
   for (const klass of [
     'mystery',
-    'engagement',
+    'engage',
+    'Engagement',
     'toString',
     '__proto__',
     'hasOwnProperty',
@@ -133,6 +135,7 @@ test('unknown classes fail safe to a non-approvable "unknown" (WG D7 #8)', () =>
     'command',
     'sim',
     'safety_override',
+    'engagement',
   ])
     assert.equal(classApprovable(k), true, k);
   assert.equal(CLASS_META.command.phrase, 'Commands an aircraft');
@@ -331,4 +334,68 @@ test('bidi controls never reach the screen (review: an OSM name "BMP \u202eYLDNE
   assert.deepEqual(calls[0].kids, ['Approval waiting: ynneD', node, null]);
   h('br');
   assert.deepEqual(calls[1].attrs, {});
+});
+
+// ---- Phase B: the engagement class (WG spec §3.7, §5.3.1; B14) ----------------
+
+test('engagement: Sand phrase and flare glyph, approvable, with its own verbs', () => {
+  assert.equal(classKey('engagement'), 'engagement');
+  assert.deepEqual(
+    { ...CLASS_META.engagement },
+    {
+      phrase: 'Simulates an engagement',
+      icon: 'flare',
+      slip: true,
+      approvable: true,
+    },
+  );
+  assert.equal(ICON.engagement, 'flare');
+  assert.equal(
+    approveVerb('wg_execute_engagement', 'engagement', { verbKind: 'strike' }),
+    'Approve simulated strike',
+  );
+  for (const verbKind of ['engagement', null, undefined, 'STRIKE', 42])
+    assert.equal(
+      approveVerb('wg_execute_engagement', 'engagement', { verbKind }),
+      'Approve simulated engagement',
+    );
+  assert.equal(
+    approveVerb('wg_execute_engagement', 'engagement'),
+    'Approve simulated engagement',
+  );
+  assert.equal(
+    policyLine('engagement'),
+    "Engagements are approved one at a time. They can't be allowed for the session.",
+  );
+});
+
+test('wargame sim tools: verbs, titles and the frc/eng/vec prefixes', () => {
+  assert.equal(approveVerb('wg_session_start', 'sim'), 'Approve start');
+  assert.equal(approveVerb('wg_session_end', 'sim'), 'Approve end');
+  assert.equal(approveVerb('wg_spawn_force', 'sim'), 'Approve change');
+  assert.equal(approveVerb('wg_generate_scenario', 'sim'), 'Approve change');
+  // A tool name is never a verb key outside its class.
+  assert.equal(approveVerb('wg_session_start', 'command'), 'Approve command');
+  const titles = {
+    wg_session_start: 'Start a simulated wargame',
+    wg_session_status: 'Wargame status',
+    wg_session_end: 'End the wargame',
+    wg_generate_scenario: 'Generate a scenario',
+    wg_spawn_force: 'Add simulated forces',
+    wg_list_forces: 'List forces',
+    wg_list_classes: 'List wargame classes',
+    wg_plan_corridor: 'Plan a corridor',
+    wg_propose_strike: 'Propose a simulated strike',
+    wg_execute_engagement: 'Execute a simulated engagement',
+  };
+  for (const [tool, title] of Object.entries(titles))
+    assert.equal(toolTitle(tool), title, tool);
+  assert.equal(nodeTypeOf('frc:red-sam-1'), 'force');
+  assert.equal(nodeTypeOf('eng:WG-3fa9c1-E7'), 'engagement');
+  assert.equal(nodeTypeOf('vec:cor-2'), 'vector');
+  assert.equal(nodeTypeOf('vec:axis-red-sam-1'), 'vector');
+  for (const text of Object.values(titles)) {
+    assert.ok(!text.includes('·'));
+    assert.ok(!/SIMULATED/.test(text));
+  }
 });

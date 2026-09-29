@@ -10,6 +10,13 @@
  * Fail-safe (WG spec §4.2.1): a node type the console does not know draws
  * as the lilac `unrecognised` glyph, whatever its status, and is never
  * green. Sites draw their category glyph stroked in Pencil (§4.2.6).
+ *
+ * The simulated wargame (§5.3.4, §5.3.6): `force`, `engagement` and
+ * `vector` draw from wargameStyles.js, which reads their side, state, phase,
+ * consequence and kind from the node's attrs (pass `attrs`). A frame is
+ * drawn only on a scenario force; nothing here is ever green. Surfaces
+ * that have not opted in to the wargame keep treating these types as
+ * unknown: `isKnownType(type)` is false for them unless `{wargame: true}`.
  */
 
 import {
@@ -18,6 +25,12 @@ import {
   UNRECOGNISED_GLYPH,
   siteCategoryKey,
 } from './glyphPaths.js';
+import {
+  WARGAME_TYPES,
+  WG_INK,
+  isWargameType,
+  wargameGlyphStyle,
+} from './wargameStyles.js';
 
 export const COLORS = Object.freeze({
   slate: '#1B2630',
@@ -64,7 +77,14 @@ export function statusKey(status) {
  * is reserved for own systems (§2.2): an info-level alarm ("new contact:
  * sam") is Pencil, so it and its `about` edges never read as "fine".
  */
-export function statusColor(type, status) {
+export function statusColor(type, status, { attrs } = {}) {
+  if (isWargameType(type)) {
+    if (attrs && typeof attrs === 'object')
+      return wargameGlyphStyle(type, attrs, status).color;
+    const table =
+      type === 'force' ? WARGAME_STATUS_INK.force : WARGAME_STATUS_INK.other;
+    return table[statusKey(status)] ?? COLORS.unknown;
+  }
   if (!isKnownType(type)) return COLORS.unknown;
   if (NEUTRAL_TYPES.has(type)) return COLORS.pencil;
   const key = statusKey(status);
@@ -119,14 +139,46 @@ export const GLYPHS = Object.freeze({
 /** The slash over a feed that is down ("No reading"). */
 export const GLYPH_SLASH = 'M3 21.5L21 2.5';
 
-/** Every node type the console knows (the contract's ten plus `site`). */
-export const NODE_TYPES = Object.freeze([...Object.keys(GLYPHS), 'site']);
-const KNOWN_TYPES = new Set(NODE_TYPES);
+/** The ISR node types: the contract's ten plus `site`. */
+export const ISR_NODE_TYPES = Object.freeze([...Object.keys(GLYPHS), 'site']);
+/** Every node type the orb draws: the ISR types plus the wargame's three. */
+export const NODE_TYPES = Object.freeze([...ISR_NODE_TYPES, ...WARGAME_TYPES]);
+const ISR_TYPES = new Set(ISR_NODE_TYPES);
 
-/** Whether the console knows how to draw and word a node type. */
-export function isKnownType(type) {
-  return typeof type === 'string' && KNOWN_TYPES.has(type);
+/**
+ * Whether a surface knows how to draw and word a node type. The wargame
+ * types (`force`, `engagement`, `vector`) count only with `{wargame: true}`:
+ * a surface opts in once it can show them properly (the orb does; the rail,
+ * search, inspector and chips do when their Phase B units land), and until
+ * then they fail safe to "Unrecognised", never to another type's look.
+ * @param {string} type node type
+ * @param {{wargame?: boolean}} [options]
+ */
+export function isKnownType(type, { wargame = false } = {}) {
+  if (typeof type !== 'string') return false;
+  return ISR_TYPES.has(type) || (wargame === true && isWargameType(type));
 }
+
+/** Whether the orb draws a type as itself (ISR and wargame types). */
+export function isOrbType(type) {
+  return isKnownType(type, { wargame: true });
+}
+
+/** A wargame status as ink when no attrs say more: never green. */
+const WARGAME_STATUS_INK = Object.freeze({
+  force: Object.freeze({
+    ok: WG_INK.film,
+    warn: WG_INK.warn,
+    critical: WG_INK.critical,
+    stale: WG_INK.stale,
+  }),
+  other: Object.freeze({
+    ok: WG_INK.pencil,
+    warn: WG_INK.warn,
+    critical: WG_INK.critical,
+    stale: WG_INK.stale,
+  }),
+});
 
 /** The fail-safe glyph for a type the console does not know (§4.2.1). */
 export const GLYPH_UNRECOGNISED = Object.freeze({
@@ -146,13 +198,21 @@ export const SITE_GLYPH_SPECS = Object.freeze(
 
 /**
  * Glyph spec for a type. Sites take their category's glyph (`other` when the
- * category is unknown); a type the console does not know takes the
- * `unrecognised` glyph, never another type's.
+ * category is unknown); wargame types take their frame, burst or arrow from
+ * their attrs (a force without scenario provenance gets no frame: the "?");
+ * a type the console does not know takes the `unrecognised` glyph, never
+ * another type's.
  * @param {string} type node type
- * @param {{category?: string}} [options] a site's `attrs.category`
+ * @param {{category?: string, attrs?: object}} [options] a site's
+ *   `attrs.category`; a wargame node's attrs
+ * @returns {{path: string, filled: boolean, bar?: string|null}}
  */
-export function glyphFor(type, { category } = {}) {
+export function glyphFor(type, { category, attrs } = {}) {
   if (type === 'site') return SITE_GLYPH_SPECS[siteCategoryKey(category)];
+  if (isWargameType(type)) {
+    const style = wargameGlyphStyle(type, attrs, 'unknown');
+    return { path: style.path, filled: style.filled, bar: style.bar };
+  }
   return isKnownType(type) ? GLYPHS[type] : GLYPH_UNRECOGNISED;
 }
 
@@ -168,7 +228,24 @@ export function missionPhaseClass(phase) {
  * @returns {{fill: string|null, stroke: string|null, dash: number[]|null,
  *   fillAlpha: number, slash: boolean, outerRing: string|null, color: string}}
  */
-export function glyphStyle(type, status, { phase } = {}) {
+export function glyphStyle(type, status, { phase, attrs } = {}) {
+  if (isWargameType(type)) {
+    const w = wargameGlyphStyle(type, attrs, statusKey(status));
+    return {
+      fill: w.fill,
+      stroke: w.stroke,
+      dash: w.dash,
+      fillAlpha: w.fillAlpha,
+      slash: w.slash,
+      outerRing: w.outerRing,
+      color: w.color,
+      bar: w.bar,
+      barDash: w.barDash,
+      alpha: w.alpha,
+      slashPath: w.slashPath,
+      halo: w.halo,
+    };
+  }
   const key = statusKey(status);
   const color = statusColor(type, key);
   const style = {
@@ -244,18 +321,27 @@ const PHASES = new Set([
 /**
  * Inline SVG markup for a node glyph (chips, search rows, the inspector).
  * Built from constants only: `type`, `status`, `phase` and `category` are
- * looked up and `size` is clamped, so the result is safe for innerHTML. An
- * unknown type draws the lilac `unrecognised` glyph (§4.2.1).
+ * looked up, a wargame node's `attrs` are read only through the closed
+ * vocabularies of wargameStyles.js, and `size` is clamped, so the result is
+ * safe for innerHTML. An unknown type draws the lilac `unrecognised` glyph
+ * (§4.2.1); a force draws its frame only with scenario provenance (§5.3.4).
  * @param {string} type node type
- * @param {{status?: string, size?: number, phase?: string, category?: string}} [options]
+ * @param {{status?: string, size?: number, phase?: string, category?: string,
+ *   attrs?: object}} [options]
  * @returns {string}
  */
-export function glyphSvg(type, { status, size = 16, phase, category } = {}) {
-  const safeType = isKnownType(type) ? type : '';
-  const glyph = glyphFor(safeType, { category });
+export function glyphSvg(
+  type,
+  { status, size = 16, phase, category, attrs: nodeAttrs } = {},
+) {
+  const safeType = isOrbType(type) ? type : '';
+  const wargame = isWargameType(safeType);
+  const wgAttrs = wargame ? nodeAttrs : undefined;
+  const glyph = glyphFor(safeType, { category, attrs: wgAttrs });
   const px = Math.round(Math.min(64, Math.max(8, Number(size) || 16)));
   const style = glyphStyle(safeType, statusKey(status), {
     phase: PHASES.has(phase) ? phase : undefined,
+    attrs: wgAttrs,
   });
   const attrs = [];
   attrs.push(`fill="${style.fill || 'none'}"`);
@@ -270,14 +356,20 @@ export function glyphSvg(type, { status, size = 16, phase, category } = {}) {
     if (style.dash) attrs.push(`stroke-dasharray="${style.dash.join(' ')}"`);
   }
   let body = `<path d="${glyph.path}" ${attrs.join(' ')}/>`;
+  if (glyph.bar && style.stroke) {
+    body += `<path d="${glyph.bar}" fill="none" stroke="${style.stroke}" stroke-width="2" stroke-linecap="round"/>`;
+  }
   if (style.slash) {
-    body += `<path d="${GLYPH_SLASH}" fill="none" stroke="${COLORS.critical}" stroke-width="2" stroke-linecap="round"/>`;
+    const ink = wargame ? style.stroke || style.color : COLORS.critical;
+    body += `<path d="${style.slashPath || GLYPH_SLASH}" fill="none" stroke="${ink}" stroke-width="2" stroke-linecap="round"/>`;
   }
   if (style.outerRing) {
     body =
       `<circle cx="12" cy="12" r="11" fill="none" stroke="${style.outerRing}" stroke-width="1.5"/>` +
       body;
   }
+  if (wargame && style.alpha < 1)
+    body = `<g opacity="${style.alpha}">${body}</g>`;
   return (
     `<svg class="ic-glyph" xmlns="http://www.w3.org/2000/svg" width="${px}" height="${px}" ` +
     `viewBox="0 0 24 24" aria-hidden="true" focusable="false">${body}</svg>`

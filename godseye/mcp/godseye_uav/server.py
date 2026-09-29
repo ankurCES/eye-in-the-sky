@@ -68,7 +68,8 @@ the old synthetic behaviour while SAYING SO (`*_is_real`, `*_source` and the
 feed's `Provenance` ride along on the MCP surface). A silent substitution here
 would repeat the bug that made the EGM96 geoid dead code for this project.
 
-ISR-only: no kinetic tools exist here.
+ISR tools only on this registry; the simulated wargame's `wg_*` tools live in
+`wargame_tools.py` (M14a).
 """
 from __future__ import annotations
 
@@ -80,6 +81,7 @@ import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from itertools import pairwise
 from typing import Any
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
@@ -276,6 +278,76 @@ THEATER_CHANGED_MESSAGE = "The theater changed after this plan was checked; plan
 #: they pass the `theater_integrity` refusal: an operator can always land
 #: (review A). Everything that flies somewhere is still refused.
 INTEGRITY_EXEMPT_TOOLS = frozenset({"uav_land", "uav_hover"})
+
+# ---- simulated wargame hooks (PLAN §4.5a M14a; WG §3.10 Phase B, §5.2.12 B5) ----
+#: `uav://safety/geofence` `doctrine.rule` (WG §5.0), verbatim.
+DOCTRINE_RULE = ("M14a: ISR by default; simulated wargame tools exist only in an "
+                 "operator-approved session.")
+#: `_submit` refusal for a drone the simulated wargame downed (WG §3.10).
+VEHICLE_LOST_MESSAGE = ("{vehicle} was lost in the simulated wargame; it returns "
+                        "when the wargame ends.")
+#: `mission_flags[v]` and the executing missions' status while it is lost.
+VEHICLE_LOST_STATUS = "lost (simulated wargame)"
+#: `sim_reset` refusal while a session is starting or running (WG §5.2.12).
+WARGAME_RESET_MESSAGE = "end the wargame first"
+#: `sim_spawn_target` / `sim_spawn_order_of_battle` keep this far from a
+#: scenario unit during a session (WG §5.2.6, `OBJECT_CLEARANCE_M`).
+SCENARIO_CLEARANCE_M = 150.0
+#: `sim_spawn_target` / `sim_move_target` refusals (WG §5.2.6). One sentence
+#: each; they never name a place.
+DUPLICATE_NAME_MESSAGE = ("A target named {name!r} already exists; give another "
+                          "name or omit it.")
+SCENARIO_NAME_MESSAGE = ("That name belongs to a simulated wargame scenario unit, "
+                         "which only the wargame places or moves.")
+NEAR_SCENARIO_UNIT_MESSAGE = ("That position is within 150 m of a simulated scenario "
+                              "unit; place it further away.")
+#: Truth-record fields `_spawn_object_record(**extra)` may not overwrite.
+SPAWN_RECORD_KEYS = frozenset({
+    "target_id", "name", "mesh", "class", "ob_class", "category",
+    "class_evidence", "lat", "lon", "alt_msl_m", "alt_hae_m", "undulation_m",
+    "datum_source", "heading_deg", "spawned_at", "route", "alt_source",
+    "alt_is_real", "alt_reason", "terrain", "terrain_default_msl_m",
+    "terrain_default_source"})
+
+
+def _optional_module(name: str) -> Any:
+    """Import `godseye_uav.<name>`, or None when THAT module is absent. Any
+    other import error inside it propagates."""
+    import importlib
+
+    full = f"{__package__}.{name}"
+    try:
+        return importlib.import_module(full)
+    except ModuleNotFoundError as exc:
+        if exc.name != full:
+            raise
+        return None
+
+
+class _InactiveWargame:
+    """`srv.wargame` until `wargame.py` (B3) is merged: never active, owns
+    nothing. Only that module's OWN absence selects it; any other import
+    error inside it propagates (the same rule as `theater_tools`)."""
+
+    active = False
+    starting = False
+    last = None
+    revision = 0
+    errors = 0
+    step_ms = 0.0
+
+    def mode_key(self) -> str:
+        return "isr"
+
+    def owns_name(self, name: str) -> bool:
+        return False
+
+    def note_track(self, track: Any) -> bool:
+        return False
+
+    def recover_on_boot(self) -> dict | None:
+        return None
+
 
 #: `alt_agl_m` came from MEASURED terrain under the aircraft.
 AGL_SOURCE_TERRAIN = "terrain:gev"
@@ -658,6 +730,19 @@ def latlon_polygon(value: Any, param: str) -> list[tuple[float, float]]:
                 "vertex order; the server will not guess.")
         out.append((lat, lon))
     return out
+
+
+def _segment_distance_m(a: tuple[float, float], b: tuple[float, float],
+                        p: tuple[float, float]) -> float:
+    """Ground distance (m) from point `p` to the segment `a`-`b`, all
+    `(lat, lon)`, in a local flat frame at `a` (sim routes are a few km)."""
+    k_lat = 111_320.0
+    k_lon = 111_320.0 * math.cos(math.radians(a[0]))
+    bx, by = (b[1] - a[1]) * k_lon, (b[0] - a[0]) * k_lat
+    px, py = (p[1] - a[1]) * k_lon, (p[0] - a[0]) * k_lat
+    seg2 = bx * bx + by * by
+    t = 0.0 if seg2 <= 0.0 else max(0.0, min(1.0, (px * bx + py * by) / seg2))
+    return math.hypot(px - t * bx, py - t * by)
 
 
 def _one_altitude(field: str, **spellings: float | None) -> float:
@@ -1232,6 +1317,11 @@ class UavBackend:
         return await self._call(self.client.simSpawnObject, name, mesh, pose,
                                 Vector3r(1, 1, 1), False, True)
 
+    async def destroy_object(self, name: str) -> bool:
+        """Remove a spawned scene object (`simDestroyObject`). True if the sim
+        held it. Used when a simulated wargame session ends (WG §5.2.9)."""
+        return bool(await self._call(self.client.simDestroyObject, name))
+
     # ---- camera: gimbal + FOV (M7 wide->narrow cross-cue) ----
     async def set_camera_pose(self, vehicle: str, camera: str, pitch_deg: float,
                               yaw_deg: float, roll_deg: float = 0.0) -> dict:
@@ -1445,6 +1535,7 @@ class GodseyeUavServer:
         public_url: str | None = None,
         airframe: Any = None,
         geodata: Any = None,
+        wargame_mcp: bool = False,
     ):
         self.backend = backend
         self.store = store
@@ -1503,6 +1594,8 @@ class GodseyeUavServer:
         self.vehicle_roster_error: str | None = None
         from .targets import PatternOfLife, TrackManager
         self.tracks = TrackManager()
+        # M14a (D1): scenario and non-scenario detections never share a track.
+        self.tracks.segregate = self._wargame_owns
         # M12: one pattern-of-life store, seeded with the theater's POIs, so
         # intent indicator 3 of 4 stops reporting "no_store" forever.
         self.pol = PatternOfLife()
@@ -1598,10 +1691,16 @@ class GodseyeUavServer:
         self._public_url_pinned = public_url is not None
         self._register_tools()
         self._register_theater_tools()
+        # M14a (WG §3.10 Phase B): the wargame engine, its own never-mounted
+        # registry, and `wg_*` on /mcp only under `--wargame-mcp`.
+        self._init_wargame(wargame_mcp=wargame_mcp)
         self._register_resources()
         # T4c: restart = replay -> resume-or-abort-and-RTH. Runs at boot so the
         # decision exists before the first command is accepted.
         self.recovery = self._boot_replay()
+        # WG §5.2.9: a session a crash interrupted is cleaned up AFTER the
+        # replay restored its tracks, so they can be deleted again.
+        self.wargame_recovery: dict | None = self._recover_wargame_on_boot()
 
     # ---- where clients reach the MCP endpoint ----
     @property
@@ -1770,11 +1869,14 @@ class GodseyeUavServer:
                              scale=new, previous=previous)
         return {"scale": new, "previous": previous}
 
-    def _submit_refusal(self, gate_epoch: int | None, tool: str | None = None) -> dict | None:
+    def _submit_refusal(self, gate_epoch: int | None, tool: str | None = None, *,
+                        vehicle: str | None = None) -> dict | None:
         """The `_submit` guards (§3.10), checked under `_mode_lock`.
 
         `tool` in `INTEGRITY_EXEMPT_TOOLS` (land, hover) passes the
         `theater_integrity` refusal: neither uses the origin (review A).
+        Phase B (B5): a `vehicle` the simulated wargame downed is refused
+        every command until the wargame ends (`vehicle_lost`).
         """
         if self._switching.is_set():
             return {"rejected": True, "error": "theater_changed",
@@ -1787,7 +1889,243 @@ class GodseyeUavServer:
         if gate_epoch is not None and gate_epoch != self.theater_epoch:
             return {"rejected": True, "error": "theater_changed",
                     "message": THEATER_CHANGED_MESSAGE}
+        if vehicle is not None and vehicle in self.vehicles_lost:
+            return {"rejected": True, "error": "vehicle_lost",
+                    "message": VEHICLE_LOST_MESSAGE.format(vehicle=vehicle)}
         return None
+
+    # ---------------------------------------------------------------- #
+    # Simulated wargame hooks (PLAN §4.5a M14a; WG §3.10, §5.2.12 B5)   #
+    # ---------------------------------------------------------------- #
+    # The engine (`wargame.WargameEngine(srv)`, B3) is duck-typed. The server
+    # reads `active`, `starting`, `mode_key()`, `owns_name(name)`,
+    # `note_track(track)`, `recover_on_boot()` and, when present,
+    # `unit_near(lat, lon, radius_m) -> unit_id | None`. The engine calls back
+    # `lose_vehicle`, `revive_vehicle`, `_spawn_object_record`,
+    # `backend.destroy_object`, and reads `vehicles_lost`, `_mode_lock` and
+    # `_switching`. `wargame_tools.register(mcp, srv)` (B4) fills
+    # `wargame_mcp`, which is never mounted; `/mcp` gets `wg_*` only under
+    # `--wargame-mcp` (`wargame_mcp=True`).
+
+    def _init_wargame(self, *, wargame_mcp: bool) -> None:
+        """The wargame engine, its registry and the lost-vehicle table.
+
+        Lazy imports: only a missing `wargame`/`wargame_tools` module is
+        tolerated (before B3/B4 merge), and `--wargame-mcp` without
+        `wargame_tools` refuses to build rather than publish nothing.
+        """
+        #: vehicle -> {by, at_ms}: drones the simulated wargame downed. Written
+        #: under `_mode_lock`, which `_submit`'s refusal check also holds.
+        self.vehicles_lost: dict[str, dict] = {}
+        #: `--wargame-mcp`: the `wg_*` tools are also published on /mcp.
+        self.wargame_mcp_enabled: bool = bool(wargame_mcp)
+        self._wargame_hook_audit_at = 0.0
+        engine = _optional_module("wargame")
+        self.wargame: Any = (_InactiveWargame() if engine is None
+                             else engine.WargameEngine(self))
+        self.wargame_mcp = MCPServer("godseye-wargame")
+        tools = _optional_module("wargame_tools")
+        if tools is None:
+            if self.wargame_mcp_enabled:
+                raise ValueError("--wargame-mcp needs godseye_uav.wargame_tools, "
+                                 "which is not installed")
+            return
+        tools.register(self.wargame_mcp, self)
+        if self.wargame_mcp_enabled:
+            tools.register(self.mcp, self)
+
+    def _recover_wargame_on_boot(self) -> dict | None:
+        """`wargame.recover_on_boot()` (WG §5.2.9). A failure is audited and
+        reported on `wargame_recovery`; it never blocks boot."""
+        try:
+            return self.wargame.recover_on_boot()
+        except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+            msg = f"{type(exc).__name__}: {exc}"
+            self.store.log_audit("wargame_recovery_failed", msg)
+            return {"error": msg}
+
+    def _wargame_active(self) -> bool:
+        return bool(getattr(self.wargame, "active", False))
+
+    def _wargame_busy(self) -> bool:
+        """A session is starting or running."""
+        return self._wargame_active() or bool(getattr(self.wargame, "starting", False))
+
+    def _wargame_session_id(self) -> str | None:
+        """The running session's id, from `mode_key()` ("wargame:<id>")."""
+        try:
+            key = str(self.wargame.mode_key())
+        except Exception:  # noqa: BLE001 — unreadable reads as no session id
+            return None
+        if not key.startswith("wargame:"):
+            return None
+        return key.split(":", 1)[1] or None
+
+    def _doctrine_block(self) -> dict:
+        """`uav://safety/geofence` `doctrine` (WG §5.0, PLAN §4.5a M14a)."""
+        active = self._wargame_active()
+        return {"mode": "wargame" if active else "isr",
+                "wargame_session": self._wargame_session_id() if active else None,
+                "wargame_mcp": self.wargame_mcp_enabled,
+                "rule": DOCTRINE_RULE}
+
+    def _wargame_hook_failed(self, hook: str, exc: Exception) -> None:
+        """Audit an engine hook that raised, at most once a minute."""
+        now = time.monotonic()
+        if now - self._wargame_hook_audit_at >= 60.0:
+            self._wargame_hook_audit_at = now
+            self.store.log_audit("wargame_hook_failed", f"{hook}: {type(exc).__name__}: {exc}",
+                                 hook=hook)
+
+    def _wargame_owns(self, name: Any) -> bool:
+        """`wargame.owns_name(name)`; an engine error reads as not owned."""
+        try:
+            return bool(self.wargame.owns_name(str(name)))
+        except Exception as exc:  # noqa: BLE001
+            self._wargame_hook_failed("owns_name", exc)
+            return False
+
+    def _scenario_unit_near(self, lat: float, lon: float,
+                            radius_m: float = SCENARIO_CLEARANCE_M) -> str | None:
+        """A scenario unit of the running session within `radius_m`, else None.
+
+        Asks the engine (`unit_near`, red and blue) and ALSO checks the truth
+        records of red units (`provenance == "scenario"`) at their live sim
+        position, so the guard holds whichever answers.
+        """
+        if not self._wargame_active():
+            return None
+        near = getattr(self.wargame, "unit_near", None)
+        if callable(near):
+            try:
+                hit = near(float(lat), float(lon), float(radius_m))
+            except Exception as exc:  # noqa: BLE001
+                self._wargame_hook_failed("unit_near", exc)
+                hit = None
+            if hit:
+                return str(hit)
+        sid = self._wargame_session_id()
+        sim = getattr(self.backend, "sim", None)
+        for name, rec in list(self.targets.items()):
+            if rec.get("provenance") != "scenario":
+                continue
+            if sid is not None and rec.get("session_id") not in (None, sid):
+                continue
+            pos = sim.object_geo(name) if sim is not None else None
+            plat, plon = (pos[0], pos[1]) if pos else (rec.get("lat"), rec.get("lon"))
+            if plat is None or plon is None:
+                continue
+            if haversine_m(float(lat), float(lon), float(plat), float(plon)) <= radius_m:
+                return str(rec.get("unit_id") or name)
+        return None
+
+    def _note_scenario_track(self, track: Any) -> bool:
+        """The ingest hook (WG §5.2.9): a track of a wargame-owned object is
+        tagged `scenario` and handed to the engine. True when it was."""
+        if not self._wargame_owns(getattr(track, "name", "")):
+            return False
+        track.scenario = True
+        try:
+            self.wargame.note_track(track)
+        except Exception as exc:  # noqa: BLE001
+            self._wargame_hook_failed("note_track", exc)
+        return True
+
+    async def lose_vehicle(self, vehicle: str, cause: str) -> dict:
+        """A scenario unit downed `vehicle` in the simulated wargame (§5.2.12).
+
+        Runs on the tasking loop (the wargame thread submits it with
+        `run_coroutine_threadsafe`). In order: mark it lost under `_mode_lock`
+        (so `_submit` refuses it from here on); abort its queue with an
+        operator override (a forced RTB included) and let the cancelled task
+        settle; down it in the fake sim (landed where it is, disarmed,
+        `collision=True`); flag it and its executing missions "lost
+        (simulated wargame)"; drop its forced-RTB state; audit
+        `vehicle_lost_simulated`. A second call is a no-op.
+        """
+        at_ms = int(time.time() * 1000)
+        with self._mode_lock:
+            prior = self.vehicles_lost.get(vehicle)
+            if prior is None:
+                self.vehicles_lost[vehicle] = {"by": str(cause), "at_ms": at_ms}
+        if prior is not None:
+            return {"vehicle": vehicle, "lost": True, "already_lost": True,
+                    **prior, "simulated": True}
+        missions = [mid for mid, rec in self.missions.items()
+                    if rec.get("vehicle") == vehicle and rec.get("state") == "executing"]
+        q = self.tasking.queue_for(vehicle)
+        try:
+            aborted = await q.abort(operator_override=True, reason=VEHICLE_LOST_STATUS)
+        except Exception as exc:  # noqa: BLE001 — reported in the result
+            aborted = {"aborted": False, "error": f"{type(exc).__name__}: {exc}"}
+        # The cancelled runner unwinds on this loop; wait (bounded) so its
+        # terminal row is written before the mission is marked, and no late
+        # RPC of it reaches the sim after the vehicle is down.
+        deadline = time.monotonic() + 3.0
+        while (q.current is not None and q.current.state not in TERMINAL
+               and time.monotonic() < deadline):
+            await asyncio.sleep(0.02)
+        sim = getattr(self.backend, "sim", None)
+        down, down_error = None, None
+        if sim is None or not callable(getattr(sim, "down_vehicle", None)):
+            down_error = "no fake simulator to down the vehicle in"
+        else:
+            try:
+                down = sim.down_vehicle(vehicle)
+            except Exception as exc:  # noqa: BLE001 — reported in the result
+                down_error = f"{type(exc).__name__}: {exc}"
+        self.mission_flags[vehicle] = VEHICLE_LOST_STATUS
+        for mid in missions:
+            rec = self.missions.get(mid)
+            if rec is None:
+                continue
+            rec["state"] = "incomplete"
+            rec["status"] = VEHICLE_LOST_STATUS
+            self.store.log_mission(mid, "incomplete", vehicle=vehicle,
+                                   status=VEHICLE_LOST_STATUS, reason="vehicle_lost")
+        self._rtb_active.pop(vehicle, None)
+        self._rtb_task.pop(vehicle, None)
+        cancelled = [h.get("task_id") for h in (aborted.get("cancelled") or [])]
+        current = (aborted.get("current") or {}).get("task_id")
+        if current:
+            cancelled.insert(0, current)
+        self.store.log_audit("vehicle_lost_simulated",
+                             f"{vehicle} lost in the simulated wargame ({cause})",
+                             vehicle=vehicle, by=str(cause), at_ms=at_ms,
+                             cancelled=cancelled, missions=missions,
+                             down_error=down_error, simulated=True)
+        self.store.sync()
+        return {"vehicle": vehicle, "lost": True, "by": str(cause), "at_ms": at_ms,
+                "cancelled": cancelled, "missions_incomplete": missions,
+                "down": down, "down_error": down_error, "simulated": True}
+
+    async def revive_vehicle(self, vehicle: str) -> dict:
+        """Restore a drone the wargame downed (§5.2.12): park it at home,
+        landed, collision cleared; un-mark it; clear its "lost" mission flag;
+        audit `vehicle_revived`. A vehicle that was not lost is left alone."""
+        rec = self.vehicles_lost.get(vehicle)
+        if rec is None:
+            return {"vehicle": vehicle, "revived": False,
+                    "reason": "not lost in the simulated wargame", "simulated": True}
+        sim = getattr(self.backend, "sim", None)
+        parked, park_error = None, None
+        if sim is None:
+            park_error = "no fake simulator to restore the vehicle in"
+        else:
+            try:
+                parked = sim.park_vehicle(vehicle)
+            except Exception as exc:  # noqa: BLE001 — reported in the result
+                park_error = f"{type(exc).__name__}: {exc}"
+        with self._mode_lock:
+            self.vehicles_lost.pop(vehicle, None)
+        if self.mission_flags.get(vehicle) == VEHICLE_LOST_STATUS:
+            self.mission_flags.pop(vehicle, None)
+        self.store.log_audit("vehicle_revived",
+                             f"{vehicle} restored at home after the simulated wargame",
+                             vehicle=vehicle, lost=rec, park_error=park_error,
+                             simulated=True)
+        return {"vehicle": vehicle, "revived": True, "was_lost": dict(rec),
+                "park": parked, "park_error": park_error, "simulated": True}
 
     # ---------------------------------------------------------------- #
     # Real-world data (REAL_DATA_INTEGRATION.md)                        #
@@ -3566,10 +3904,12 @@ class GodseyeUavServer:
         cross-check, and when `gate_epoch` (the `_gate` result's
         `theater_epoch`) is not the current epoch. The check and the queue
         submission share `_mode_lock`, so a switch cannot start in between.
+        Phase B: refused for a drone the simulated wargame downed
+        (`vehicle_lost`); `lose_vehicle` marks it under the same lock.
         """
         try:
             with self._mode_lock:
-                refusal = self._submit_refusal(gate_epoch, tool)
+                refusal = self._submit_refusal(gate_epoch, tool, vehicle=vehicle)
                 if refusal is None:
                     task = self.tasking.submit(vehicle, tool, params,
                                                idempotency_key=idempotency_key, **kw)
@@ -3982,7 +4322,12 @@ class GodseyeUavServer:
         That turned a failed safety RTB (a lost-link RTB dies the moment it
         asks for telemetry, because a lost link is exactly what removes it)
         into a vehicle that could never be recovered again, silently.
+
+        WG §5.2.12: None for a drone the simulated wargame downed; it flies
+        nothing until `revive_vehicle`.
         """
+        if vehicle in self.vehicles_lost:
+            return None
         prev = self._rtb_task.get(vehicle)
         if self._rtb_active.get(vehicle) == reason:
             if prev is not None and prev.state not in TERMINAL:
@@ -4024,7 +4369,10 @@ class GodseyeUavServer:
         return handle
 
     async def _execute_lost_link(self, vehicle: str, verdict: dict) -> dict | None:
-        """Fly the per-mission lost-link plan autonomously (M9)."""
+        """Fly the per-mission lost-link plan autonomously (M9). Nothing for a
+        drone the simulated wargame downed (WG §5.2.12)."""
+        if vehicle in self.vehicles_lost:
+            return None
         mon = self.monitor_for(vehicle)
         action = mon.link.action
         if action is None:
@@ -5617,6 +5965,10 @@ class GodseyeUavServer:
         updated = self.tracks.ingest(dets, sensor=sensor, observer=observer,
                                      frame_id=frame_id)
         for t in updated:
+            # WG §5.2.9: a simulated scenario unit's contact is tagged and
+            # handed to the wargame; it never enters the pattern of life.
+            if self._note_scenario_track(t):
+                continue
             self.pol.observe_track(t)
         self._persist_intel(updated)
         return {"detections": dets, "tracks": updated, "observer": observer,
@@ -5652,6 +6004,192 @@ class GodseyeUavServer:
         return self.tracks.get(track_id)
 
     # ---- sim ground truth (§4.4 + uav://targets) ----
+    def _spawn_refusal(self, name: str, lat: float, lon: float) -> dict | None:
+        """`sim_spawn_target`'s guards (WG §5.2.6), or None. `scenario_name`
+        (the wargame owns it), `duplicate_name` (always), and during a session
+        `near_scenario_unit` (within 150 m of a scenario unit)."""
+        code = message = None
+        if self._wargame_owns(name):
+            code, message = "scenario_name", SCENARIO_NAME_MESSAGE
+        elif name in self.targets:
+            code, message = "duplicate_name", DUPLICATE_NAME_MESSAGE.format(name=name)
+        elif self._scenario_unit_near(lat, lon) is not None:
+            code, message = "near_scenario_unit", NEAR_SCENARIO_UNIT_MESSAGE
+        if code is None:
+            return None
+        self.store.log_audit("spawn_target_refused", message, name=name, error=code)
+        return {"rejected": True, "error": code, "message": message}
+
+    def _route_refusal(self, name: str, start: tuple[float, float] | None,
+                       waypoints: list | None, loop: bool) -> dict | None:
+        """`near_scenario_unit` when a sim object's route passes within
+        `SCENARIO_CLEARANCE_M` of a scenario unit of the running session.
+
+        WG §5.2.6 guards a spawn point; driving an object onto a unit is the
+        same thing (D1 defence in depth: the tracker keeps the two apart too).
+        The legs run `start` -> each waypoint, and back to the first when
+        `loop`; each leg is checked exactly (point-to-segment, local flat
+        frame) against every unit position, read once. Waypoints
+        `_move_target` can't read are left for it to report. None outside a
+        session, so ISR is unchanged.
+        """
+        if not self._wargame_active():
+            return None
+        wps: list[tuple[float, float]] = []
+        for wp in waypoints or ():
+            try:
+                la, lo = ((wp[0], wp[1]) if isinstance(wp, (list, tuple))
+                          else (wp["lat"], wp["lon"]))
+                wps.append((float(la), float(lo)))
+            except (KeyError, IndexError, TypeError, ValueError):
+                return None
+        if not wps:
+            return None
+        pts = ([(float(start[0]), float(start[1]))] if start is not None else []) + wps
+        if loop and len(wps) > 1:
+            pts.append(wps[0])
+        legs = list(pairwise(pts)) or [(wps[0], wps[0])]
+        units = self._scenario_positions()
+        for a, b in legs:
+            if any(_segment_distance_m(a, b, (ulat, ulon)) <= SCENARIO_CLEARANCE_M
+                   for ulat, ulon in units):
+                message = NEAR_SCENARIO_UNIT_MESSAGE
+                self.store.log_audit("move_target_refused", message, name=name,
+                                     error="near_scenario_unit")
+                return {"rejected": True, "error": "near_scenario_unit",
+                        "message": message}
+        return None
+
+    def _scenario_positions(self) -> list[tuple[float, float]]:
+        """`(lat, lon)` of every scenario unit of the running session: the
+        engine's forces (red and blue) and each red truth record at its live sim
+        position, the two sources `_scenario_unit_near` asks. [] outside one."""
+        if not self._wargame_active():
+            return []
+        out: list[tuple[float, float]] = []
+        try:
+            rows = (self.wargame.list_forces(truth=True) or {}).get("forces") or []
+        except Exception as exc:  # noqa: BLE001
+            self._wargame_hook_failed("list_forces", exc)
+            rows = []
+        for row in rows:
+            try:
+                out.append((float(row["lat"]), float(row["lon"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        sid = self._wargame_session_id()
+        sim = getattr(self.backend, "sim", None)
+        for name, rec in list(self.targets.items()):
+            if rec.get("provenance") != "scenario":
+                continue
+            if sid is not None and rec.get("session_id") not in (None, sid):
+                continue
+            pos = sim.object_geo(name) if sim is not None else None
+            plat, plon = (pos[0], pos[1]) if pos else (rec.get("lat"), rec.get("lon"))
+            if plat is not None and plon is not None:
+                out.append((float(plat), float(plon)))
+        return out
+
+    def _ob_spawn_skip(self, request: dict) -> str | None:
+        """Why `sim_spawn_order_of_battle` skips this mapped site, or None."""
+        name = request.get("name")
+        if name and self._wargame_owns(name):
+            return "scenario_name"
+        try:
+            lat, lon = float(request["lat"]), float(request["lon"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return ("near_scenario_unit"
+                if self._scenario_unit_near(lat, lon) is not None else None)
+
+    @staticmethod
+    def _spawn_altitude(ground: dict, alt_msl_m: float | None,
+                        alt_m: float | None) -> tuple[float, dict]:
+        """`(alt_msl, alt_provenance)` for a spawned object: the caller's MSL
+        altitude, else `ground` (`ground_msl_at`). ValueError on a bad one."""
+        explicit = (alt_msl_m is not None or alt_m is not None)
+        alt_msl = (float(_one_altitude("sim_spawn_target altitude",
+                                       alt_msl_m=alt_msl_m, alt_m=alt_m))
+                   if explicit else float(ground["alt_msl_m"]))
+        alt_provenance = ({"alt_source": "caller", "alt_is_real": False,
+                           "alt_reason": ("the caller supplied the altitude; "
+                                          "the server did not measure it"),
+                           "terrain_default_msl_m": ground["alt_msl_m"],
+                           "terrain_default_source": ground["alt_source"]}
+                          if explicit else
+                          {k: v for k, v in ground.items() if k != "terrain"})
+        return alt_msl, alt_provenance
+
+    async def _spawn_object(self, label: str, asset: str, ob_ref: str,
+                            lat: float, lon: float, alt_msl: float,
+                            alt_provenance: dict, heading_deg: float,
+                            extra: dict | None = None) -> tuple[dict, Any]:
+        """Place the object in the sim and file its truth record in
+        `self.targets` (`sim_spawn_target` and `_spawn_object_record`).
+        Returns `(record, the sim's spawn answer)`."""
+        from .targets import match_ob
+        fix = canonical_altitude(alt_msl, lat, lon, datum="msl")
+        spawned = await self.backend.spawn_object(
+            label, asset, lat, lon, fix.alt_hae, heading_deg=heading_deg)
+        entry, evidence = match_ob(ob_ref)
+        record = {
+            "target_id": label, "name": label, "mesh": asset,
+            # §4.4 names this slot `class`; `ob_class` is the same value
+            # under the spelling the parameter had to use.
+            "class": entry.key,
+            "ob_class": entry.key, "category": entry.category,
+            "class_evidence": evidence,
+            "lat": lat, "lon": lon,
+            "alt_msl_m": alt_msl, "alt_hae_m": round(fix.alt_hae, 3),
+            "undulation_m": round(fix.undulation_m, 3),
+            "datum_source": fix.source,
+            "heading_deg": float(heading_deg),
+            "spawned_at": time.time(), "route": None,
+            **alt_provenance,
+            **(extra or {}),
+        }
+        self.targets[label] = record
+        scenario = {k: extra[k] for k in ("provenance", "session_id", "unit_id")
+                    if extra and k in extra}
+        self.store.log_audit("spawn_target", f"{label} @ {lat},{lon}",
+                             name=label, mesh=asset, ob_class=entry.key,
+                             alt_msl_m=alt_msl,
+                             alt_hae_m=round(fix.alt_hae, 3),
+                             alt_source=alt_provenance["alt_source"],
+                             alt_is_real=alt_provenance["alt_is_real"],
+                             **scenario)
+        return record, spawned
+
+    async def _spawn_object_record(self, name: str, ob_class: str, lat: float,
+                                   lon: float, *, alt_msl_m: float | None = None,
+                                   heading_deg: float = 0.0, mesh: str | None = None,
+                                   **extra: Any) -> dict:
+        """`sim_spawn_target`'s internals for the simulated wargame (WG §5.2.6).
+
+        Places `name` as an `ob_class` object at the ground under (lat, lon),
+        or at `alt_msl_m`, files its truth record in `srv.targets` with
+        `extra` merged in (the engine passes `provenance="scenario"`,
+        `session_id`, `side`, `unit_id`, `designator`), and returns that
+        record. None of the tool's guards apply: the engine owns its names and
+        spacing. Raises ValueError for an unknown class, a name already in
+        `srv.targets`, an `extra` key that would overwrite a truth field, or a
+        bad altitude, before anything is spawned.
+        """
+        from .targets import OB_LIBRARY
+        if ob_class not in OB_LIBRARY:
+            raise ValueError(f"{ob_class!r} is not an order-of-battle library key")
+        if not name or name in self.targets:
+            raise ValueError(f"a target named {name!r} already exists or is empty")
+        clash = sorted(set(extra) & SPAWN_RECORD_KEYS)
+        if clash:
+            raise ValueError(f"extra fields would overwrite the truth record: {clash}")
+        ground = self.ground_msl_at(float(lat), float(lon))
+        alt_msl, alt_provenance = self._spawn_altitude(ground, alt_msl_m, None)
+        record, _ = await self._spawn_object(
+            name, mesh or ob_class, ob_class, float(lat), float(lon), alt_msl,
+            alt_provenance, float(heading_deg), extra=dict(extra))
+        return record
+
     async def _move_target(self, target_id: str, waypoints: list,
                            speed_mps: float, loop: bool) -> dict:
         """Drive a spawned object along geodetic waypoints (M17)."""
@@ -6557,7 +7095,7 @@ class GodseyeUavServer:
             replay = self._idem_replay("sim_spawn_target", idempotency_key)
             if replay is not None:
                 return replay
-            from .targets import OB_LIBRARY, match_ob
+            from .targets import OB_LIBRARY
             if ob_class is not None and ob_class not in OB_LIBRARY:
                 return error("unknown_ob_class",
                              f"{ob_class!r} is not an order-of-battle library "
@@ -6568,8 +7106,19 @@ class GodseyeUavServer:
                              "give ob_class (preferred), or name/mesh for the "
                              "legacy path")
             if name is None:
-                self._target_seq = getattr(self, "_target_seq", 0) + 1
-                label = f"{ob_class or mesh}_{self._target_seq}"
+                # WG §5.2.6: an automatic label skips a name already taken (by
+                # an explicit name or by the simulated wargame).
+                while True:
+                    self._target_seq = getattr(self, "_target_seq", 0) + 1
+                    label = f"{ob_class or mesh}_{self._target_seq}"
+                    if label not in self.targets and not self._wargame_owns(label):
+                        break
+            refusal = self._spawn_refusal(label, float(lat), float(lon))
+            if refusal is None and mobile_route:
+                refusal = self._route_refusal(label, (float(lat), float(lon)),
+                                              mobile_route, bool(loop))
+            if refusal is not None:
+                return refusal
             asset = mesh or ob_class or label
             # The default is the ground under THIS point — measured terrain when
             # the real-world layer has it, the theater's hand-entered elevation
@@ -6578,51 +7127,18 @@ class GodseyeUavServer:
             # real hillside is a fact the operator has to be able to see.
             ground = self.ground_msl_at(float(lat), float(lon))
             try:
-                explicit = (alt_msl_m is not None or alt_m is not None)
-                alt_msl = (float(_one_altitude("sim_spawn_target altitude",
-                                               alt_msl_m=alt_msl_m, alt_m=alt_m))
-                           if explicit else float(ground["alt_msl_m"]))
+                alt_msl, alt_provenance = self._spawn_altitude(ground, alt_msl_m, alt_m)
             except ValueError as exc:
                 return error("invalid_parameter", str(exc))
-            alt_provenance = ({"alt_source": "caller", "alt_is_real": False,
-                               "alt_reason": ("the caller supplied the altitude; "
-                                              "the server did not measure it"),
-                               "terrain_default_msl_m": ground["alt_msl_m"],
-                               "terrain_default_source": ground["alt_source"]}
-                              if explicit else
-                              {k: v for k, v in ground.items() if k != "terrain"})
-            fix = canonical_altitude(alt_msl, lat, lon, datum="msl")
-            spawned = await self.backend.spawn_object(
-                label, asset, lat, lon, fix.alt_hae, heading_deg=heading_deg)
-            entry, evidence = match_ob(ob_class or label)
-            record = {
-                "target_id": label, "name": label, "mesh": asset,
-                # §4.4 names this slot `class`; `ob_class` is the same value
-                # under the spelling the parameter had to use.
-                "class": entry.key,
-                "ob_class": entry.key, "category": entry.category,
-                "class_evidence": evidence,
-                "lat": lat, "lon": lon,
-                "alt_msl_m": alt_msl, "alt_hae_m": round(fix.alt_hae, 3),
-                "undulation_m": round(fix.undulation_m, 3),
-                "datum_source": fix.source,
-                "heading_deg": float(heading_deg),
-                "spawned_at": time.time(), "route": None,
-                **alt_provenance,
-            }
-            self.targets[label] = record
-            self.store.log_audit("spawn_target", f"{label} @ {lat},{lon}",
-                                 name=label, mesh=asset, ob_class=entry.key,
-                                 alt_msl_m=alt_msl,
-                                 alt_hae_m=round(fix.alt_hae, 3),
-                                 alt_source=alt_provenance["alt_source"],
-                                 alt_is_real=alt_provenance["alt_is_real"])
+            record, spawned = await self._spawn_object(
+                label, asset, ob_class or label, lat, lon, alt_msl, alt_provenance,
+                heading_deg)
             out = {"spawned": spawned, "target_id": label, "name": label,
                    # §4.4 spelling first, legacy alias alongside it.
-                   "class": entry.key,
-                   "ob_class": entry.key, "category": entry.category,
-                   "class_evidence": evidence,
-                   "alt_msl_m": alt_msl, "alt_hae_m": round(fix.alt_hae, 3),
+                   "class": record["class"],
+                   "ob_class": record["ob_class"], "category": record["category"],
+                   "class_evidence": record["class_evidence"],
+                   "alt_msl_m": alt_msl, "alt_hae_m": record["alt_hae_m"],
                    "heading_deg": float(heading_deg),
                    **alt_provenance,
                    "resource": "uav://targets", "status": "accepted"}
@@ -6645,6 +7161,20 @@ class GodseyeUavServer:
             replay = self._idem_replay("sim_move_target", idempotency_key)
             if replay is not None:
                 return replay
+            if self._wargame_owns(target_id):
+                # WG §5.2.6: a scenario unit moves only by the wargame.
+                return {"rejected": True, "error": "scenario_name",
+                        "message": SCENARIO_NAME_MESSAGE}
+            if self._wargame_active() and target_id in self.targets:
+                sim = getattr(self.backend, "sim", None)
+                rec = self.targets[target_id]
+                pos = sim.object_geo(target_id) if sim is not None else None
+                here = (pos[0], pos[1]) if pos else (rec.get("lat"), rec.get("lon"))
+                if None in here:
+                    here = None
+                refusal = self._route_refusal(target_id, here, waypoints, bool(loop))
+                if refusal is not None:
+                    return refusal
             out = await self._move_target(target_id, waypoints, float(speed_mps),
                                           bool(loop))
             if out.get("error"):
@@ -6963,12 +7493,20 @@ class GodseyeUavServer:
             wanted = None if not categories else {str(c) for c in categories}
             spawned: list[dict] = []
             refused: list[dict] = []
+            skipped: list[dict] = []
             for site in order.sites:
                 if wanted is not None and site.category not in wanted:
                     continue
                 if limit is not None and len(spawned) >= int(limit):
                     break
                 request = site.spawn_request()
+                # WG §5.2.6: mapped sites never take a scenario unit's name or
+                # land within 150 m of one; those rows are skipped, not spawned.
+                why = self._ob_spawn_skip(request)
+                if why is not None:
+                    skipped.append({"osm_id": site.osm_id, "name": site.name,
+                                    "category": site.category, "reason": why})
+                    continue
                 out = await sim_spawn_target(**request)
                 row = {"osm_id": site.osm_id, "name": site.name,
                        "category": site.category, "ob_class": site.ob_class,
@@ -6986,6 +7524,8 @@ class GodseyeUavServer:
                 "caveat": MAPPED_DATA_CAVEAT,
                 "provenance": order.provenance.as_dict(),
             }
+            if skipped:   # only ever during a simulated wargame session
+                result["skipped"] = skipped
             return self._idem_record("sim_spawn_order_of_battle",
                                      idempotency_key, result)
 
@@ -7065,6 +7605,13 @@ class GodseyeUavServer:
             replay = self._idem_replay("sim_reset", idempotency_key)
             if replay is not None:
                 return replay
+            if self._wargame_busy():
+                # WG §5.2.12: a reset would strand the scenario units and the
+                # drones the wargame downed; ending it restores both.
+                self.store.log_audit("sim_reset_refused", WARGAME_RESET_MESSAGE,
+                                     error="wargame_active")
+                return {"rejected": True, "error": "wargame_active",
+                        "message": WARGAME_RESET_MESSAGE}
             try:
                 await self.backend.reset()
             except Exception as exc:  # noqa: BLE001 — reported, never ignored
@@ -7412,6 +7959,9 @@ class GodseyeUavServer:
                         "force-RTB is un-cancellable (M4/T5)."),
                 "isr_only": ("M14: no kinetic tool exists on this server and "
                              "no engagement recommendation is produced."),
+                # M14a (WG §5.0): which mode the server is in. `isr_only` above
+                # stays byte-identical in every mode.
+                "doctrine": self._doctrine_block(),
             }
 
         @mcp.resource("uav://reports/{id}", mime_type="application/json",

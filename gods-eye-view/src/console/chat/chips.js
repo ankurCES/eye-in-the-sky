@@ -31,7 +31,16 @@ export const NODE_TYPES = new Set([
   'alarm',
   'feed',
   'site',
+  // Phase B (M14a): simulated wargame nodes (WG spec §3.2).
+  'force',
+  'engagement',
+  'vector',
 ]);
+/**
+ * Wargame node types: orb/glyphs.js draws them from their attrs (side,
+ * state, phase, consequence) and never green (B13, §5.3.4).
+ */
+const WARGAME_TYPES = new Set(['force', 'engagement', 'vector']);
 const STATUSES = new Set(['ok', 'warn', 'critical', 'stale', 'unknown']);
 
 /** Find a graph node by id in an intelStore snapshot (Map or object index). */
@@ -66,7 +75,7 @@ export function chipStatus(type, status) {
 }
 
 /** The glyph markup for a chip: constant SVG from orb/glyphs.js only. */
-function chipGlyph(type, status, category = null) {
+function chipGlyph(type, status, category = null, attrs = null) {
   // orb/glyphs.js draws any type it doesn't know as the unrecognised glyph.
   const safeType = NODE_TYPES.has(type) ? type : 'unknown';
   const safeStatus = chipStatus(type, status);
@@ -76,6 +85,11 @@ function chipGlyph(type, status, category = null) {
       status: safeStatus,
       size: 10,
       category: typeof category === 'string' ? category : undefined,
+      // A wargame node's frame, burst or arrow follows its attrs (B13).
+      attrs:
+        WARGAME_TYPES.has(safeType) && attrs && typeof attrs === 'object'
+          ? attrs
+          : undefined,
     });
     return typeof svg === 'string' ? svg : '';
   } catch {
@@ -99,7 +113,7 @@ export function createChip(ref, hooks = {}) {
     (node?.type === 'feed' ? feedLabel(node) : node?.label) ||
     null;
   const glyph = h('span', { class: 'ic-chip__glyph', 'aria-hidden': 'true' });
-  const svg = chipGlyph(type, status, node?.attrs?.category);
+  const svg = chipGlyph(type, status, node?.attrs?.category, node?.attrs);
   if (svg) glyph.innerHTML = svg;
   const text = h(
     'span',

@@ -21,6 +21,21 @@
  * - `analyst:availability` {available, reason?, hint?}
  * - `approval:pending` {count, oldest?}
  *
+ * The simulated wargame (WG v2 §5.3; only ever emitted during a session or
+ * by its read view):
+ * - `wargame:view` {view:'umpire'|'blue'|null, truth, session_id}: the
+ *   intel store's view; the shell points the orb, the List view and the map
+ *   overlay at it.
+ * - `wargame:ended` {by:'operator', session_id, aar_id, ended_at_ms}: the
+ *   strip's End wargame succeeded (the transcript's divider says "by you").
+ * - `console:key` {state, canApprove}: the engagement approval key's holder
+ *   moved (never the key itself); slips re-check Deny-only.
+ * - `read:request` {id, markdown?, entity?, node?} and `read:open`
+ *   {id, title, markdown}: open a report (the after-action review) in the
+ *   read view.
+ * - `view:request` {view:'list'|'orb', source?}: switch the stage view (the
+ *   rail's "Show all" engagements).
+ *
  * A listener that throws never stops the others: the error is reported and
  * the emit carries on, because one broken panel must not blind the rest.
  */
@@ -44,6 +59,13 @@ export const BUS_EVENTS = Object.freeze([
   'inspector:state', // {open, id} from the inspector (plate viewport)
   'gev:status', // {state, phase, message?} from src/main.js (map start-up)
   'approval:review', // {} a sheet's Review: show the oldest waiting slip
+  // The simulated wargame (WG v2 §5.3):
+  'wargame:view',
+  'wargame:ended',
+  'console:key',
+  'read:request',
+  'read:open',
+  'view:request',
 ]);
 
 function defaultReport(error) {

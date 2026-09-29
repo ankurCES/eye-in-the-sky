@@ -11,6 +11,13 @@
  *
  * Everything the renderer needs from the platform (canvas creation, Path2D,
  * a clock) is injectable, so node:test can drive it with a recording context.
+ *
+ * The simulated wargame (WG §5.3.4–§5.3.6): frames paint their state bar as
+ * a second stroke (so a suppressed frame dashes while its bar stays solid)
+ * and their slash in the frame's own ink; wargame edges come from
+ * wargameEdges.js (caps, Umpire-only kinds, never magenta) and an `axis`
+ * edge ends in an arrowhead at its target; the session bands caption
+ * themselves ("Simulated red forces 3") and draw nothing when empty.
  */
 
 import { h } from '../../ui/uavDom.js';
@@ -24,6 +31,9 @@ import {
   tracePath,
 } from './glyphs.js';
 import { SITES_DEGRADED_TEXT, siteBandCaption } from './placeText.js';
+import { SESSION_REPORT_LAT, WARGAME_BANDS } from './contextBands.js';
+import { wargameEdgePlan } from './wargameEdges.js';
+import { wargameBandCaption } from './wargameText.js';
 import {
   BANDS,
   BAND_ORDER,
@@ -126,21 +136,34 @@ export function edgeStyle(kind) {
 
 /**
  * Which edges to draw this frame, most important first, capped at 200.
+ * Wargame kinds take their style, reveal rule and caps from wargameEdges.js;
+ * `umpire: false` (Blue view) never draws the Umpire-only kinds.
  * @param {object} layout computeLayout() result
  * @param {{selected?:number, hovered?:number, focus?:Iterable<number>,
- *   colorOf?:(i:number)=>string, cap?:number}} state
- * @returns {Array<{e:number, kind:string, color:string, width:number, dash:number[]|null}>}
+ *   colorOf?:(i:number)=>string, cap?:number, umpire?:boolean}} state
+ * @returns {Array<{e:number, kind:string, color:string, width:number,
+ *   dash:number[]|null, arrow?:boolean, bi?:number}>} `arrow` (with the
+ *   target end `bi`) only on edges drawn with an arrowhead
  */
 export function selectEdges(
   layout,
-  { selected = -1, hovered = -1, focus = [], colorOf, cap = EDGE_CAP } = {},
+  {
+    selected = -1,
+    hovered = -1,
+    focus = [],
+    colorOf,
+    cap = EDGE_CAP,
+    umpire = true,
+  } = {},
 ) {
   const active = new Set(focus);
   if (hovered >= 0) active.add(hovered);
   if (selected >= 0) active.add(selected);
   const picked = [];
+  const plan = wargameEdgePlan(layout, { umpire });
   layout.edges.forEach((edge, e) => {
-    const style = edgeStyle(edge.kind);
+    const style = plan[e] ?? edgeStyle(edge.kind);
+    if (style.reveal === 'never') return;
     let rank = -1;
     if (style.reveal === 'always') rank = 0;
     else if (
@@ -160,14 +183,19 @@ export function selectEdges(
       const alarmEnd = layout.band[edge.ai] === 'alarm' ? edge.ai : edge.bi;
       color = colorOf?.(alarmEnd) || COLORS.pencil;
     }
-    picked.push({
+    const item = {
       e,
       rank,
       kind: edge.kind,
       color,
       width: style.width,
       dash: style.dash,
-    });
+    };
+    if (style.arrow) {
+      item.arrow = true;
+      item.bi = edge.bi;
+    }
+    picked.push(item);
   });
   picked.sort((a, b) => a.rank - b.rank || a.e - b.e);
   return picked.slice(0, cap);
@@ -646,9 +674,20 @@ export function placeCaptions(
     );
   const kept = [];
   const crowded = (y) => kept.some((row) => Math.abs(row.y - y) < 16);
-  for (const { caption, y } of found) {
-    const w = measure(caption.text);
-    const home = rowAt(caption, y, w);
+  for (const found1 of found) {
+    const { y } = found1;
+    let caption = found1.caption;
+    let w = measure(caption.text);
+    let home = rowAt(caption, y, w);
+    // A long caption that would fall inside the limb (onto its own band's
+    // glyphs) takes its short form in the margin when that fits there
+    // (the session bands: "Red forces 2" for "Simulated red forces 2").
+    if (caption.short && home?.align !== 'right') {
+      const short = { ...caption, text: caption.short };
+      const ws = measure(short.text);
+      const alt = rowAt(short, y, ws);
+      if (alt?.align === 'right') [caption, w, home] = [short, ws, alt];
+    }
     if (!home || crowded(y)) continue;
     let pick = onGlyph(home) ? null : home;
     for (const dy of pick ? [] : [-18, 18]) {
@@ -751,20 +790,29 @@ export function createRenderer(env = {}) {
 
   /** Paint one node glyph directly (sprite construction, or no-sprite fallback). */
   function paintNode(g, spec, x, y, r) {
-    const style = glyphStyle(spec.type, spec.status, { phase: spec.phase });
-    const d = glyphFor(spec.type, { category: spec.category }).path;
+    const options = { phase: spec.phase, attrs: spec.attrs };
+    const style = glyphStyle(spec.type, spec.status, options);
+    const glyph = glyphFor(spec.type, {
+      category: spec.category,
+      attrs: spec.attrs,
+    });
+    const d = glyph.path;
     const k = r / GLYPH_NOMINAL_RADIUS;
+    // A wargame style may carry its own opacity (a destroyed blue unit,
+    // a denied engagement: 50 %), baked into the sprite.
+    const base = Number.isFinite(style.alpha) ? style.alpha : 1;
     const drawGlyph = (ox, oy, alpha) => {
       g.save();
       g.translate(ox - 12 * k, oy - 12 * k);
       g.scale(k, k);
       g.lineWidth = Math.max(2, 1.1 / k);
       g.lineJoin = 'round';
+      if (base < 1) g.globalAlpha = alpha * base;
       if (style.fill) {
-        g.globalAlpha = alpha * style.fillAlpha;
+        g.globalAlpha = alpha * base * style.fillAlpha;
         g.fillStyle = style.fill;
         paintPath(g, d, 'fill');
-        g.globalAlpha = alpha;
+        g.globalAlpha = alpha * base;
       }
       if (style.stroke) {
         g.strokeStyle = style.stroke;
@@ -772,10 +820,21 @@ export function createRenderer(env = {}) {
         paintPath(g, d, 'stroke');
         g.setLineDash([]);
       }
-      if (style.slash) {
-        g.strokeStyle = COLORS.critical;
+      // A frame's state bar: solid (or broken in two) even on a dashed frame.
+      if (glyph.bar && style.stroke) {
+        g.strokeStyle = style.stroke;
+        g.setLineDash(style.barDash || []);
         g.lineCap = 'round';
-        paintPath(g, GLYPH_SLASH, 'stroke');
+        paintPath(g, glyph.bar, 'stroke');
+        g.setLineDash([]);
+      }
+      if (style.slash) {
+        // A down feed's slash is critical; a destroyed unit's is its own ink.
+        g.strokeStyle = style.slashPath
+          ? style.stroke || style.color
+          : COLORS.critical;
+        g.lineCap = 'round';
+        paintPath(g, style.slashPath || GLYPH_SLASH, 'stroke');
       }
       g.restore();
     };
@@ -1038,6 +1097,56 @@ export function createRenderer(env = {}) {
     };
     drawLines('back', 0.35);
 
+    // Arrowheads on `axis` edges (§5.3.5): at the target end, clear of its
+    // glyph, only where that end faces the camera. One path per ink.
+    const arrows = new Map();
+    const ends = [0, 0, 0, 0, 0, 0, 0, 0];
+    for (const edge of scene.edges || []) {
+      if (!edge.arrow || !scene.edgePts) continue;
+      const at = edge.e * EDGE_STRIDE + (EDGE_POINTS - 2) * 3;
+      const pts = scene.edgePts;
+      camera.projectXYZ(pts[at], pts[at + 1], pts[at + 2], ends, 0);
+      camera.projectXYZ(pts[at + 3], pts[at + 4], pts[at + 5], ends, 4);
+      if (!(ends[6] >= 0)) continue;
+      const dx = ends[4] - ends[0];
+      const dy = ends[5] - ends[1];
+      const len = Math.hypot(dx, dy);
+      if (!(len > 1e-3)) continue;
+      const ux = dx / len;
+      const uy = dy / len;
+      const b = edge.bi;
+      const rb =
+        Number.isInteger(b) && nodes[b] ? nodes[b].r * proj[b * 4 + 3] : 0;
+      const tx = ends[4] - ux * (rb + 2);
+      const ty = ends[5] - uy * (rb + 2);
+      let list = arrows.get(edge.color);
+      if (!list)
+        arrows.set(edge.color, (list = { width: edge.width, pts: [] }));
+      list.pts.push(
+        tx - ux * 6 - uy * 3.5,
+        ty - uy * 6 + ux * 3.5,
+        tx,
+        ty,
+        tx - ux * 6 + uy * 3.5,
+        ty - uy * 6 - ux * 3.5,
+      );
+    }
+    const drawArrows = () => {
+      for (const [color, { width: w, pts }] of arrows) {
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = w;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        for (let k = 0; k < pts.length; k += 6) {
+          ctx.moveTo(pts[k], pts[k + 1]);
+          ctx.lineTo(pts[k + 2], pts[k + 3]);
+          ctx.lineTo(pts[k + 4], pts[k + 5]);
+        }
+        ctx.stroke();
+      }
+    };
+
     // Nodes, back to front.
     const pointsBack = scene.pointsBack;
     const backHalos = !scene.dropBackHalos;
@@ -1054,6 +1163,7 @@ export function createRenderer(env = {}) {
         // Everything behind is painted; lay the front lines over it.
         flushPoints();
         drawLines('front', 1);
+        drawArrows();
       }
       const vm = nodes[i];
       if (!vm) continue;
@@ -1073,7 +1183,10 @@ export function createRenderer(env = {}) {
         ticks.push(x, y, alpha);
         continue;
       }
-      if (vm.critical && (!back || backHalos)) {
+      // Halos are steady and only on criticals; a wargame style says
+      // whether its critical wears one (a red unit does, a lost blue one
+      // is drawn stale and slashed instead).
+      if ((vm.halo ?? vm.critical) && (!back || backHalos)) {
         const bucket = bucketFor(r);
         const halo = haloSprite(bucket, dpr);
         if (halo) {
@@ -1109,6 +1222,7 @@ export function createRenderer(env = {}) {
     if (frontStart === n) {
       flushPoints();
       drawLines('front', 1);
+      drawArrows();
     }
     function flushPoints() {
       for (const [color, list] of points) {
@@ -1506,24 +1620,52 @@ export function createRenderer(env = {}) {
 /**
  * Band captions in pole-to-pole order, e.g. "Contacts 23 (+1)". The site band
  * (WG §4.2.6) reads "Sites 41 (12 more on the map)", draws nothing when
- * empty, and says so in warn ink when the map data feed is degraded.
+ * empty, and says so in warn ink when the map data feed is degraded. The
+ * session bands (§5.3.5) read "Simulated red forces 3", "Simulated blue
+ * forces 2" and "Simulated engagements 4, vectors 2", and draw nothing when
+ * empty; in the session profile the report caption follows its band to −54°
+ * and the equipment band (collapsed to ticks) has none.
  * @param {object} counts layout.counts
  * @param {{recent?: object, detectionsDown?: boolean,
- *   sites?: {count?: number, omitted?: number, degraded?: boolean}}} [options]
- *   `sites.count` is the number drawn on the orb (default counts.site)
+ *   sites?: {count?: number, omitted?: number, degraded?: boolean},
+ *   wargame?: {vectors?: number, sideNotSet?: number},
+ *   profile?: 'isr'|'session'}} [options]
+ *   `sites.count` is the number drawn on the orb (default counts.site);
+ *   `wargame` is layout.wargame; `profile` is layout.profile
  */
 export function bandCaptions(
   counts,
-  { recent = {}, detectionsDown = false, sites = null } = {},
+  {
+    recent = {},
+    detectionsDown = false,
+    sites = null,
+    wargame = null,
+    profile = 'isr',
+  } = {},
 ) {
   const out = [];
   for (const key of BAND_ORDER) {
     const band = BANDS[key];
     const count = counts?.[key] || 0;
     if (key === 'other' && !count) continue;
+    // In the session profile equipment collapses to ticks between the two
+    // force rows; its caption steps aside so theirs can be read.
+    if (key === 'equipment' && profile === 'session') continue;
     if (key === 'site') {
       const row = siteCaption(count, sites);
       if (row) out.push({ key, ...row, lat: band.lat });
+      continue;
+    }
+    if (Object.hasOwn(WARGAME_BANDS, key)) {
+      const numbers = {
+        count,
+        vectors: wargame?.vectors,
+        sideNotSet: wargame?.sideNotSet,
+        recent: recent[key],
+      };
+      const text = wargameBandCaption(key, numbers);
+      const short = wargameBandCaption(key, numbers, { short: true });
+      if (text) out.push({ key, text, short, ink: null, lat: band.lat });
       continue;
     }
     let text = `${band.caption} ${count}`;
@@ -1536,7 +1678,13 @@ export function bandCaptions(
     } else if (recent[key] > 0) {
       text += ` (+${recent[key]})`;
     }
-    out.push({ key, text, ink, lat: key === 'theater' ? 86 : band.lat });
+    const lat =
+      key === 'theater'
+        ? 86
+        : key === 'report' && profile === 'session'
+          ? SESSION_REPORT_LAT
+          : band.lat;
+    out.push({ key, text, ink, lat });
   }
   return out;
 }

@@ -2241,6 +2241,150 @@ class TestReadOnly:
 
 
 # ===========================================================================
+# M14a (PLAN §4.5a, WG §3.4 B9): the browser proxy never forwards a `wg_*` tool
+# ===========================================================================
+
+#: The WG §3.7 catalog: every simulated wargame tool, entry tools included.
+WG_TOOLS = ("wg_session_start", "wg_session_status", "wg_list_classes",
+            "wg_session_end", "wg_generate_scenario", "wg_spawn_force",
+            "wg_list_forces", "wg_plan_corridor", "wg_propose_strike",
+            "wg_execute_engagement")
+
+EXECUTE_ARGS = {"pending_id": "pnd-1", "shooter_id": "Blue strike 1",
+                "target_track_id": "T-0007"}
+
+
+class TestWargameToolsNotForwarded:
+    """`/control/command` answers 403 for any `wg_*` tool and never calls MCP.
+
+    An engagement is confirmed only on the console's approval path (WG §3.8);
+    `/control/command` can never confirm, not even against a server started
+    with `--wargame-mcp`, whose `/mcp` does list these tools. The refusal is
+    made before the MCP transport is touched, so the recorder below proving
+    "no call" is the whole claim.
+    """
+
+    @staticmethod
+    def _record(client):
+        calls = []
+
+        def rpc(method, params):
+            calls.append((method, params))
+            return ({"jsonrpc": "2.0", "id": 1,
+                     "result": {"content": [{"type": "text", "text": '{"ok": true}'}],
+                                "isError": False}}, None)
+
+        client.app.state.mcp.rpc = rpc
+        return calls
+
+    def test_execute_engagement_is_refused_with_403(self, client):
+        calls = self._record(client)
+        r = client.post("/control/command", headers=H, json={
+            "tool": "wg_execute_engagement", "arguments": dict(EXECUTE_ARGS)})
+        assert r.status_code == 403, r.text
+        assert r.json()["error"] == "wargame_tools_not_forwarded"
+        assert calls == [], "a wg_ tool reached the MCP transport"
+
+    @pytest.mark.parametrize("tool", WG_TOOLS)
+    def test_every_catalog_tool_is_refused(self, client, tool):
+        calls = self._record(client)
+        r = client.post("/control/command", headers=H,
+                        json={"tool": tool, "vehicle": "Drone1", "arguments": {}})
+        assert r.status_code == 403, (tool, r.text)
+        assert r.json()["error"] == "wargame_tools_not_forwarded"
+        assert calls == []
+
+    @pytest.mark.parametrize("tool", ["WG_execute_engagement",
+                                      " wg_execute_engagement",
+                                      "Wg_session_start\n"])
+    def test_near_miss_spellings_are_refused(self, client, tool):
+        calls = self._record(client)
+        r = client.post("/control/command", headers=H, json={"tool": tool})
+        assert r.status_code == 403, (tool, r.text)
+        assert calls == []
+
+    def test_refused_even_with_malformed_arguments(self, client):
+        """The name is checked before `arguments` is touched: a non-object
+        `arguments` still gets the 403, not a 500 from the proxy."""
+        calls = self._record(client)
+        r = client.post("/control/command", headers=H,
+                        json={"tool": "wg_execute_engagement", "arguments": ["x"]})
+        assert r.status_code == 403, r.text
+        assert calls == []
+
+    def test_the_body_is_the_refusal_convention(self, client):
+        self._record(client)
+        body = client.post("/control/command", headers=H,
+                           json={"tool": "wg_propose_strike"}).json()
+        assert body == {"rejected": True,
+                        "error": bridge_mod.WARGAME_NOT_FORWARDED,
+                        "message": bridge_mod.WARGAME_NOT_FORWARDED_MESSAGE}
+        assert body["message"].endswith(".") and body["message"].count(".") == 1
+        assert "·" not in body["message"]
+
+    def test_auth_still_comes_first(self, client):
+        calls = self._record(client)
+        r = client.post("/control/command",
+                        json={"tool": "wg_execute_engagement",
+                              "arguments": dict(EXECUTE_ARGS)})
+        assert r.status_code == 401
+        assert calls == []
+
+    # -- existing routes unchanged ------------------------------------------
+
+    def test_isr_commands_are_forwarded_as_before(self, client):
+        calls = self._record(client)
+        r = client.post("/control/command", headers=H,
+                        json={"tool": "uav_abort", "vehicle": "Drone2"})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"ok": True}
+        assert calls == [("tools/call", {"name": "uav_abort",
+                                         "arguments": {"vehicle": "Drone2"}})]
+
+    def test_isr_arguments_pass_through_untouched(self, client):
+        calls = self._record(client)
+        r = client.post("/control/command", headers=H, json={
+            "tool": "sim_set_fuel", "arguments": {"vehicle": "Drone1", "pct": 100}})
+        assert r.status_code == 200, r.text
+        assert calls == [("tools/call", {"name": "sim_set_fuel",
+                                         "arguments": {"vehicle": "Drone1", "pct": 100}})]
+
+    def test_a_missing_tool_is_still_400(self, client):
+        calls = self._record(client)
+        r = client.post("/control/command", headers=H, json={"vehicle": "Drone1"})
+        assert r.status_code == 400
+        assert r.json() == {"detail": "command needs a tool name"}
+        assert calls == []
+
+    def test_the_mission_route_still_pins_uav_mission(self, client):
+        """`/control/mission` ignores a body `tool` exactly as before: the
+        pinned `uav_mission` is what reaches MCP."""
+        calls = self._record(client)
+        r = client.post("/control/mission", headers=H, json={
+            "vehicle": "Drone1", "kind": "recon_route", "params": {"radius_m": 300},
+            "tool": "wg_execute_engagement"})
+        assert r.status_code == 200, r.text
+        assert calls == [("tools/call", {"name": "uav_mission", "arguments": {
+            "vehicle": "Drone1", "kind": "recon_route", "params": {"radius_m": 300}}})]
+
+    def test_the_route_set_is_unchanged(self, client):
+        """B9 adds a check inside `_forward`, never a route."""
+        paths = {(r.path, frozenset(r.methods)) for r in client.app.routes
+                 if hasattr(r, "methods")}
+        control = {p for p in paths if p[0].startswith("/control")}
+        assert control == {("/control/mission", frozenset({"POST"})),
+                           ("/control/command", frozenset({"POST"})),
+                           ("/control/status/{veh}", frozenset({"GET"}))}
+
+    def test_is_wargame_tool(self):
+        for name in (*WG_TOOLS, "WG_SESSION_START", "\twg_list_forces "):
+            assert bridge_mod.is_wargame_tool(name), name
+        for name in ("uav_hover", "uav_wg_probe", "wg", "wgx_start", "wg-start", "",
+                     None, 7, ["wg_session_start"], {"name": "wg_session_start"}):
+            assert not bridge_mod.is_wargame_tool(name), name
+
+
+# ===========================================================================
 # AGL: the operator must be shown the number the harness flies on
 # (REAL_DATA_INTEGRATION.md; BRIDGE_CONTRACT vehicles[] / "fail visibly")
 #

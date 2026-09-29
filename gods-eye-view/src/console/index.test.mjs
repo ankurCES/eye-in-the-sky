@@ -31,6 +31,7 @@ export async function resolve(specifier, context, next) {
 register(`data:text/javascript,${encodeURIComponent(hooks)}`);
 
 const {
+  CLAIM_RETRY_MS,
   COPY,
   ICON,
   analystUnavailableCopy,
@@ -573,9 +574,15 @@ function stubComponents(log) {
         setViewport: record('orb.setViewport'),
         snapshot: () => null,
         setOptions: record('orb.setOptions'),
+        setView: record('orb.setView'),
       };
     },
-    createOrbListView: () => ({ setGraph() {}, filter() {}, destroy() {} }),
+    createOrbListView: () => ({
+      setGraph() {},
+      filter() {},
+      destroy() {},
+      setView: record('list.setView'),
+    }),
     createChatClient() {
       const listeners = {};
       log.chat = {
@@ -2322,6 +2329,569 @@ test('off the orb the theater change is a toast; its Show on map moves the map',
     await flush(8);
     assert.equal(port.calls.at(-1), `area:${THEATER_BBOX.join(',')}:true`);
     assert.doesNotMatch(textOf(t.el.toasts), /Theater changed/);
+  } finally {
+    t.restore();
+  }
+});
+
+// ---- simulated wargame: strip, console key, read view (WG §3.5, §5.3.2, §5.3.11) ----
+
+const WG_STARTED = Date.UTC(2026, 8, 28, 14, 2, 11);
+
+function wargameGraph(wg = {}, extra = {}) {
+  return graphWith([], {
+    meta: {
+      counts: { track: 4 },
+      threat_assessed: 4,
+      threat_unassessed: 0,
+      wargame: {
+        active: true,
+        session_id: 'WG-1a2b3c',
+        started_at_ms: WG_STARTED,
+        seed: 4417,
+        engine: 'wg-notional/1',
+        time_scale: 4,
+        truth_view: true,
+        ...wg,
+      },
+    },
+    ...extra,
+  });
+}
+
+/** A fake sessionStorage on globalThis for one mount; returns restore(). */
+function fakeSessionStorage(values = {}) {
+  const data = { ...values };
+  const store = {
+    data,
+    getItem: (k) => (k in data ? data[k] : null),
+    setItem: (k, v) => {
+      data[k] = String(v);
+    },
+    removeItem: (k) => {
+      delete data[k];
+    },
+  };
+  const saved = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+  Object.defineProperty(globalThis, 'sessionStorage', {
+    value: store,
+    configurable: true,
+    writable: true,
+  });
+  store.restore = () => {
+    if (saved) Object.defineProperty(globalThis, 'sessionStorage', saved);
+    else delete globalThis.sessionStorage;
+  };
+  return store;
+}
+
+/** mount() with a richer api: routes, a claim answer, End, entities. The
+ *  picture is `t.api.graph` for every graph path (Blue or Umpire view). */
+async function mountWg({
+  graph = graphWith(),
+  claim = async () => ({}),
+  end = async () => ({ ok: true, aar_id: 'aar-WG-1a2b3c' }),
+  entities = {},
+  port = null,
+  width = 1440,
+  session = null,
+} = {}) {
+  const doc = stubDom();
+  const saved = globalThis.document;
+  globalThis.document = doc;
+  const storage = session ? fakeSessionStorage(session) : null;
+  const log = { calls: [], claims: 0, ends: 0, chatArgs: null };
+  const clock = fakeClock();
+  const win = fakeWin(width);
+  const bus = createBus();
+  const api = {
+    graph,
+    get(path) {
+      log.calls.push(['api.get', path]);
+      if (path.startsWith('/intel/entity/')) {
+        const id = decodeURIComponent(path.slice('/intel/entity/'.length));
+        return id in entities
+          ? Promise.resolve(entities[id])
+          : Promise.reject(new Error('not in the picture'));
+      }
+      return Promise.resolve(this.graph);
+    },
+    post: async (path) => {
+      log.calls.push(['api.post', path]);
+      return {};
+    },
+    claimConsole: async () => {
+      log.claims += 1;
+      return claim();
+    },
+    endWargame: async () => {
+      log.ends += 1;
+      return end();
+    },
+    sse: () => ({ close() {} }),
+    abortVehicle: async () => ({ aborted: true }),
+  };
+  const store = createIntelStore({
+    api,
+    bus,
+    clock,
+    doc: null,
+    storage: null,
+    alarmStream: false,
+  });
+  const components = stubComponents(log);
+  const makeChat = components.createChatClient;
+  components.createChatClient = (args) => {
+    log.chatArgs = args;
+    return makeChat(args);
+  };
+  const host = doc.createElement('div');
+  const handle = mountIntelConsole({
+    root: host,
+    config: { api, bus, store, base: '', token: 't' },
+    trackingPort: port,
+    components,
+    win,
+    clock,
+  });
+  await flush();
+  const restore = () => {
+    handle.destroy();
+    globalThis.document = saved;
+    storage?.restore();
+  };
+  return {
+    doc,
+    log,
+    clock,
+    win,
+    bus,
+    api,
+    store,
+    host,
+    handle,
+    storage,
+    el: handle.elements,
+    restore,
+  };
+}
+
+const stripOf = (t) => byClass(t.el.root, 'ic-wgstrip');
+
+test('ISR mode: no strip, no data-wargame, the honesty line unchanged', async () => {
+  const t = await mountWg();
+  try {
+    const strip = stripOf(t);
+    assert.ok(strip, 'the strip exists');
+    assert.ok(isHidden(strip));
+    assert.equal(textOf(strip), '');
+    assert.equal(t.el.root.attrs['data-wargame'], undefined);
+    assert.doesNotMatch(textOf(t.el.footer), /Simulated/);
+    // The strip sits before the narrow bar: first in Tab order after the skips.
+    const kids = t.el.root.children;
+    assert.ok(kids.indexOf(strip) < kids.indexOf(t.el.narrowBar));
+  } finally {
+    t.restore();
+  }
+});
+
+test('an active session shows the strip, the root frame and the honesty prefix; its end removes them', async () => {
+  const t = await mountWg({ graph: wargameGraph() });
+  try {
+    const strip = stripOf(t);
+    assert.ok(!isHidden(strip));
+    assert.equal(t.el.root.attrs['data-wargame'], 'on');
+    assert.equal(
+      textOf(strip),
+      'Simulated wargame Session WG-1a2b3c Redmond (AirSim default) Started 14:02:11Z Sim time ×4 Umpire view End wargame',
+    );
+    assert.match(
+      textOf(t.el.footer),
+      /^Simulated wargame\. 4 contacts in theater\. Threat assessed for 4 of 4\.$/,
+    );
+    assert.equal(
+      honestyLine(wargameGraph()),
+      'Simulated wargame. 4 contacts in theater. Threat assessed for 4 of 4.',
+    );
+    t.api.graph = graphWith([], {
+      meta: { wargame: { active: false, last: null }, counts: { track: 0 } },
+    });
+    await t.clock.advance(2000);
+    assert.ok(isHidden(strip), 'strip only while active');
+    assert.equal(t.el.root.attrs['data-wargame'], undefined);
+    assert.doesNotMatch(textOf(t.el.footer), /Simulated/);
+  } finally {
+    t.restore();
+  }
+});
+
+test('End wargame calls the end route, hides the strip at once and tells the divider', async () => {
+  const t = await mountWg({ graph: wargameGraph() });
+  const ended = [];
+  t.bus.on('wargame:ended', (p) => ended.push(p));
+  try {
+    const strip = stripOf(t);
+    const gets = () => t.log.calls.filter((c) => c[0] === 'api.get').length;
+    await flush(8);
+    const before = gets();
+    byClass(strip, 'ic-wgstrip__end').fire('click');
+    const pop = byClass(strip, 'ic-wgstrip__pop');
+    assert.ok(!isHidden(pop));
+    byClass(pop, 'ic-wgstrip__confirm').fire('click');
+    await flush(8);
+    assert.equal(t.log.ends, 1);
+    assert.ok(isHidden(strip), 'gone before the next poll');
+    assert.equal(t.el.root.attrs['data-wargame'], undefined);
+    assert.doesNotMatch(textOf(t.el.footer), /Simulated/);
+    const endedAt = t.clock.now();
+    assert.deepEqual(ended, [
+      {
+        by: 'operator',
+        session_id: 'WG-1a2b3c',
+        aar_id: 'aar-WG-1a2b3c',
+        ended_at_ms: endedAt,
+      },
+    ]);
+    assert.match(
+      textOf(t.el.livePolite),
+      /^Wargame ended by you at \d\d:\d\d:\d\dZ\.$/,
+    );
+    // The picture was asked again at once, before the next 2 s poll.
+    assert.ok(gets() > before);
+    // A poll that still says active (the host catching up) keeps it gone.
+    await t.clock.advance(2000);
+    assert.ok(isHidden(strip));
+    assert.doesNotMatch(textOf(t.el.footer), /Simulated/);
+  } finally {
+    t.restore();
+  }
+});
+
+test('a refused End keeps the strip and says why; Esc closes the popover first', async () => {
+  const t = await mountWg({
+    graph: wargameGraph(),
+    end: async () => {
+      throw Object.assign(new Error('no wargame is running'), { status: 409 });
+    },
+  });
+  try {
+    const strip = stripOf(t);
+    byClass(strip, 'ic-wgstrip__end').fire('click');
+    byClass(strip, 'ic-wgstrip__confirm').fire('click');
+    await flush(8);
+    assert.ok(!isHidden(strip));
+    assert.equal(
+      textOf(byClass(strip, 'ic-wgstrip__status')),
+      "Couldn't end the wargame: no wargame is running.",
+    );
+    const ev = t.win.key({ key: 'Escape', target: t.doc.body });
+    assert.ok(ev.defaultPrevented, 'the shell used Esc');
+    assert.ok(isHidden(byClass(strip, 'ic-wgstrip__pop')));
+  } finally {
+    t.restore();
+  }
+});
+
+const CKEY = 'k3Y_abcdefghijklmnopqrstuvwxyz012';
+
+test('boot claims the console key once: 200 lands in sessionStorage, the chat client gets the holder', async () => {
+  const t = await mountWg({
+    claim: async () => ({ console_key: CKEY }),
+    session: {},
+  });
+  try {
+    assert.equal(t.log.claims, 1);
+    assert.equal(t.storage.data['godseye.consoleKey'], CKEY);
+    const holder = t.handle.ctx.consoleKey;
+    assert.equal(holder.canApprove(), true);
+    assert.deepEqual(holder.headers(), { 'X-Godseye-Console': CKEY });
+    // The client reads the key through the holder (a getter), knows a
+    // refused claim, and asks the holder to re-claim on a 422.
+    assert.equal(typeof t.log.chatArgs.consoleKey, 'function');
+    assert.equal(t.log.chatArgs.consoleKey(), CKEY);
+    assert.equal(t.log.chatArgs.consoleRefused(), false);
+    assert.equal(typeof t.log.chatArgs.onConsoleRejected, 'function');
+    // The key itself is never in ctx.config, the DOM or an announcement.
+    assert.doesNotMatch(JSON.stringify(t.handle.ctx.config), new RegExp(CKEY));
+    assert.doesNotMatch(textOf(t.el.root), new RegExp(CKEY));
+    assert.equal(byClass(t.el.root, 'ic-banner'), null, 'no banner');
+  } finally {
+    t.restore();
+  }
+});
+
+test('a key this tab already holds is reused on reload: no claim', async () => {
+  const t = await mountWg({
+    claim: async () => ({ console_key: 'someone_else_0123456789abcdef' }),
+    session: { 'godseye.consoleKey': CKEY },
+  });
+  try {
+    assert.equal(t.log.claims, 0);
+    assert.equal(t.handle.ctx.consoleKey.key(), CKEY);
+  } finally {
+    t.restore();
+  }
+});
+
+test('409: a persistent warn banner, Deny-only for slips, and the bus hears the state', async () => {
+  const states = [];
+  const t = await mountWg({
+    claim: async () => {
+      throw Object.assign(
+        new Error('another client already claimed engagement approvals'),
+        {
+          status: 409,
+          code: 'console_already_claimed',
+        },
+      );
+    },
+    session: {},
+  });
+  t.bus.on('console:key', (p) => states.push(p));
+  try {
+    const banner = find(
+      t.el.stageBanner,
+      (el) => el.attrs?.['data-kind'] === 'console-key',
+    );
+    assert.ok(banner, 'the banner is on the stage');
+    assert.equal(banner.attrs['data-tone'], 'warn');
+    assert.equal(banner.attrs.role, 'status');
+    assert.equal(
+      textOf(banner).replace(/^warning /, ''),
+      'Another client claimed engagement approvals; restart to re-arm',
+    );
+    assert.ok(!isHidden(t.el.stageBanner));
+    assert.equal(
+      t.handle.ctx.consoleKey.denyOnlyLine(),
+      "This console can't approve engagements: another client claimed them.",
+    );
+    // The chat client knows the claim was refused (its slips say so).
+    assert.equal(t.log.chatArgs.consoleRefused(), true);
+    assert.equal(t.log.chatArgs.consoleKey(), null);
+    assert.equal(t.storage.data['godseye.consoleKey'], undefined);
+    // It persists across polls and a session start, and is never re-claimed.
+    t.api.graph = wargameGraph();
+    await t.clock.advance(60_000);
+    assert.equal(t.log.claims, 1);
+    assert.ok(
+      find(t.el.stageBanner, (el) => el.attrs?.['data-kind'] === 'console-key'),
+    );
+    t.bus.emit('console:key', { state: 'probe' });
+    assert.ok(states.every((s) => !JSON.stringify(s).includes(CKEY)));
+  } finally {
+    t.restore();
+  }
+});
+
+test('an unanswered claim retries on the CLAIM_RETRY_MS schedule, then holds', async () => {
+  let n = 0;
+  const t = await mountWg({
+    claim: async () => {
+      n += 1;
+      if (n < 3) throw new Error('offline');
+      return { console_key: CKEY };
+    },
+    session: {},
+  });
+  try {
+    assert.equal(t.log.claims, 1);
+    assert.equal(t.handle.ctx.consoleKey.state, 'failed');
+    await t.clock.advance(CLAIM_RETRY_MS[0]);
+    assert.equal(t.log.claims, 2);
+    await t.clock.advance(CLAIM_RETRY_MS[1]);
+    assert.equal(t.log.claims, 3);
+    assert.equal(t.handle.ctx.consoleKey.state, 'held');
+    await t.clock.advance(120_000);
+    assert.equal(t.log.claims, 3, 'no claim once held');
+    assert.equal(byClass(t.el.root, 'ic-banner'), null);
+  } finally {
+    t.restore();
+  }
+});
+
+test('tracking during a session insets the map by the strip, and stops when it ends', async () => {
+  const port = trackingPort();
+  const insets = [];
+  port.setViewportInset = (i) => insets.push(i);
+  const quiet = graphWith([], {
+    meta: { wargame: { active: false, last: null }, counts: { track: 0 } },
+  });
+  const t = await mountWg({ port, graph: wargameGraph() });
+  try {
+    t.handle.setMode('tracking', { vehicle: 'Drone1', source: 'operator' });
+    await flush(8);
+    await t.clock.advance(400); // the iris and the fade
+    assert.equal(t.handle.ctx.mode.state, 'tracking');
+    assert.equal(insets.at(-1).top, 28);
+    assert.equal(insets.at(-1).right > 0, true);
+    t.api.graph = quiet;
+    await t.clock.advance(2000);
+    assert.equal(t.el.root.attrs['data-wargame'], undefined);
+    assert.equal(insets.at(-1).top, undefined, 'no top inset in ISR mode');
+  } finally {
+    t.restore();
+  }
+});
+
+const AAR_ID = 'rpt:aar-WG-1a2b3c';
+const AAR_ENTITY = {
+  id: AAR_ID,
+  type: 'report',
+  attrs: { format: 'AAR' },
+  fields: {
+    report_type: 'AAR',
+    markdown:
+      '# After-action review (simulated)\n\n## Summary\n\nSession WG-1a2b3c. <img src=x onerror=alert(1)>',
+  },
+};
+
+test('Read in full opens the AAR in the stage (data-view="read"); Esc returns to the orb and the inspector', async () => {
+  const t = await mountWg({ entities: { [AAR_ID]: AAR_ENTITY } });
+  try {
+    t.log.inspector.show(AAR_ID);
+    t.bus.emit('inspect', { id: AAR_ID });
+    t.bus.emit('read:request', { id: AAR_ID });
+    await flush(8);
+    const read = byClass(t.el.root, 'ic-read');
+    assert.ok(read);
+    assert.equal(read.attrs['data-view'], 'read');
+    assert.ok(!isHidden(read));
+    assert.ok(!isHidden(t.el.readHost));
+    assert.ok(isHidden(t.el.orbWrap), 'the orb gives way');
+    assert.equal(t.el.stage.attrs['data-view'], 'read');
+    assert.equal(t.el.viewOrb.attrs['aria-pressed'], 'false');
+    assert.equal(t.doc.activeElement, read);
+    assert.equal(
+      textOf(byClass(read, 'ic-read__title')),
+      'After-action review (simulated)',
+    );
+    // Markdown only, as text: the fixture's tag is words, not an element.
+    assert.equal(
+      find(read, (el) => el.tag === 'img'),
+      null,
+    );
+    assert.match(textOf(read), /<img src=x onerror=alert\(1\)>/);
+    assert.ok(
+      t.log.calls.some((c) => c[0] === 'inspector.hide'),
+      'the inspector steps aside',
+    );
+    const ev = t.win.key({ key: 'Escape', target: t.doc.body });
+    assert.ok(ev.defaultPrevented);
+    assert.ok(isHidden(t.el.readHost));
+    assert.ok(!isHidden(t.el.orbWrap));
+    assert.equal(t.el.stage.attrs['data-view'], undefined);
+    assert.equal(t.el.viewOrb.attrs['aria-pressed'], 'true');
+    assert.equal(t.log.inspector.current(), AAR_ID, 'the report is back');
+  } finally {
+    t.restore();
+  }
+});
+
+test('the read view: Markdown in hand opens at once; List leaves it; nothing to read is said', async () => {
+  const t = await mountWg();
+  try {
+    assert.equal(typeof t.handle.ctx.openRead, 'function');
+    t.handle.ctx.openRead({ id: 'rpt:x', markdown: 'Some *text*.', aar: true });
+    await flush();
+    assert.ok(!isHidden(t.el.readHost));
+    t.el.viewList.fire('click');
+    assert.ok(isHidden(t.el.readHost), 'List closes the read view');
+    assert.ok(!isHidden(t.el.listHost));
+    assert.equal(t.el.stage.attrs['data-view'], undefined);
+    // An id the picture doesn't have.
+    t.bus.emit('read:request', { id: 'rpt:missing' });
+    await flush(8);
+    assert.ok(isHidden(t.el.readHost));
+    assert.equal(
+      textOf(t.el.livePolite),
+      "Couldn't open the report: not in the picture.",
+    );
+    // A report with no Markdown.
+    t.bus.emit('read:request', { id: 'rpt:x', entity: { fields: {} } });
+    await flush(8);
+    assert.equal(
+      textOf(t.el.livePolite),
+      'This report has no text to read in full.',
+    );
+  } finally {
+    t.restore();
+  }
+});
+
+test('wargame CSS: the tokens, a strip row above everything, a frame that never takes input', () => {
+  const css = readFileSync(new URL('./console.css', import.meta.url), 'utf8');
+  for (const token of [
+    '--ic-sand-slip: #5a4812;',
+    '--ic-strip: #30383b;',
+    '--ic-t-arm-engage: 1600ms;',
+    '--ic-strip-h: 28px;',
+  ])
+    assert.ok(css.includes(token), `${token} is defined`);
+  // The arming delay is a safety feature: reduced motion never shortens it.
+  const reduced = css.slice(css.indexOf('@media (prefers-reduced-motion'));
+  assert.doesNotMatch(reduced.slice(0, 600), /--ic-t-arm-engage/);
+  assert.match(
+    css,
+    /grid-template-areas:\s*'strip strip'\s*'top top'\s*'main analyst';/,
+  );
+  assert.match(css, /grid-template-areas:\s*'strip'\s*'top'\s*'main';/);
+  assert.match(
+    css,
+    /\.ic-wgstrip \{\s*grid-area: strip;[^}]*height: var\(--ic-strip-h\);/,
+  );
+  assert.match(
+    css,
+    /\.ic-root\[data-wargame='on'\]::after \{[^}]*border: 2px solid var\(--ic-sand\);[^}]*pointer-events: none;/,
+  );
+  // Overlays at the root's top edge start under the strip.
+  for (const cls of ['ic-mapbanner', 'ic-backfloat', 'ic-skips', 'ic-settings'])
+    assert.match(
+      css,
+      new RegExp(
+        `:where\\(\\.ic-root\\[data-wargame='on'\\]\\) \\.${cls} \\{[^}]*var\\(--ic-strip-h\\)`,
+      ),
+    );
+});
+
+test('the wargame view reaches the orb, the List view and the map overlay; read:open and view:request are wired (B17)', async () => {
+  const truths = [];
+  const port = {
+    whenReady: async () => {},
+    enter: async () => false,
+    exit: () => {},
+    isTracking: () => false,
+    onChange: () => () => {},
+    setMapVisible: () => {},
+    setViewportInset: () => {},
+    setOverlayTruth: (on) => truths.push(on),
+  };
+  const t = await mountWg({ graph: wargameGraph(), port });
+  try {
+    await t.clock.advance(0);
+    await flush(4);
+    const views = () =>
+      t.log.calls.filter((c) => c[0] === 'orb.setView').map((c) => c[1]);
+    assert.deepEqual(views().at(-1), { umpire: true });
+    assert.equal(truths.at(-1), true, 'Umpire view asks the map for truth');
+    t.store.setView('blue');
+    await flush(4);
+    assert.deepEqual(views().at(-1), { umpire: false });
+    assert.equal(truths.at(-1), false, 'Blue view: no truth on the map');
+    // The List view, made lazily, starts in the view in force.
+    t.bus.emit('view:request', { view: 'list', source: 'situation' });
+    assert.ok(!isHidden(t.el.listHost));
+    assert.deepEqual(
+      t.log.calls.filter((c) => c[0] === 'list.setView').at(-1)[1],
+      { umpire: false },
+    );
+    // The inspector's Read in full on an after-action review.
+    t.bus.emit('read:open', {
+      id: 'rpt:aar-WG-1a2b3c',
+      title: 'After-action review (simulated)',
+      markdown: '# After-action review (simulated)',
+    });
+    await flush(8);
+    assert.ok(!isHidden(t.el.readHost));
   } finally {
     t.restore();
   }

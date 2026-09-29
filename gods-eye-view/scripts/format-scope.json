@@ -793,5 +793,16 @@
   "src/console/settings/client.test.mjs",
   "src/console/settings/model.test.mjs",
   "src/console/settings/view.test.mjs",
-  "src/console/settings/settings.css"
+  "src/console/settings/settings.css",
+  "src/console/orb/wargameStyles.test.mjs",
+  "src/console/orb/wargameText.test.mjs",
+  "src/console/orb/wargameEdges.test.mjs",
+  "src/console/orb/wargameOrb.test.mjs",
+  "src/console/chat/validateEngagement.test.mjs",
+  "src/console/chat/slipEngagement.test.mjs",
+  "src/console/chat/umpire.test.mjs",
+  "src/console/wargameStrip.test.mjs",
+  "src/console/readView.test.mjs",
+  "src/console/railWargame.test.mjs",
+  "src/console/inspectorWargame.test.mjs"
 ]

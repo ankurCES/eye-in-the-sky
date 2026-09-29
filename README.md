@@ -12,9 +12,11 @@ that needs no GPU), the MCP server that is the only command path, the telemetry 
 graph, the analyst and the console UI. It can run in a native window, in your browser, headless, or
 as a packaged macOS app.
 
-**ISR-only.** There are no kinetic tools anywhere in the system, and none may be added. It observes,
-classifies and reports. Threat output is sensor-posture advice only; command authority stays with
-the operator.
+**ISR by default.** In its default mode the system observes, classifies and reports, and no kinetic
+tools exist. An opt-in simulated wargame mode (M14a) adjudicates notional engagements between
+simulated scenario units only; real places are context, never targets, and every engagement needs
+the operator's approval in the console. Threat output in ISR mode is sensor-posture advice only;
+command authority stays with the operator.
 
 ## Contents
 

@@ -324,11 +324,11 @@ test('an unknown site category draws the "other" pin', () => {
 });
 
 test('fail-safe: an unknown node type is lilac "unrecognised", never green (WG §4.2.1)', () => {
-  assert.ok(NODE_TYPES.includes('site') && NODE_TYPES.length === 11);
+  assert.ok(NODE_TYPES.includes('site') && NODE_TYPES.length === 14);
   for (const type of [
-    'force',
-    'engagement',
-    'vector',
+    'force_red',
+    'engagement_band',
+    'strike_package',
     'mystery',
     '',
     '__proto__',
@@ -365,9 +365,13 @@ test('fail-safe: an unknown node type is lilac "unrecognised", never green (WG �
       assert.equal(style.slash, false);
     }
   }
-  const svg = glyphSvg('force', { status: 'ok' });
+  const svg = glyphSvg('strike_package', { status: 'ok' });
   assert.ok(svg.includes(UNRECOGNISED_GLYPH) && svg.includes(COLORS.unknown));
   assert.ok(!svg.includes(COLORS.ok));
+  // A force without scenario provenance is not framed: it keeps the "?"
+  // (WG §5.3.4; wargameStyles.test.mjs covers the frames).
+  const bare = glyphSvg('force', { status: 'ok' });
+  assert.ok(bare.includes(UNRECOGNISED_GLYPH) && !bare.includes(COLORS.ok));
 });
 
 test('sites are Pencil outlines whatever their status (context, never status-coloured)', () => {

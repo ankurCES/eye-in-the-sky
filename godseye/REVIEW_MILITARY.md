@@ -1,3 +1,5 @@
+> Historical document. The ISR-only rule is amended by PLAN.md §4.5a (M14a).
+
 # MILITARY ISR REVIEW — godseye PLAN_DRAFT v0.1
 **Reviewer:** UAS/ISR operations planner (ret.) — doctrine check only, no repo exploration.
 **Verdict:** Architecture is sound (one command path, server-enforced safety, ground-truth detections). Doctrine is amateur hour in three places: grid spacing, orbit geometry, threat assessment. Fix before Phase 3, or the sim teaches the agent bad habits you'll never untrain.

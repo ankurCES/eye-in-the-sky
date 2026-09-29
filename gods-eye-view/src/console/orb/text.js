@@ -8,9 +8,25 @@
  * Fail-safe (WG spec §4.2.1): a type the console does not know reads
  * "Unrecognised" ("Unrecognised (force)" in List view), its status is not
  * read at all, and its label is shown verbatim as text, bidi-safe.
+ *
+ * The simulated wargame (§5.3.4–§5.3.6): the node-level words here (label,
+ * subtitle, status word, register, accessible name) know `force`,
+ * `engagement` and `vector` and take them from wargameText.js. The
+ * type-only words (`typeWord`, `typeLabel`) are shared with surfaces that
+ * have not opted in yet, so they know the wargame types only with
+ * `{wargame: true}`.
  */
 
 import { isKnownType } from './glyphs.js';
+import { isWargameType } from './wargameStyles.js';
+import {
+  WARGAME_TYPE_WORDS,
+  wargameNodeLabel,
+  wargameNodeSubtitle,
+  wargameOptionText,
+  wargameRegister,
+  wargameStatusWord,
+} from './wargameText.js';
 import {
   SITE_REGISTER,
   SITE_STATUS_TEXT,
@@ -34,6 +50,7 @@ export const TYPE_WORDS = Object.freeze({
   report: 'Report',
   alarm: 'Alarm',
   site: 'Site',
+  ...WARGAME_TYPE_WORDS,
 });
 
 /** The type word for a type the console does not know. */
@@ -52,8 +69,12 @@ const PHASE_WORDS = Object.freeze({
 
 const CONTACT_TYPES = new Set(['track', 'unit']);
 
-export function typeWord(type) {
-  return isKnownType(type) ? TYPE_WORDS[type] : UNRECOGNISED_WORD;
+/**
+ * The type word ("Contact"), or "Unrecognised". Wargame types count only
+ * with `{wargame: true}` (see isKnownType).
+ */
+export function typeWord(type, { wargame = false } = {}) {
+  return isKnownType(type, { wargame }) ? TYPE_WORDS[type] : UNRECOGNISED_WORD;
 }
 
 /** A type as untrusted text (≤ 40 characters, bidi-safe). */
@@ -61,9 +82,12 @@ function typeText(type) {
   return safeText(type, 40) || 'no type';
 }
 
-/** List view's type cell: "Contact", or "Unrecognised (force)". */
-export function typeLabel(type) {
-  return isKnownType(type)
+/**
+ * A type cell: "Contact", or "Unrecognised (force)" where the surface has
+ * not opted in to the wargame; with `{wargame: true}`, "Force".
+ */
+export function typeLabel(type, { wargame = false } = {}) {
+  return isKnownType(type, { wargame })
     ? TYPE_WORDS[type]
     : `${UNRECOGNISED_WORD} (${typeText(type)})`;
 }
@@ -217,6 +241,7 @@ export function cleanSubtitle(text) {
  * bidi controls and control characters are removed (§3.11).
  */
 export function nodeLabel(node) {
+  if (isWargameType(node?.type)) return wargameNodeLabel(node);
   if (node?.type === 'feed') return feedLabel(node);
   if (node?.type === 'site') return siteLabel(node);
   const alarm = alarmNodeLabel(node);
@@ -240,6 +265,7 @@ export function alarmNodeLabel(node) {
  * @param {{downSince?: number|null}} [options]
  */
 export function nodeSubtitle(node, options = {}) {
+  if (isWargameType(node?.type)) return wargameNodeSubtitle(node);
   if (node?.type === 'feed') return feedState(node, options);
   if (node?.type === 'site') return siteSubtitle(node);
   if (!isKnownType(node?.type)) {
@@ -255,14 +281,18 @@ export function nodeSubtitle(node, options = {}) {
  * tells entities apart is kept instead of the head the ellipsis would keep:
  * "medium-range SAM battery (SA-6/2K12 class)" -> "SA-6/2K12 class" or
  * "SA-6/2K12"; "command post / C2 node" -> "C2 node" when that fits; a unit's
- * "3 x …" count stays in front. Anything else is returned whole (CSS ends it
- * with "…").
+ * "3 x …" count stays in front. A simulated engagement ("Simulated strike on
+ * Towed anti-aircraft gun", WG §5.3.6) keeps what was engaged: "Strike on
+ * Towed anti-aircraft gun" (its subtitle still says "Simulated"). Anything
+ * else is returned whole (CSS ends it with "…").
  * @param {string} label the full node label
  * @param {(text:string)=>boolean} [fits] whether a text fits the gutter
  */
 export function marginTitle(label, fits = () => true) {
   const text = String(label ?? '').trim();
   if (!text || fits(text)) return text;
+  const engaged = /^Simulated (strike|shot|ground fire) on (.+)$/.exec(text);
+  if (engaged) return `${capitalize(engaged[1])} on ${engaged[2]}`;
   const count = /^(\d+ x )(.+)$/.exec(text);
   if (count) {
     const rest = marginTitle(count[2], (t) => fits(count[1] + t));
@@ -327,6 +357,7 @@ export function threatWord(node) {
 export function statusWord(node) {
   const type = node?.type;
   const status = node?.status;
+  if (isWargameType(type)) return wargameStatusWord(node);
   // Fail-safe: an unknown type's status is never read (§4.2.1).
   if (!isKnownType(type)) return 'Not assessed';
   if (type === 'site') return SITE_STATUS_TEXT;
@@ -373,6 +404,7 @@ export function statusWord(node) {
  */
 export function registerOf(node) {
   const attrs = node?.attrs || {};
+  if (isWargameType(node?.type)) return wargameRegister(node);
   if (!isKnownType(node?.type)) return 'Not assessed';
   if (node?.type === 'site') return SITE_REGISTER;
   if (CONTACT_TYPES.has(node?.type)) {
@@ -393,6 +425,7 @@ export function registerOf(node) {
  * "Contacts feed, feed, down since 14:00Z".
  */
 export function optionText(node, { isNew = false, downSince = null } = {}) {
+  if (isWargameType(node?.type)) return wargameOptionText(node, { isNew });
   const parts = [nodeLabel(node)];
   parts.push(typeLabel(node?.type).toLowerCase());
   const segments = splitSegments(nodeSubtitle(node, { downSince }));

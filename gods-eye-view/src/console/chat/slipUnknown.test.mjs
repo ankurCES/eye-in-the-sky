@@ -234,10 +234,13 @@ const approveEls = (root) =>
       /^approve/.test(el.attrs?.['data-action'] || ''),
   );
 
+// `engage` stands for any class this console doesn't know. (`engagement`
+// itself is a known, approvable class since Phase B: see
+// slipEngagement.test.mjs.)
 test('the reducer keeps the raw class word and maps it to "unknown"', () => {
-  const a = fold({ class: 'engagement', acknowledge_required: true });
+  const a = fold({ class: 'engage', acknowledge_required: true });
   assert.equal(a.klass, 'unknown');
-  assert.equal(a.rawClass, 'engagement');
+  assert.equal(a.rawClass, 'engage');
   assert.equal(a.acknowledgeRequired, true);
   assert.equal(fold({}).klass, 'unknown', 'a missing class is unknown too');
   assert.equal(fold({ class: 'sim' }).klass, 'sim');
@@ -245,7 +248,7 @@ test('the reducer keeps the raw class word and maps it to "unknown"', () => {
 
 test('an unknown class gives a Deny-only slip: no Approve element in the DOM, ever', async () => {
   for (const data of [
-    { class: 'engagement' },
+    { class: 'engage' },
     { class: 'zzz' },
     { class: '__proto__' },
     {},
@@ -283,7 +286,7 @@ test('an unknown class gives a Deny-only slip: no Approve element in the DOM, ev
 });
 
 test('the unknown slip shows the class phrase, the fixed line and the server text as text', () => {
-  const { slip } = mount(fold({ class: 'engagement' }));
+  const { slip } = mount(fold({ class: 'engage' }));
   const text = textOf(slip.el);
   assert.ok(text.includes('Unrecognised action'));
   assert.ok(text.includes('Execute a simulated engagement'));
@@ -300,12 +303,12 @@ test('the unknown slip shows the class phrase, the fixed line and the server tex
   assert.equal(hidden(line), false);
   assert.equal(
     textOf(line),
-    'This console doesn\'t recognise the approval class "engagement", so it can\'t show what this does or approve it. Update the app, or deny it.',
+    'This console doesn\'t recognise the approval class "engage", so it can\'t show what this does or approve it. Update the app, or deny it.',
   );
-  assert.equal(unknownLine('engagement'), textOf(line));
+  assert.equal(unknownLine('engage'), textOf(line));
   assert.equal(
-    unknownDenyNote('engagement'),
-    'The console can\'t approve the "engagement" class.',
+    unknownDenyNote('engage'),
+    'The console can\'t approve the "engage" class.',
   );
   // No undo or stop section is invented for an action nobody recognised.
   assert.ok(!text.includes('How to undo it'));
@@ -315,14 +318,14 @@ test('the unknown slip shows the class phrase, the fixed line and the server tex
 });
 
 test('keyboard and note paths on an unknown slip only ever deny', async () => {
-  const { slip, clock, decisions } = mount(fold({ class: 'engagement' }));
+  const { slip, clock, decisions } = mount(fold({ class: 'engage' }));
   clock.advance(ARM_MS);
   const deny = find(slip.el, (el) => el.attrs?.['data-action'] === 'deny');
   deny.fire('keydown', { key: 'Enter', repeat: false });
   await Promise.resolve();
   assert.equal(decisions.at(-1).decision, 'deny');
   // ⌘Enter in the note field denies with the typed note and the class note.
-  const { slip: s2, decisions: d2 } = mount(fold({ class: 'engagement' }));
+  const { slip: s2, decisions: d2 } = mount(fold({ class: 'engage' }));
   const note = find(s2.el, cls('ic-slip__note'));
   note.value = 'why?';
   note.fire('input');
@@ -330,7 +333,7 @@ test('keyboard and note paths on an unknown slip only ever deny', async () => {
   await Promise.resolve();
   assert.deepEqual(d2.at(-1), {
     decision: 'deny',
-    note: 'The console can\'t approve the "engagement" class. why?',
+    note: 'The console can\'t approve the "engage" class. why?',
   });
   clock.advance(DBLCLICK_MS);
   assert.equal(
@@ -378,13 +381,13 @@ test('XSS and bidi fixtures in an unknown slip render as text (§3.11)', () => {
 
 test('a filed unknown slip reads like any other record', () => {
   const a = {
-    ...fold({ class: 'engagement' }),
+    ...fold({ class: 'engage' }),
     state: 'denied',
     resolvedAt: T0 + 60_000,
-    note: 'The console can\'t approve the "engagement" class.',
+    note: 'The console can\'t approve the "engage" class.',
   };
   assert.equal(
     filedText(a),
-    'Denied by you at 14:03:51Z. Your note: “The console can\'t approve the "engagement" class.”',
+    'Denied by you at 14:03:51Z. Your note: “The console can\'t approve the "engage" class.”',
   );
 });

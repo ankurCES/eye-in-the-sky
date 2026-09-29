@@ -23,6 +23,17 @@
  * `countdown` is true only for an analyst request that passed the UX §6.9
  * gate; an operator's Show on map opens the map at once.
  *
+ * The simulated wargame (WG spec §5.3.7, §5.3.8; M14a):
+ * - an `approval_request` of class `engagement` carries its preview as
+ *   `data.engagement`; the view keeps it (live and replayed) and hands the
+ *   slip `approval.engagementPreview`, the console key state from
+ *   `chat.consoleAccess()` and the live outcome from the graph;
+ * - umpire rows (umpire.js) are appended from the intel graph, anchored
+ *   where they arrived, folded while a slip waits, and never scroll the
+ *   log then; a lost drone raises the critical loss banner;
+ * - bus 'approval:review' `{approvalId?, engagementId?}` scrolls to that
+ *   pending slip (the rail's Wargame "Review").
+ *
  * opts (tests): { doc, now, clock:{setTimeout, clearTimeout, setInterval,
  *   clearInterval}, raf, reducedMotion }
  */
@@ -59,7 +70,21 @@ import {
   providerHint,
   providerUnavailableCopy,
 } from '../settings/model.js';
-import { createSlip, grantPhrase, segmentNodes } from './slip.js';
+import { createSlip, grantPhrase, segmentNodes, slipTitle } from './slip.js';
+import {
+  ENGAGEMENT_PREVIEW_FIELD,
+  assessEngagement,
+  isEngagement,
+} from './validateEngagement.js';
+import { engagementOutcome } from './slipEngagement.js';
+import {
+  createUmpireLog,
+  groupUmpireRows,
+  isUmpireView,
+  lossBanners,
+  umpireGroupNode,
+  umpireRowNode,
+} from './umpire.js';
 import { chipRefs, renderDom } from './markdown.js';
 import { createChip, createTether, lookupNode, wireRoving } from './chips.js';
 import {
@@ -185,8 +210,35 @@ function nameOf(node) {
   return id.includes(':') ? id.slice(id.indexOf(':') + 1) : id || null;
 }
 
+/**
+ * Session prompts during a simulated wargame (WG spec §5.3.8); they replace
+ * the ISR ones. The strike prompt appears only when a scenario contact
+ * exists, and cites it by its generic label.
+ */
+export function wargamePrompts(graph) {
+  const contact = nodesOf(graph, 'track').find(
+    (t) => t.attrs?.scenario === true && typeof t.id === 'string',
+  );
+  const list = ['Generate a medium air-defence scenario here.'];
+  list.push('Recce the far half of the area and scan for contacts.');
+  if (contact) {
+    // Chip grammar: the label can't carry the chip's own delimiters.
+    const label = stripBidi(nameOf(contact) || 'contact').replace(
+      /[[\]|]/g,
+      '',
+    );
+    list.push(
+      `Plan a simulated strike on [[${contact.id}|${label}]] and show me the dry run.`,
+    );
+  }
+  list.push('Plan a low-exposure re-look of the last strike.');
+  list.push('End the wargame and show the after-action review.');
+  return list.slice(0, 5);
+}
+
 /** Suggested prompts, at most 5, exact text, chosen by state (spec §6.10). */
 export function suggestedPrompts(graph) {
+  if (graph?.meta?.wargame?.active === true) return wargamePrompts(graph);
   const vehicles = nodesOf(graph, 'vehicle');
   const pois = nodesOf(graph, 'poi');
   const tracks = nodesOf(graph, 'track');
@@ -648,6 +700,23 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
   // The theater epoch when each live approval arrived (WG spec §4.2.2): a
   // theater slip is blocked once the epoch moves on. Unknown on replay.
   const requestEpochs = new Map();
+  // Engagement previews by approval id (WG spec §3.6 `engagement`), kept
+  // here from the raw `approval_request` (live and replayed), and the
+  // wargame session id when each engagement request arrived live.
+  const engagementPreviews = new Map();
+  const requestSessions = new Map();
+  const withPreviewCache = new WeakMap();
+  // Umpire rows (WG spec §5.3.8): append-only, view-local, anchored to the
+  // transcript position where they arrived.
+  const umpireLog = createUmpireLog();
+  let umpireGrew = false;
+  // Wargame session dividers (WG spec §5.3.2), from the meta.wargame.active
+  // flip, anchored where it happened. The first graph seen is the baseline
+  // (a console opened mid-session doesn't replay the start).
+  const wargameMarks = [];
+  let wargameSeen;
+  let endedByOperator = null;
+  let transcriptState = null;
   const executed = new Set();
   const trackDecisions = new Map();
   const mapDecisions = new Map();
@@ -1386,7 +1455,30 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     return el;
   }
 
-  function slipModel(a, t) {
+  /** The approval with its engagement preview attached (same object when none). */
+  function withPreview(a) {
+    if (!a || !isEngagement(a)) return a;
+    const hit = withPreviewCache.get(a);
+    const preview = engagementPreviews.get(a.id) ?? null;
+    if (hit && hit[ENGAGEMENT_PREVIEW_FIELD] === preview) return hit;
+    const merged = { ...a, [ENGAGEMENT_PREVIEW_FIELD]: preview };
+    withPreviewCache.set(a, merged);
+    return merged;
+  }
+
+  /** Whether this console may approve engagements: `{held, refused}` or null. */
+  function consoleAccess() {
+    try {
+      return typeof chat?.consoleAccess === 'function'
+        ? chat.consoleAccess()
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function slipModel(raw, t) {
+    const a = withPreview(raw);
     const vehicle = approvalVehicle(a);
     const pending = pendingApprovals(state);
     const index = pending.findIndex((p) => p.id === a.id);
@@ -1412,12 +1504,23 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
       caveats: assumedCaveats(graph),
       detections: a.klass === 'sensor' ? detectionsFeed(graph) : null,
       fleet: isPreviewTool(a.tool) ? fleetOf(graph) : null,
+      console: isEngagement(a) ? consoleAccess() : null,
+      outcome: isEngagement(a) ? engagementOutcome(a, graph) : null,
       now: t,
       reducedMotion: reduced(),
     };
   }
 
-  function assessApproval(a) {
+  function assessApproval(raw) {
+    const a = withPreview(raw);
+    if (isEngagement(a)) {
+      // Engagement slips (validateEngagement.js): blocked makes the slip
+      // Deny-only; stale offers Ask for a fresh plan first.
+      return assessEngagement(a, graphOf(store), {
+        approvedSince: approvedSince(state, a.at, a.id),
+        requestSession: requestSessions.get(a.id) ?? null,
+      });
+    }
     if (a.tool === 'sim_set_theater') {
       // Theater slips: the console's own refusals (validateTheater.js). A
       // change of state re-arms the slip; 'blocked' makes it Deny-only.
@@ -1450,7 +1553,9 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     let slip = slips.get(a.id);
     if (!slip) {
       slip = createSlip(model, {
-        decide: (decision, note) => decide(a.id, decision, note),
+        decide: (decision, note, opts) => decide(a.id, decision, note, opts),
+        consoleAccess: () =>
+          isEngagement(state.approvals[a.id]) ? consoleAccess() : null,
         revalidate: () => {
           const current = state.approvals[a.id];
           return current ? assessApproval(current) : null;
@@ -2002,6 +2107,158 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     });
   }
 
+  // ---- wargame dividers (WG spec §5.3.2) ----
+  /** Note a session starting or ending since the last graph (append-only). */
+  function observeWargame() {
+    const graph = graphOf(store);
+    if (!graph) return;
+    const wg = graph.meta?.wargame;
+    const active =
+      wg && typeof wg === 'object' && wg.active === true
+        ? String(wg.session_id ?? '') || 'session'
+        : null;
+    if (wargameSeen === undefined) {
+      wargameSeen = active;
+      return;
+    }
+    if (active === wargameSeen) return;
+    const anchor = state.items.length;
+    if (wargameSeen) {
+      const last = wg?.last && typeof wg.last === 'object' ? wg.last : null;
+      const mine =
+        endedByOperator && endedByOperator.session_id === wargameSeen
+          ? endedByOperator
+          : null;
+      const aarId =
+        mine?.aar_id ??
+        (last && (!last.session_id || last.session_id === wargameSeen)
+          ? last.aar_id
+          : null) ??
+        null;
+      wargameMarks.push({
+        key: `wg:end:${wargameSeen}`,
+        kind: 'end',
+        anchor,
+        byYou: Boolean(mine),
+        at: mine?.ended_at_ms ?? last?.ended_at_ms ?? now(),
+        aarId: typeof aarId === 'string' && aarId ? aarId : null,
+      });
+      if (mine) endedByOperator = null;
+    }
+    if (active) {
+      wargameMarks.push({
+        key: `wg:start:${active}`,
+        kind: 'start',
+        anchor,
+        at: Number.isFinite(wg.started_at_ms) ? wg.started_at_ms : now(),
+      });
+    }
+    wargameSeen = active;
+  }
+
+  /** One divider line: started, or ended with the after-action review chip. */
+  function wargameMarkEl(mark) {
+    const z = zulu(mark.at, { seconds: true }) || '';
+    const sig = JSON.stringify([mark.kind, z, mark.byYou, mark.aarId]);
+    return cached(mark.key, sig, () => {
+      if (mark.kind === 'start')
+        return h(
+          'p',
+          {
+            class: 'ic-divider',
+            role: 'separator',
+            'data-kind': 'wargame-start',
+          },
+          `Wargame started at ${z}. The analyst now works with wargame tools, and every engagement asks you first.`,
+        );
+      const kids = [
+        mark.byYou ? `Wargame ended by you at ${z}.` : `Wargame ended at ${z}.`,
+      ];
+      if (mark.aarId) {
+        const chip = createChip(
+          { id: `rpt:${mark.aarId}`, label: 'After-action review (simulated)' },
+          chipHooks(),
+        );
+        wireRoving([chip]);
+        kids.push(' After-action review: ', chip, '.');
+      }
+      return h(
+        'p',
+        { class: 'ic-divider', role: 'separator', 'data-kind': 'wargame-end' },
+        ...kids,
+      );
+    });
+  }
+
+  /** The wargame dividers at each transcript position. */
+  function wargameMarksByAnchor() {
+    const byAnchor = new Map();
+    for (const mark of wargameMarks) {
+      const list = byAnchor.get(mark.anchor) || [];
+      list.push(mark);
+      byAnchor.set(mark.anchor, list);
+    }
+    return byAnchor;
+  }
+
+  // ---- umpire rows (WG spec §5.3.8) ----
+  /** Append the umpire events of a new graph to the log (append-only). */
+  function observeUmpire() {
+    const graph = graphOf(store);
+    if (!graph) return;
+    const pending = pendingApprovals(state);
+    const added = umpireLog.observe(graph, {
+      now: now(),
+      anchor: state.items.length,
+      pendingId: pending.length ? pending[pending.length - 1].id : null,
+    });
+    if (added.length) umpireGrew = true;
+  }
+
+  /** The umpire rows at each transcript position. */
+  function umpireByAnchor() {
+    const byAnchor = new Map();
+    for (const row of umpireLog.rows) {
+      const list = byAnchor.get(row.anchor) || [];
+      list.push(row);
+      byAnchor.set(row.anchor, list);
+    }
+    return byAnchor;
+  }
+
+  /** Elements for the umpire rows at one position (grouped, cached). */
+  function umpireEls(rows) {
+    if (!rows?.length) return [];
+    const umpire = isUmpireView(graphOf(store));
+    // Rows that arrived while a slip was waiting stay folded until no
+    // slip waits any more.
+    const waiting = pendingApprovals(state).length > 0;
+    const groups = groupUmpireRows(rows, { isPending: () => waiting });
+    return groups.map((g) => {
+      const key = `ump:${g.key}`;
+      const open = g.kind !== 'row' && expanded.has(key);
+      const sig = JSON.stringify([
+        g.kind,
+        g.rows.map((r) => r.key),
+        open,
+        umpire,
+      ]);
+      return cached(key, sig, () =>
+        g.kind === 'row'
+          ? umpireRowNode(g.rows[0], { umpire })
+          : umpireGroupNode(g, {
+              umpire,
+              open,
+              onToggle: () => {
+                if (expanded.has(key)) expanded.delete(key);
+                else expanded.add(key);
+                schedule();
+              },
+            }),
+      );
+    });
+  }
+
   function renderTranscript(t) {
     // Measure BEFORE any child updates: a slip collapsing or streamed text
     // growing in place (both happen while `els` is built) would otherwise read
@@ -2014,7 +2271,14 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
       ? logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 32
       : false;
     const els = [];
+    const umpireAt = umpireByAnchor();
+    const marksAt = wargameMarksByAnchor();
     state.items.forEach((item, index) => {
+      // Session dividers and umpire rows that arrived before this item
+      // existed come before it.
+      for (const mark of marksAt.get(index) || [])
+        els.push(wargameMarkEl(mark));
+      els.push(...umpireEls(umpireAt.get(index)));
       if (item.kind === 'turn') {
         const turn = state.turns[item.id];
         if (!turn) return;
@@ -2037,6 +2301,13 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
         if (row) els.push(toolRow(row, t));
       } else if (item.kind === 'divider') els.push(dividerLine(item, index));
     });
+    const tail = new Set([...marksAt.keys(), ...umpireAt.keys()]);
+    for (const anchor of [...tail].sort((a, b) => a - b)) {
+      if (anchor < state.items.length) continue;
+      for (const mark of marksAt.get(anchor) || [])
+        els.push(wargameMarkEl(mark));
+      els.push(...umpireEls(umpireAt.get(anchor)));
+    }
     if (state.outbox && state.outbox.status !== 'done')
       els.push(outboxArticle());
     const empty = !els.length;
@@ -2045,9 +2316,19 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     // The empty state reads from its heading down; a transcript follows its
     // newest line while the operator is at the bottom.
     const reveal = revealLatest || revealUntilFiled.size > 0;
+    // Umpire rows never scroll the log while a slip waits (§5.3.8): the
+    // operator is reading the slip, and a moved slip re-arms.
+    const quiet =
+      umpireGrew &&
+      !reveal &&
+      state === transcriptState &&
+      pendingApprovals(state).length > 0;
+    umpireGrew = false;
+    transcriptState = state;
     if (empty) {
       if (!logEl.__icEmpty) logEl.scrollTop = 0;
-    } else if (atBottom || reveal) logEl.scrollTop = logEl.scrollHeight;
+    } else if ((atBottom && !quiet) || reveal)
+      logEl.scrollTop = logEl.scrollHeight;
     if (!empty) {
       revealLatest = false;
       for (const id of [...revealUntilFiled]) {
@@ -2121,11 +2402,28 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
         ),
       );
     }
+    // Simulated losses (WG spec §5.3.8): UI-only, not an alarm kind.
+    const losses = lossBanners(graphOf(store));
+    for (const loss of losses) {
+      kids.push(
+        h(
+          'p',
+          {
+            class: 'ic-chat__banner ic-chat__loss',
+            'data-tone': 'critical',
+            role: 'alert',
+          },
+          icon(ICON.warning),
+          loss.text,
+        ),
+      );
+    }
     const sig = JSON.stringify([
       serviceDown,
       state.connection.reconnecting,
       state.notice,
       rl,
+      losses.map((l) => l.text),
     ]);
     if (bannerEl.__icSig !== sig) {
       bannerEl.__icSig = sig;
@@ -2139,7 +2437,7 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     if (!pending.length) return;
     const oldest = pending[0];
     const v = approvalVehicle(oldest);
-    const what = `${oldest.title}${v ? `, ${v}` : ''}`;
+    const what = `${slipTitle(withPreview(oldest))}${v ? `, ${v}` : ''}`;
     setText(
       approvalText,
       pending.length === 1
@@ -2365,7 +2663,7 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
         oldest: oldest
           ? {
               id: oldest.id,
-              title: stripBidi(oldest.title),
+              title: stripBidi(slipTitle(withPreview(oldest))),
               vehicle: approvalVehicle(oldest),
               klass: oldest.klass,
             }
@@ -2397,6 +2695,8 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
   function render() {
     if (destroyed) return;
     const t = now();
+    observeWargame();
+    observeUmpire();
     renderHeader(t);
     renderBanners(t);
     renderTranscript(t);
@@ -2409,11 +2709,14 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
   }
 
   // ---- actions ----
-  async function decide(id, decision, note) {
+  async function decide(id, decision, note, opts = {}) {
     revealUntilFiled.add(id);
     dispatch({ type: 'decision', id, decision, note, at: now() });
     try {
-      await chat.approve(id, decision, note);
+      // `acknowledged` rides only on an approval the slip saw ticked.
+      if (opts?.acknowledged === true)
+        await chat.approve(id, decision, note, { acknowledged: true });
+      else await chat.approve(id, decision, note);
       dispatch({ type: 'decision_ok', id });
     } catch (error) {
       revealUntilFiled.delete(id);
@@ -2741,6 +3044,20 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
     if (!ev) return;
     const { name, data, seq, at, replay } = ev;
     const before = state;
+    // The engagement preview rides on the raw event (WG spec §3.6); keep
+    // it before the reducer runs, so the slip's first render already has
+    // it. First one wins, like the reducer's duplicate handling.
+    if (name === 'approval_request' && data?.approval_id != null) {
+      const aid = String(data.approval_id);
+      const p = data.engagement;
+      if (
+        !engagementPreviews.has(aid) &&
+        p &&
+        typeof p === 'object' &&
+        !Array.isArray(p)
+      )
+        engagementPreviews.set(aid, p);
+    }
     dispatch({ type: 'event', name, data, seq, at, replay });
     if (state === before) return; // duplicate or ignored
     if (name === 'session' && data?.session_id && state.lastSeq === 0)
@@ -2760,9 +3077,15 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
         befores.set(a.id, vehicleNow(approvalVehicle(a)));
         const epoch = graphOf(store)?.theater?.epoch;
         if (Number.isFinite(epoch)) requestEpochs.set(a.id, epoch);
-        announce(`Approval needed: ${a.title}. ${classMeta(a.klass).phrase}.`, {
-          assertive: true,
-        });
+        const wgSession = graphOf(store)?.meta?.wargame?.session_id;
+        if (isEngagement(a) && typeof wgSession === 'string' && wgSession)
+          requestSessions.set(a.id, wgSession);
+        // An engagement names its target: "Approval needed: Simulated
+        // strike on {target}. Simulates an engagement." (§5.3.7)
+        announce(
+          `Approval needed: ${slipTitle(withPreview(a))}. ${classMeta(a.klass).phrase}.`,
+          { assertive: true },
+        );
       }
     } else if (name === 'tool_result') {
       const row = state.rows[data.call_id];
@@ -2946,6 +3269,40 @@ export function createAnalyst(host, ctx = {}, opts = {}) {
         if (payload?.mode) currentMode = payload.mode;
       }),
     );
+    // The rail's Wargame "Review" (WG spec §5.3.10): scroll to the slip of
+    // a pending engagement, by approval id or by the `eng:` node id.
+    unsubs.push(
+      bus.on('approval:review', (payload) => {
+        // The rail sends `{id: 'eng:…', approval_id}`; others may send
+        // `{approvalId, engagementId}`.
+        const approvalId = payload?.approvalId ?? payload?.approval_id ?? null;
+        const wanted = String(
+          payload?.engagementId ?? payload?.id ?? '',
+        ).replace(/^eng:/, '');
+        const target = pendingApprovals(state).find(
+          (a) =>
+            (approvalId && a.id === approvalId) ||
+            (wanted && engagementPreviews.get(a.id)?.id === wanted),
+        );
+        slips.get(target?.id)?.review();
+      }),
+    );
+    // The operator's End wargame (the strip): the divider says "by you".
+    unsubs.push(
+      bus.on('wargame:ended', (payload) => {
+        if (payload?.by === 'operator' && payload.session_id)
+          endedByOperator = {
+            session_id: String(payload.session_id),
+            aar_id: payload.aar_id ?? null,
+            ended_at_ms: Number.isFinite(payload.ended_at_ms)
+              ? payload.ended_at_ms
+              : null,
+          };
+        schedule();
+      }),
+    );
+    // The console key's state moved: engagement slips re-check Deny-only.
+    unsubs.push(bus.on('console:key', () => schedule()));
   }
 
   render();

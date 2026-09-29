@@ -26,7 +26,9 @@ directory (absolute; a Finder launch runs with cwd ``/``). The theater is
 ``--theater``, else the one persisted in the store, else the default (WG
 §4.1.4). Map data (``--geodata``: geocoding and mapped sites for new
 theaters) is on; the safety loop's hydration (``--real-data``) stays off
-unless asked for. For external
+unless asked for. ISR is the default (M14a): ``--wargame-mcp`` also puts the
+simulated wargame's ``wg_*`` tools on ``/mcp``; engagements are approved only
+in the console, with the key it claims once per launch. For external
 harnesses, the MCP URL and token are written to ``<store>/../mcp.json``
 (mode 0600). A frozen app launched from Finder has nowhere to print, so its
 output goes to ``<store>/../logs/eye-in-the-sky.log`` (mode 0600).
@@ -72,6 +74,11 @@ SELFTEST_TIMEOUT_S = 60.0
 SELFTEST_PAGE_CHECKS = ("console_mounted", "webgl2", "app_config", "intel_graph")
 SELFTEST_CHECKS = (*SELFTEST_PAGE_CHECKS, "package_data")
 SELFTEST_POLL_S = 0.25
+#: The analyst's system prompt: the base, the ISR identity (the default) and
+#: the simulated wargame addendum (M14a, WG v2 §5.2.11). A frozen build that
+#: drops any of them fails ``package_data``.
+ANALYST_PROMPT_FILES = ("analyst_prompt.md", "analyst_prompt_isr.md",
+                        "analyst_prompt_wargame.md")
 APP_NAME = "eye-in-the-sky"
 LOG_NAME = "eye-in-the-sky.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -262,6 +269,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--airframe", default=None, choices=sorted(safety.AIRFRAMES),
                     help="airframe profile (default: the restored theater's, else "
                          f"$GODSEYE_AIRFRAME, else {safety.DEFAULT_AIRFRAME_ID})")
+    ap.add_argument("--wargame-mcp", action="store_true",
+                    help="also publish the simulated wargame's wg_* tools on /mcp for "
+                         "external harnesses (M14a; off by default: ISR only). "
+                         "Engagements are still approved in the console only")
     ap.add_argument("--port", type=int, default=None,
                     help=f"app port (default {DEFAULT_PORT}; UI, bridge and MCP share it)")
     ap.add_argument("--mcp-port", type=int, default=None,
@@ -587,7 +598,8 @@ def selftest_package_facts(host) -> dict:
     from . import geo
 
     try:
-        prompt = files("godseye_uav").joinpath("analyst_prompt.md").is_file()
+        pkg = files("godseye_uav")
+        prompt = all(pkg.joinpath(name).is_file() for name in ANALYST_PROMPT_FILES)
     except Exception:  # noqa: BLE001 - reported as missing
         prompt = False
     source = geo.geoid_source()
@@ -777,6 +789,10 @@ def _describe(host, *, token_source: str, harness_file: Path | None) -> None:
     real = "on" if getattr(srv, "real", None) is not None else "off"
     _say(f"map data : {'on' if geodata else 'off'} (geocoding and mapped sites); "
          f"real-data hydration {real}")
+    if getattr(srv, "wargame_mcp_enabled", False):
+        # M14a: said only when on, so an ISR launch prints what it always did.
+        _say("wargame  : --wargame-mcp: simulated wg_* tools are also on /mcp; "
+             "engagements are still approved in the console only")
     chat = host.chat_summary()
     # The provider is named by its catalog label; its key is never printed.
     provider = chat.get("provider") if isinstance(chat.get("provider"), dict) else {}
@@ -800,7 +816,8 @@ def _config_from_args(args, token: str, *, llm_env: Mapping[str, str] | None = N
         chat=not args.no_chat, model=args.model, effort=args.effort,
         geodata=args.geodata == "on",
         real_data=None if args.real_data is None else REAL_DATA_MODES[args.real_data],
-        airframe=args.airframe, llm_env=dict(llm_env or {}))
+        airframe=args.airframe, llm_env=dict(llm_env or {}),
+        wargame_mcp=bool(getattr(args, "wargame_mcp", False)))
 
 
 def _build(cfg, *, port_explicit: bool, mode: str):

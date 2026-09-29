@@ -8,7 +8,12 @@
  *   open()                   restore the session id from sessionStorage (or
  *                            POST /chat/sessions) and follow its stream
  *   send(text, ctx?)         POST …/messages {text, context:{focused_ids}}
- *   approve(id, decision, note?)  POST …/approvals/{id}
+ *   approve(id, decision, note?, {acknowledged}?)  POST …/approvals/{id}
+ *                            with `acknowledged:true` (engagement approvals,
+ *                            WG spec §3.5) and the `X-Godseye-Console`
+ *                            header once this console holds its key
+ *   consoleAccess()          {held, refused}: whether this console may
+ *                            approve engagements (the key never leaves here)
  *   interrupt()              POST …/interrupt
  *   grants() / revokeGrant(tool)  GET / DELETE …/grants (null when absent)
  *   newSession()             DELETE the old session, start a fresh one
@@ -44,6 +49,10 @@ export const CHAT_EVENTS = Object.freeze([
 ]);
 
 export const SESSION_KEY = 'ic.chat.session';
+/** Where the shell keeps the engagement approval key (WG spec §3.5). */
+export const CONSOLE_KEY_STORAGE = 'godseye.consoleKey';
+/** The header an approval POST carries once the console holds its key. */
+export const CONSOLE_HEADER = 'X-Godseye-Console';
 const TIMES_PREFIX = 'ic.chat.times.';
 const TIMES_MAX = 500;
 const TIMES_SAVE_MS = 2000;
@@ -130,6 +139,18 @@ export function chatError(error) {
     return new ChatError('unknown_session', message, { status });
   if (status === 404)
     return new ChatError('not_found', message, { status, body });
+  if (status === 422 && body?.error === 'console_required')
+    return new ChatError(
+      'console_required',
+      "the server didn't accept this console's engagement key",
+      { status },
+    );
+  if (status === 422 && body?.error === 'acknowledgement_required')
+    return new ChatError(
+      'acknowledgement_required',
+      'the acknowledgement box must be ticked first',
+      { status },
+    );
   if (status === 422)
     return new ChatError('invalid', body?.message || message, { status });
   if (status != null) return new ChatError('http', message, { status });
@@ -145,10 +166,25 @@ function parseData(data) {
   }
 }
 
+/**
+ * @param {object} opts
+ * @param {object} opts.api the shared api (createApi)
+ * @param {object} [opts.storage] sessionStorage-like
+ * @param {() => number} [opts.now]
+ * @param {() => (string|null)} [opts.consoleKey] the engagement approval key
+ *   (B15a config.js); default: `storage[CONSOLE_KEY_STORAGE]`
+ * @param {() => boolean} [opts.consoleRefused] true once the claim got 409
+ *   (another client holds the key); default false
+ * @param {() => void} [opts.onConsoleRejected] called when an approval POST
+ *   answers 422 `console_required` (the host no longer accepts the key held)
+ */
 export function createChatClient({
   api,
   storage = defaultStorage(),
   now = () => Date.now(),
+  consoleKey = null,
+  consoleRefused = null,
+  onConsoleRejected = null,
 } = {}) {
   if (!api) throw new Error('createChatClient needs an api');
   const listeners = new Map();
@@ -209,6 +245,34 @@ export function createChatClient({
     const entries = [...times.entries()].slice(-TIMES_MAX);
     times = new Map(entries);
     write(storage, TIMES_PREFIX + sid, JSON.stringify(entries));
+  }
+
+  /** The engagement approval key, or null. Never logged, never emitted. */
+  function heldKey() {
+    let key = null;
+    try {
+      key =
+        typeof consoleKey === 'function'
+          ? consoleKey()
+          : read(storage, CONSOLE_KEY_STORAGE);
+    } catch {
+      key = null;
+    }
+    return typeof key === 'string' && key.trim() ? key.trim() : null;
+  }
+
+  /** Whether this console may approve engagements (WG spec §3.5). */
+  function consoleAccess() {
+    const held = heldKey() != null;
+    let refused = false;
+    if (!held && typeof consoleRefused === 'function') {
+      try {
+        refused = consoleRefused() === true;
+      } catch {
+        refused = false;
+      }
+    }
+    return { held, refused };
   }
 
   function path(suffix = '') {
@@ -407,7 +471,7 @@ export function createChatClient({
     }
   }
 
-  async function approve(approvalId, decision, note) {
+  async function approve(approvalId, decision, note, opts = {}) {
     if (!['approve', 'deny', 'approve_session'].includes(decision)) {
       throw new ChatError('invalid', `Unknown decision ${decision}`);
     }
@@ -415,13 +479,31 @@ export function createChatClient({
     const body = { decision };
     const text = typeof note === 'string' ? note.trim() : '';
     if (text) body.note = text.slice(0, 2000);
+    // Only an approval carries the acknowledgement; a deny never needs it.
+    if (opts?.acknowledged === true && decision !== 'deny')
+      body.acknowledged = true;
+    // The key goes on every approval POST once the console holds it.
+    const key = heldKey();
     try {
       return await api.post(
         path(`/approvals/${encodeURIComponent(approvalId)}`),
         body,
+        ...(key ? [{ headers: { [CONSOLE_HEADER]: key } }] : []),
       );
     } catch (error) {
-      throw chatError(error);
+      const err = chatError(error);
+      if (
+        err.code === 'console_required' &&
+        key &&
+        typeof onConsoleRejected === 'function'
+      ) {
+        try {
+          onConsoleRejected();
+        } catch (hookError) {
+          globalThis.console?.error?.(hookError);
+        }
+      }
+      throw err;
     }
   }
 
@@ -472,6 +554,7 @@ export function createChatClient({
     open,
     send,
     approve,
+    consoleAccess,
     interrupt,
     grants,
     revokeGrant,

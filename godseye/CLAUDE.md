@@ -12,7 +12,9 @@ contract and SALUTE/INTREP templates, and its non-negotiable workflow is
 Boot the stack with `./scripts/demo_laptop.sh` (no GPU needed) and connect over MCP Streamable HTTP at
 `http://127.0.0.1:8791/mcp`; `.mcp.json` configures it. The MCP server is the only command path.
 
-**ISR-only:** no kinetic tools exist and none may be added.
+**ISR by default (M14a):** no kinetic tools exist in ISR mode and none may be added outside the M14a
+rule (PLAN.md §4.5a): simulated `wg_*` tools in `wargame*.py`, scenario units only, operator approval
+for every engagement.
 
 To **work on the code**, read `README.md`, then `TOOL_CONTRACT.md` and `BRIDGE_CONTRACT.md` — those two
 are the contracts the implementation is held to. `GAP_REGISTER.md` records the audit this work came from.

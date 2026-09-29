@@ -3,9 +3,12 @@
 A GeoJSON FeatureCollection of everything the map draws as context around
 the active theater. Phase A serves `site` features: EVERY fetched site
 (<= `MAX_OVERLAY_SITES`), most salient first, the top `LABELLED_SITES`
-flagged `labelled`. Phase B (B10) adds `force`, `force_envelope`, `vector`
-and `engagement` from the wargame engine; its `revision` is already part of
-`rev`.
+flagged `labelled`. Phase B (B10) adds the simulated wargame's `force`,
+`force_envelope`, `vector` and `engagement` features from the engine
+(`intel_scenario.overlay_features`: red only in the Umpire view `truth=1` or
+a revealed session, capped per §3.3, every one `simulated: true`); its
+`revision` is part of `rev`. A wargame read that fails leaves the sites
+standing and says so in `wargame.error`.
 
 The map polls every 3 s with the last `rev` it drew:
 
@@ -25,7 +28,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from . import intel_sites
+from . import intel_scenario, intel_sites
 from . import sites as _sites
 from .intel_graph import _num, json_size
 
@@ -147,8 +150,20 @@ def build_overlay(srv: Any, *, truth: bool = False, rev: str | None = None) -> d
         if total > len(features):
             omitted["site"] = total - len(features)
     counts = {"site": len(features)} if features else {}
+    served_sites = len(features)
+    error = None
+    try:
+        wg_features, wg_counts, wg_omitted = intel_scenario.overlay_features(srv, truth=truth)
+    except Exception as exc:  # noqa: BLE001 - the sites still serve; the body says so
+        wg_features, wg_counts, wg_omitted = [], {}, {}
+        error = f"{intel_scenario.ENGINE_ERROR} ({type(exc).__name__})"
+    features.extend(wg_features)
+    counts.update(wg_counts)
+    omitted.update(wg_omitted)
     body = _collection(now_rev, tid, _int_or_none(epoch), features, counts, omitted)
-    body["sites"] = _sites_block(current, total, len(features), reason)
+    body["sites"] = _sites_block(current, total, served_sites, reason)
+    if error:
+        body["wargame"] = {"error": error}
     return body
 
 

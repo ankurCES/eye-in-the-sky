@@ -21,6 +21,7 @@ export const ICON = Object.freeze({
   command: 'flight_takeoff',
   sim: 'tune',
   override: 'gpp_maybe',
+  engagement: 'flare',
   expand: 'expand_more',
   refresh: 'refresh',
   login: 'login',
@@ -72,6 +73,15 @@ export const CLASS_META = Object.freeze({
   safety_override: Object.freeze({
     phrase: 'Safety override',
     icon: ICON.override,
+    slip: true,
+    approvable: true,
+  }),
+  // WG spec §5.3.1 (M14a): Sand, glyph `flare`, a 6 px band plus a Sand 45°
+  // hatch; never session-grantable; the acknowledgement box is required and
+  // Approve arms 1600 ms after it is ticked.
+  engagement: Object.freeze({
+    phrase: 'Simulates an engagement',
+    icon: ICON.engagement,
     slip: true,
     approvable: true,
   }),
@@ -164,6 +174,16 @@ export const TOOL_TITLES = Object.freeze({
   sim_set_theater: 'Set the theater',
   sim_set_time_scale: 'Set sim speed',
   ui_show_map: 'Show on the map',
+  wg_session_start: 'Start a simulated wargame',
+  wg_session_status: 'Wargame status',
+  wg_session_end: 'End the wargame',
+  wg_generate_scenario: 'Generate a scenario',
+  wg_spawn_force: 'Add simulated forces',
+  wg_list_forces: 'List forces',
+  wg_list_classes: 'List wargame classes',
+  wg_plan_corridor: 'Plan a corridor',
+  wg_propose_strike: 'Propose a simulated strike',
+  wg_execute_engagement: 'Execute a simulated engagement',
 });
 
 export function toolTitle(tool) {
@@ -294,18 +314,36 @@ export function isDryRunnable(approval) {
   return DRY_RUNNABLE_TOOLS.includes(approval.tool);
 }
 
-/** Approve verb per tool and class (spec §6.5 item 9). */
-export function approveVerb(tool, klass) {
+/** Sim tools with their own verb (WG spec §3.7 approve verbs). */
+const SIM_VERBS = Object.freeze({
+  sim_set_theater: 'Approve theater change',
+  wg_session_start: 'Approve start',
+  wg_session_end: 'Approve end',
+});
+
+/**
+ * Approve verb per tool and class (spec §6.5 item 9; WG spec §3.7). An
+ * engagement's verb follows its preview's `verb_kind` ("strike" for a
+ * simulated air strike, anything else is an engagement).
+ * @param {string} tool
+ * @param {string} klass
+ * @param {{verbKind?: string|null}} [opts]
+ */
+export function approveVerb(tool, klass, { verbKind = null } = {}) {
   const k = classKey(klass);
   if (k === 'sensor')
     return tool === 'uav_scan_targets'
       ? 'Approve scan'
       : 'Approve sensor tasking';
   if (k === 'unknown') return '';
+  if (k === 'engagement')
+    return verbKind === 'strike'
+      ? 'Approve simulated strike'
+      : 'Approve simulated engagement';
   if (k === 'sim')
-    return tool === 'sim_set_theater'
-      ? 'Approve theater change'
-      : 'Approve change';
+    return (
+      (Object.hasOwn(SIM_VERBS, tool) && SIM_VERBS[tool]) || 'Approve change'
+    );
   if (k === 'safety_override') return 'Approve override';
   if (tool === 'uav_takeoff') return 'Approve takeoff';
   if (tool === 'uav_land') return 'Approve landing';
@@ -334,6 +372,8 @@ export function policyLine(klass, tool = null) {
   if (k === 'sim')
     return 'Simulation changes are approved one at a time in this version.';
   if (k === 'safety_override') return 'Overrides are approved one at a time.';
+  if (k === 'engagement')
+    return "Engagements are approved one at a time. They can't be allowed for the session.";
   return '';
 }
 
@@ -348,6 +388,9 @@ const PREFIX_TYPE = Object.freeze({
   thr: 'theater',
   poi: 'poi',
   sit: 'site',
+  frc: 'force',
+  eng: 'engagement',
+  vec: 'vector',
   alarm: 'alarm',
   feed: 'feed',
 });

@@ -227,9 +227,14 @@ class Theater:
     provenance: Mapping[str, Any] | None = field(
         default=None, compare=False, hash=False, repr=False)
     dynamic: bool = field(default=False, compare=False, hash=False)
+    #: M14a (WG §5.2.4): may a simulated wargame session start here? False on
+    #: preset rows whose real anchors make a notional battle inappropriate.
+    #: Out of `==`/`hash` and out of `as_dict`; only the literal True clears.
+    wargame_ok: bool = field(default=True, compare=False, hash=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dynamic", bool(self.dynamic))
+        object.__setattr__(self, "wargame_ok", self.wargame_ok is True)
         if self.provenance is None:
             return
         if not isinstance(self.provenance, Mapping):
@@ -477,7 +482,7 @@ class Theater:
         keeps being bitten by.
 
         `dynamic` is always present; `provenance` only when set (WG §4.1.1).
-        `from_dict()` is the inverse.
+        `wargame_ok` is never in the row (M14a). `from_dict()` is the inverse.
         """
         row = {
             "id": self.id,
@@ -543,6 +548,7 @@ _TABLE: tuple[Theater, ...] = (
         pois=(Poi("North Field", 47.6445, -122.1402),
               Poi("South Field", 47.6385, -122.1402),
               Poi("East Field", 47.6415, -122.1372)),
+        wargame_ok=True,    # M14a: AirSim's stock synthetic origin
     ),
     Theater(
         id="iran-isfahan",
@@ -557,6 +563,7 @@ _TABLE: tuple[Theater, ...] = (
         pois=(Poi("Isfahan North", 32.670, 51.660),
               Poi("Isfahan Center", 32.655, 51.670),
               Poi("Isfahan South", 32.640, 51.680)),
+        wargame_ok=False,   # M14a: urban AO beside declared facilities
     ),
     Theater(
         id="iran-natanz",
@@ -577,6 +584,7 @@ _TABLE: tuple[Theater, ...] = (
         pois=(Poi("Natanz North", 33.735, 51.720),
               Poi("Natanz Center", 33.725, 51.730),
               Poi("Natanz South", 33.715, 51.740)),
+        wargame_ok=False,   # M14a: the home coordinates name the facility
     ),
     Theater(
         id="iran-fordow",
@@ -596,6 +604,7 @@ _TABLE: tuple[Theater, ...] = (
         pois=(Poi("Fordow North", 34.892, 50.990),
               Poi("Fordow Center", 34.885, 50.996),
               Poi("Fordow South", 34.878, 51.005)),
+        wargame_ok=False,   # M14a: the home coordinates name the facility
     ),
     Theater(
         id="indo-pak-loc",
@@ -609,6 +618,7 @@ _TABLE: tuple[Theater, ...] = (
         pois=(Poi("LoC North", 34.105, 74.815),
               Poi("LoC Center", 34.080, 74.820),
               Poi("LoC South", 34.055, 74.825)),
+        wargame_ok=False,   # M14a: a live line of control
     ),
     Theater(
         id="taiwan-strait",
@@ -623,6 +633,8 @@ _TABLE: tuple[Theater, ...] = (
         pois=(Poi("Strait North", 24.540, 119.500),
               Poi("Strait Center", 24.500, 119.500),
               Poi("Strait South", 24.460, 119.500)),
+        # M14a: maritime AO; the templates' ground units can't be placed meaningfully
+        wargame_ok=False,
     ),
     Theater(
         id="ukraine-donbas",
@@ -636,6 +648,7 @@ _TABLE: tuple[Theater, ...] = (
         pois=(Poi("Donbas North", 48.640, 37.900),
               Poi("Donbas Center", 48.600, 37.900),
               Poi("Donbas South", 48.560, 37.900)),
+        wargame_ok=False,   # M14a: an active front line
     ),
     Theater(
         id="red-sea-hormuz",
@@ -650,11 +663,51 @@ _TABLE: tuple[Theater, ...] = (
         pois=(Poi("Hormuz North", 26.580, 56.250),
               Poi("Hormuz Center", 26.550, 56.250),
               Poi("Hormuz South", 26.520, 56.250)),
+        # M14a: maritime AO; the templates' ground units can't be placed meaningfully
+        wargame_ok=False,
     ),
 )
 
 THEATERS: Mapping[str, Theater] = {t.id: t for t in _TABLE}
 DEFAULT_THEATER_ID = "default"
+
+#: M14a (WG §5.2.4): a runtime AO whose box, grown by this margin, overlaps
+#: the box (AO, home and POIs) of a preset row the wargame refuses is refused
+#: too. Otherwise re-planning the same place at runtime would clear exactly
+#: what the preset table refuses.
+WARGAME_PRESET_MARGIN_M = 5000.0
+
+
+def _box_of(points: Iterable[tuple[float, float]]) -> tuple[float, float, float, float]:
+    lats, lons = zip(*points)
+    return (min(lats), min(lons), max(lats), max(lons))
+
+
+#: (south, west, north, east) of every preset row with `wargame_ok` False.
+_UNCLEARED_PRESET_BOXES: tuple[tuple[float, float, float, float], ...] = tuple(
+    _box_of([*t.ao, (t.home_lat, t.home_lon), *((p.lat, p.lon) for p in t.pois)])
+    for t in _TABLE if not t.wargame_ok)
+
+
+def wargame_clear_of_presets(ao: Iterable[tuple[float, float]],
+                             margin_m: float = WARGAME_PRESET_MARGIN_M) -> bool:
+    """True when the box of `ao` (`[(lat, lon), ...]`), grown by `margin_m`,
+    overlaps no preset theater the wargame refuses (M14a, WG §5.2.4).
+
+    Fails closed: an empty or unreadable AO is not clear.
+    """
+    try:
+        s, w, n, e = _box_of([(float(la), float(lo)) for la, lo in ao])
+    except (TypeError, ValueError):
+        return False
+    dlat = margin_m / _M_PER_DEG_LAT
+    s, n = s - dlat, n + dlat
+    # the widest degree margin: metres per degree of longitude at the box's
+    # most poleward edge (make_dynamic keeps boxes off the poles)
+    dlon = margin_m / max(1.0, _m_per_deg_lon(min(89.0, max(abs(s), abs(n)))))
+    w, e = w - dlon, e + dlon
+    return not any(s <= bn and n >= bs and w <= be and e >= bw
+                   for bs, bw, bn, be in _UNCLEARED_PRESET_BOXES)
 DEFAULT_EXPORT_NAME = "theaters.json"
 
 # ---------------------------------------------------------------------------
@@ -792,7 +845,9 @@ def make_dynamic(*, label: str, place: str, center: tuple[float, float],
         home_lat=hlat, home_lon=hlon,
         home_alt_msl_m=_number(home_alt_msl_m, "home_alt_msl_m"),
         ao=ao, pois=tuple(_poi(p) for p in pois),
-        provenance=provenance, dynamic=True)
+        provenance=provenance, dynamic=True,
+        # M14a: cleared unless it sits on (or near) a preset the table refuses
+        wargame_ok=wargame_clear_of_presets(ao))
 
 
 def register_dynamic(t: Theater) -> Theater:
@@ -877,7 +932,13 @@ def from_dict(d: Mapping[str, Any]) -> Theater:
         orbit_radius_m=_number(d.get("orbit_radius_m", DEFAULT_ORBIT_RADIUS_M),
                                f"{tid} orbit_radius_m"),
         provenance=provenance,
-        dynamic=tid.startswith(DYNAMIC_PREFIX))
+        dynamic=tid.startswith(DYNAMIC_PREFIX),
+        # Not in the row (M14a): a dynamic id is cleared unless its AO sits on
+        # (or near) a preset the table refuses (and subject to the
+        # complete-exclusion rule at session start), a preset id keeps its
+        # table value, and any other id fails closed.
+        wargame_ok=((tid.startswith(DYNAMIC_PREFIX) and wargame_clear_of_presets(ao))
+                    or (tid in THEATERS and THEATERS[tid].wargame_ok)))
 
 # ---------------------------------------------------------------------------
 # Hydration registry. `Theater` is frozen — the static table must stay the

@@ -17,6 +17,7 @@ import {
   suggestedPrompts,
 } from './view.js';
 import { ARM_MS, DBLCLICK_MS } from './slip.js';
+import { ENGAGE_ARM_MS } from './slipEngagement.js';
 import { createChip } from './chips.js';
 
 // ---- stub DOM -------------------------------------------------------------------------
@@ -2801,14 +2802,16 @@ test('chips: sites are known; an unrecognised type is never status-coloured', ()
   const site = createChip({ id: 'sit:dyn-kherson:way/1' }, { store });
   assert.equal(site.attrs['data-type'], 'site');
   assert.equal(textOf(site).includes('Kherson airfield'), true);
+  // `force` is known since Phase B (B14); `mystery` stands for any type
+  // this console doesn't know.
   store.graph.nodes.push({
-    id: 'frc:red-sam-1',
-    type: 'force',
+    id: 'zzz:red-sam-1',
+    type: 'mystery',
     label: `${XSS}‮`,
     status: 'ok',
     attrs: {},
   });
-  const odd = createChip({ id: 'frc:red-sam-1' }, { store });
+  const odd = createChip({ id: 'zzz:red-sam-1' }, { store });
   assert.equal(odd.attrs['data-status'], 'unknown', 'never ok/green');
   assert.equal(odd.attrs['data-type'], 'unrecognised');
   assert.equal(
@@ -2817,4 +2820,570 @@ test('chips: sites are known; an unrecognised type is never status-coloured', ()
   );
   assert.ok(textOf(odd).includes('<img src=x onerror=alert(1)>'));
   assert.ok(!BIDI.test(textOf(odd)));
+});
+
+// ---- the simulated wargame (WG spec §5.3.7, §5.3.8; B14) ----------------------------------
+
+const WG_T = T0;
+
+function wargameGraph({ truth = false, active = true, nodes = [] } = {}) {
+  const g = graphFixture({
+    nodes: [
+      {
+        id: 'trk:TRK-9',
+        type: 'track',
+        label: 'Air-defence guns',
+        status: 'warn',
+        lat: 47.65,
+        lon: -122.13,
+        attrs: { scenario: true },
+      },
+      ...nodes,
+    ],
+  });
+  g.meta.wargame = {
+    active,
+    session_id: 'WG-3fa9c1',
+    truth_view: truth,
+    pending: [],
+  };
+  return g;
+}
+
+function engagementPreview(extra = {}) {
+  return {
+    id: 'WG-3fa9c1-E7',
+    kind: 'blue_strike',
+    verb_kind: 'engagement',
+    attacker: { id: 'frc:blue-artillery-1', label: 'Blue artillery 1' },
+    target: {
+      track_id: 'TRK-9',
+      graph_id: 'trk:TRK-9',
+      label: 'Air-defence guns',
+      confidence: 'probable',
+      sightings: 2,
+      last_seen_ms: WG_T - 60_000,
+      lat: 47.65,
+      lon: -122.13,
+      scenario: true,
+      protected: false,
+    },
+    p_notional: { effect: 0.62 },
+    inputs: ['Range 3.2 km of 20.0 km'],
+    seed: 4417,
+    engine: 'wg-notional/1',
+    checks: [
+      { text: 'Target is a simulated scenario unit', ok: true },
+      { text: 'Wargame session active', ok: true },
+    ],
+    ...extra,
+  };
+}
+
+function engagementRequest(chat, extra = {}, opts = {}) {
+  chat.event(
+    'approval_request',
+    {
+      approval_id: 'e1',
+      call_id: 'ce1',
+      tool: 'wg_execute_engagement',
+      class: 'engagement',
+      title: 'Execute a simulated engagement',
+      summary: 'Blue artillery 1 · TRK-9',
+      consequences: [
+        'Rolls one simulated outcome for this engagement against a scenario unit.',
+      ],
+      args: {
+        pending_id: 'WG-3fa9c1-E7',
+        shooter_id: 'frc:blue-artillery-1',
+        target_track_id: 'TRK-9',
+      },
+      acknowledge_required: true,
+      engagement: engagementPreview(),
+      expires_at_ms: WG_T + 600_000,
+      ...extra,
+    },
+    next(),
+    opts,
+  );
+}
+
+/** The fake chat with a console key and a recorded approve body. */
+function withConsole(chat, access = { held: true, refused: false }) {
+  chat.access = access;
+  chat.consoleAccess = () => chat.access;
+  chat.approve = async (id, decision, note, opts) => {
+    chat.calls.push(['approve', id, decision, note, opts]);
+    return { ok: true };
+  };
+  return chat;
+}
+
+const engagementSlip = (host) =>
+  find(
+    host,
+    (el) => cls('ic-slip')(el) && el.attrs['data-class'] === 'engagement',
+  );
+const ackInput = (slip) =>
+  find(find(slip, cls('ic-slip__ack')), (el) => el.tag === 'input');
+
+test('engagement: the slip names its target, arms 1600 ms after the box, and approves with acknowledged', async () => {
+  const { chat, host, clock, announced } = await mountView({
+    graph: wargameGraph(),
+  });
+  withConsole(chat);
+  turn(chat, 'Strike the guns');
+  engagementRequest(chat);
+  await flush();
+  let slip = engagementSlip(host);
+  assert.ok(slip, 'an engagement slip, not an unknown one');
+  assert.ok(find(slip, cls('ic-slip__hatch')));
+  const text = textOf(slip);
+  assert.ok(text.includes('Simulates an engagement'));
+  assert.ok(text.includes('Simulated engagement on Air-defence guns'));
+  assert.ok(text.includes('Simulated. Nothing real is fired.'));
+  assert.deepEqual(announced.at(-1), [
+    'Approval needed: Simulated engagement on Air-defence guns. Simulates an engagement.',
+    'assertive',
+  ]);
+  const approve = () => approveIn(engagementSlip(host));
+  assert.equal(approve().attrs['aria-disabled'], 'true');
+  clock.advance(5000);
+  assert.equal(
+    approve().attrs['aria-disabled'],
+    'true',
+    'nothing before the box',
+  );
+  const box = ackInput(slip);
+  box.checked = true;
+  box.fire('change');
+  clock.advance(ENGAGE_ARM_MS - 1);
+  assert.equal(approve().attrs['aria-disabled'], 'true');
+  clock.advance(1);
+  assert.equal(approve().attrs['aria-disabled'], 'false');
+  approve().fire('pointerdown');
+  approve().fire('click', { detail: 1 });
+  clock.advance(DBLCLICK_MS);
+  await flush();
+  assert.deepEqual(
+    chat.calls.filter((c) => c[0] === 'approve'),
+    [['approve', 'e1', 'approve', null, { acknowledged: true }]],
+  );
+  slip = engagementSlip(host);
+  assert.equal(slip.attrs['data-state'], 'deciding');
+});
+
+test('engagement: Deny-only without a console key, without a preview, or after the wargame ends', async () => {
+  // No key: the fake chat has no consoleAccess at all (fails safe).
+  let m = await mountView({ graph: wargameGraph() });
+  turn(m.chat, 'x');
+  engagementRequest(m.chat);
+  await flush();
+  let slip = engagementSlip(m.host);
+  assert.equal(approveIn(slip), null);
+  assert.equal(
+    textOf(find(slip, cls('ic-slip__denyonly'))),
+    "This console can't approve engagements: it holds no engagement approval key.",
+  );
+  // Refused claim.
+  withConsole(m.chat, { held: false, refused: true });
+  m.clock.advance(1000);
+  await flush();
+  slip = engagementSlip(m.host);
+  assert.equal(
+    textOf(find(slip, cls('ic-slip__denyonly'))),
+    "This console can't approve engagements: another client claimed them.",
+  );
+  // The key arrives: Approve comes back.
+  m.chat.access = { held: true, refused: false };
+  m.clock.advance(1000);
+  await flush();
+  assert.ok(approveIn(engagementSlip(m.host)));
+
+  // No preview.
+  m = await mountView({ graph: wargameGraph() });
+  withConsole(m.chat);
+  turn(m.chat, 'x');
+  engagementRequest(m.chat, { engagement: undefined });
+  await flush();
+  slip = engagementSlip(m.host);
+  assert.equal(approveIn(slip), null);
+  assert.equal(
+    textOf(find(slip, cls('ic-slip__denyonly'))),
+    "The console couldn't build this preview, so it can't be approved.",
+  );
+
+  // The wargame ends while the slip waits.
+  const graph = wargameGraph();
+  m = await mountView({ graph });
+  withConsole(m.chat);
+  turn(m.chat, 'x');
+  engagementRequest(m.chat);
+  await flush();
+  assert.ok(approveIn(engagementSlip(m.host)));
+  graph.meta.wargame = { active: false, last: null };
+  m.store.change();
+  await flush();
+  slip = engagementSlip(m.host);
+  assert.equal(approveIn(slip), null);
+  assert.equal(
+    textOf(find(slip, cls('ic-slip__denyonly'))),
+    'The wargame has ended.',
+  );
+});
+
+test('engagement: a replayed request keeps its preview; a moved target makes it stale', async () => {
+  const graph = wargameGraph();
+  const { chat, host, store } = await mountView({ graph });
+  withConsole(chat);
+  chat.event(
+    'session',
+    { session_id: 's1', model: 'claude-x', last_seq: 9 },
+    0,
+  );
+  chat.event('turn_start', { turn_id: 't1', text: 'x' }, 1, { replay: true });
+  engagementRequest(chat, {}, { replay: true });
+  await flush();
+  let slip = engagementSlip(host);
+  assert.ok(approveIn(slip), 'the replayed preview is kept');
+  assert.ok(textOf(slip).includes('Simulated engagement on Air-defence guns'));
+  // The track moves ~330 m: stale, with Ask for a fresh plan first.
+  graph.nodes.find((n) => n.id === 'trk:TRK-9').lat = 47.653;
+  store.change();
+  await flush();
+  slip = engagementSlip(host);
+  assert.equal(slip.attrs['data-variant'], 'stale');
+  assert.ok(find(slip, (el) => el.attrs?.['data-action'] === 'ask-fresh-plan'));
+  assert.match(
+    textOf(find(slip, cls('ic-slip__stale'))),
+    /^Conditions changed since this was proposed: the target moved about 33\d m\./,
+  );
+});
+
+function redShotNode(n, extra = {}) {
+  return {
+    id: `eng:WG-3fa9c1-R${n}`,
+    type: 'engagement',
+    label: 'Simulated shot on Drone1',
+    status: 'ok',
+    attrs: {
+      kind: 'red_shot',
+      phase: 'adjudicated',
+      attacker: null,
+      attacker_label: 'Red air defence (not identified)',
+      target: 'veh:Drone1',
+      target_label: 'Drone1',
+      outcome: 'missed',
+      outcome_hidden: false,
+      consequence: 'none',
+      p_notional: 0.18,
+      adjudicated_at_ms: WG_T + n * 60_000,
+      simulated: true,
+      ...extra,
+    },
+  };
+}
+
+const umpireEls = (host) =>
+  findAll(host, (el) => cls('ic-umpire')(el) && el.attrs['data-kind']);
+
+test('umpire rows: appended from the graph, deduplicated, masked in Blue view', async () => {
+  const graph = wargameGraph();
+  const { chat, host, store } = await mountView({ graph });
+  turn(chat, 'Recce the far half');
+  chat.event('text_delta', { turn_id: 't1', text: 'Flying.' }, next());
+  // What happened before the console saw the graph isn't replayed.
+  assert.equal(umpireEls(host).length, 0);
+  graph.nodes.push(redShotNode(1, { attacker_label: 'Red SAM 2' }));
+  store.change();
+  await flush();
+  let rows = umpireEls(host);
+  assert.equal(rows.length, 1);
+  assert.equal(
+    textOf(find(rows[0], cls('ic-umpire__text'))),
+    'Red air defence (not identified) engaged Drone1. Missed.',
+    'Blue view never names the red unit, even if the graph did',
+  );
+  assert.ok(textOf(rows[0]).startsWith('Umpire, 14:03:00Z, Simulated'));
+  // The same graph again (or a view flip) adds nothing.
+  store.change();
+  graph.meta.wargame.truth_view = true;
+  store.change();
+  await flush();
+  rows = umpireEls(host);
+  assert.equal(rows.length, 1);
+  // A row keeps the words it was seen with: seen through the fog, it stays
+  // masked in Umpire view too.
+  assert.equal(
+    textOf(find(rows[0], cls('ic-umpire__text'))),
+    'Red air defence (not identified) engaged Drone1. Missed.',
+  );
+  // Seen in Umpire view: the designator and the chance...
+  graph.nodes.push(redShotNode(2, { attacker_label: 'Red SAM 3' }));
+  store.change();
+  await flush();
+  rows = umpireEls(host);
+  assert.equal(rows.length, 2);
+  assert.equal(
+    textOf(find(rows[1], cls('ic-umpire__text'))),
+    'Red SAM 3 engaged Drone1. Missed (≈ 0.18).',
+  );
+  // ...and masked again as soon as Blue view is back.
+  graph.meta.wargame.truth_view = false;
+  store.change();
+  await flush();
+  rows = umpireEls(host);
+  assert.equal(
+    textOf(find(rows[1], cls('ic-umpire__text'))),
+    'Red air defence (not identified) engaged Drone1. Missed.',
+  );
+  // The row sits after the turn it arrived during.
+  const log = find(host, cls('ic-log'));
+  assert.equal(log.children.at(-1), rows[1]);
+});
+
+test('umpire rows fold while a slip waits, and never scroll the log then', async () => {
+  const graph = wargameGraph();
+  const { chat, host, store, clock } = await mountView({ graph });
+  withConsole(chat);
+  turn(chat, 'Strike the guns');
+  engagementRequest(chat);
+  await flush();
+  const log = scroller(host, { top: 1500, height: 2000, client: 500 });
+  graph.nodes.push(redShotNode(1), redShotNode(3));
+  store.change();
+  await flush();
+  assert.equal(log.scrollTop, 1500, 'no autoscroll while the slip waits');
+  let groups = umpireEls(host);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].attrs['data-kind'], 'since');
+  assert.ok(textOf(groups[0]).includes('2 umpire events since this request.'));
+  const show = find(groups[0], (el) => el.tag === 'button');
+  assert.equal(textOf(show), 'Show');
+  // The fold made the log taller; the ticker's next render stays put.
+  log.scrollHeight = 2060;
+  clock.advance(1000);
+  await flush();
+  assert.equal(log.scrollTop, 1500);
+  show.fire('click');
+  await flush();
+  groups = umpireEls(host);
+  assert.equal(
+    findAll(groups[0], (el) => el.attrs?.['data-kind'] === 'row').length,
+    2,
+  );
+  // Decided: the rows are no longer "since this request"; two minutes
+  // apart, they are two rows.
+  chat.event(
+    'approval_resolved',
+    { approval_id: 'e1', call_id: 'ce1', decision: 'denied' },
+    next(),
+  );
+  await flush();
+  const kinds = find(host, cls('ic-log'))
+    .children.filter(cls('ic-umpire'))
+    .map((el) => el.attrs['data-kind']);
+  assert.deepEqual(kinds, ['row', 'row']);
+});
+
+test('the filed engagement shows its outcome live; a lost drone raises the loss banner', async () => {
+  const graph = wargameGraph();
+  const { chat, host, store, clock } = await mountView({ graph });
+  withConsole(chat);
+  turn(chat, 'Strike the guns');
+  engagementRequest(chat);
+  await flush();
+  const box = ackInput(engagementSlip(host));
+  box.checked = true;
+  box.fire('change');
+  clock.advance(ENGAGE_ARM_MS);
+  const approve = approveIn(engagementSlip(host));
+  approve.fire('pointerdown');
+  approve.fire('click', { detail: 1 });
+  clock.advance(DBLCLICK_MS);
+  await flush();
+  chat.event(
+    'approval_resolved',
+    { approval_id: 'e1', call_id: 'ce1', decision: 'approved' },
+    next(),
+  );
+  await flush();
+  let slip = engagementSlip(host);
+  assert.equal(slip.attrs['data-state'], 'filed');
+  assert.match(
+    textOf(find(slip, cls('ic-slip__record'))).replace(/^check/, ''),
+    /^Approved by you at \d\d:\d\d:\d\dZ\. Simulated engagement on Air-defence guns\.$/,
+  );
+  assert.equal(
+    find(slip, cls('ic-slip__outcome')),
+    null,
+    'not adjudicated yet',
+  );
+  graph.nodes.push({
+    id: 'eng:WG-3fa9c1-E7',
+    type: 'engagement',
+    label: 'Simulated strike on Air-defence guns',
+    attrs: {
+      kind: 'blue_strike',
+      phase: 'adjudicated',
+      outcome: null,
+      outcome_hidden: true,
+      adjudicated_at_ms: WG_T + 120_000,
+      target_label: 'Air-defence guns',
+      attacker_label: 'Blue artillery 1',
+    },
+  });
+  store.change();
+  await flush();
+  slip = engagementSlip(host);
+  assert.equal(
+    textOf(find(slip, cls('ic-slip__outcome'))),
+    'Outcome hidden in blue view.',
+  );
+  // Battle damage assessed: the outcome shows.
+  Object.assign(graph.nodes.at(-1).attrs, {
+    outcome: 'damaged',
+    outcome_hidden: false,
+    bda: { state: 'damaged', looks: 2 },
+  });
+  store.change();
+  await flush();
+  assert.equal(
+    textOf(find(engagementSlip(host), cls('ic-slip__outcome'))),
+    'Outcome at 14:04:00Z: damaged (simulated).',
+  );
+  // Drone1 is lost: the critical loss banner (UI-only).
+  Object.assign(graph.nodes[0].attrs, {
+    wargame_state: 'lost',
+    wargame_lost_at_ms: WG_T + 180_000,
+  });
+  store.change();
+  await flush();
+  const banner = find(host, cls('ic-chat__loss'));
+  assert.ok(banner);
+  assert.equal(banner.attrs['data-tone'], 'critical');
+  assert.equal(
+    textOf(banner).replace(/^warning/, ''),
+    'Simulated loss: Drone1 destroyed by Red air defence (not identified) at 14:05:00Z.',
+  );
+});
+
+test('session prompts replace the ISR ones during a wargame (§5.3.8)', () => {
+  const g = wargameGraph();
+  assert.deepEqual(suggestedPrompts(g), [
+    'Generate a medium air-defence scenario here.',
+    'Recce the far half of the area and scan for contacts.',
+    'Plan a simulated strike on [[trk:TRK-9|Air-defence guns]] and show me the dry run.',
+    'Plan a low-exposure re-look of the last strike.',
+    'End the wargame and show the after-action review.',
+  ]);
+  // No scenario contact: no strike prompt.
+  g.nodes.find((n) => n.id === 'trk:TRK-9').attrs.scenario = false;
+  assert.ok(!suggestedPrompts(g).some((p) => p.includes('simulated strike')));
+  // A label can't break out of its chip.
+  const odd = wargameGraph();
+  odd.nodes.find((n) => n.id === 'trk:TRK-9').label = 'guns]] [[x|y‮';
+  assert.equal(
+    suggestedPrompts(odd)[2],
+    'Plan a simulated strike on [[trk:TRK-9|guns xy]] and show me the dry run.',
+  );
+  // Inactive: the ISR prompts.
+  assert.equal(
+    suggestedPrompts(wargameGraph({ active: false }))[0],
+    "Summarize the situation in this theater and what we don't know yet.",
+  );
+});
+
+test("bus 'approval:review' scrolls to a pending engagement's slip by eng: id", async () => {
+  const { chat, host, bus } = await mountView({ graph: wargameGraph() });
+  withConsole(chat);
+  turn(chat, 'x');
+  engagementRequest(chat);
+  await flush();
+  const slip = engagementSlip(host);
+  let scrolled = 0;
+  slip.scrollIntoView = () => {
+    scrolled += 1;
+  };
+  bus.emit('approval:review', { engagementId: 'eng:WG-other' });
+  assert.equal(scrolled, 0);
+  bus.emit('approval:review', { engagementId: 'eng:WG-3fa9c1-E7' });
+  assert.equal(scrolled, 1);
+  bus.emit('approval:review', { approvalId: 'e1' });
+  assert.equal(scrolled, 2);
+});
+
+test("bus 'approval:review' also takes the rail's {id, approval_id} (B17)", async () => {
+  const { chat, host, bus } = await mountView({ graph: wargameGraph() });
+  withConsole(chat);
+  turn(chat, 'x');
+  engagementRequest(chat);
+  await flush();
+  const slip = engagementSlip(host);
+  let scrolled = 0;
+  slip.scrollIntoView = () => {
+    scrolled += 1;
+  };
+  bus.emit('approval:review', { id: 'eng:WG-3fa9c1-E7', approval_id: null });
+  assert.equal(scrolled, 1);
+  bus.emit('approval:review', { id: 'eng:nope', approval_id: 'e1' });
+  assert.equal(scrolled, 2);
+});
+
+test('wargame dividers: a start flip, then an End by the operator with the review chip (§5.3.2, B17)', async () => {
+  const graph = wargameGraph({ active: false });
+  graph.meta.wargame = { active: false, last: null };
+  const { chat, host, store, bus } = await mountView({ graph });
+  turn(chat, 'Start a wargame');
+  await flush();
+  const dividers = () =>
+    findAll(host, (el) => el.attrs?.['data-kind']?.startsWith?.('wargame-'));
+  assert.equal(dividers().length, 0, 'the first graph is a baseline');
+  graph.meta.wargame = {
+    active: true,
+    session_id: 'WG-3fa9c1',
+    started_at_ms: Date.UTC(2026, 8, 28, 14, 3, 0),
+    truth_view: true,
+    pending: [],
+  };
+  store.change();
+  await flush();
+  assert.equal(dividers().length, 1);
+  assert.equal(
+    textOf(dividers()[0]),
+    'Wargame started at 14:03:00Z. The analyst now works with wargame tools, and every engagement asks you first.',
+  );
+  bus.emit('wargame:ended', {
+    by: 'operator',
+    session_id: 'WG-3fa9c1',
+    aar_id: 'aar-WG-3fa9c1',
+    ended_at_ms: Date.UTC(2026, 8, 28, 14, 20, 5),
+  });
+  graph.meta.wargame = {
+    active: false,
+    last: {
+      session_id: 'WG-3fa9c1',
+      aar_id: 'aar-WG-3fa9c1',
+      ended_at_ms: Date.UTC(2026, 8, 28, 14, 20, 6),
+    },
+  };
+  store.change();
+  await flush();
+  const all = dividers();
+  assert.equal(all.length, 2);
+  assert.ok(
+    textOf(all[1]).startsWith(
+      'Wargame ended by you at 14:20:05Z. After-action review:',
+    ),
+    textOf(all[1]),
+  );
+  const chip = find(
+    all[1],
+    (el) => el.attrs?.['data-id'] === 'rpt:aar-WG-3fa9c1',
+  );
+  assert.ok(chip, 'the review is a chip');
+  // The same graph again adds nothing.
+  store.change();
+  await flush();
+  assert.equal(dividers().length, 2);
 });

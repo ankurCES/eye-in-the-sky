@@ -1418,9 +1418,9 @@ function placeNodes() {
       },
     },
     {
-      id: 'frc:red-sam-1',
-      type: 'force',
-      label: 'Red SAM 1',
+      id: 'gzm:gizmo-1',
+      type: 'gizmo',
+      label: 'Gizmo 1',
       subtitle: 'Scenario unit',
       status: 'ok',
       lat: 46.62,
@@ -1524,11 +1524,11 @@ const PLACE_ENTITIES = {
       active: false,
     },
   },
-  'frc:red-sam-1': {
-    id: 'frc:red-sam-1',
-    type: 'force',
-    label: 'Red SAM 1',
-    fields: { side: 'red', designator: 'Red SAM 1', detail: { a: 1 } },
+  'gzm:gizmo-1': {
+    id: 'gzm:gizmo-1',
+    type: 'gizmo',
+    label: 'Gizmo 1',
+    fields: { side: 'red', designator: 'Gizmo 1', detail: { a: 1 } },
   },
 };
 
@@ -1558,7 +1558,7 @@ const actionWords = (el) =>
 
 test('typeFromId: sit is a site; an unknown prefix is unknown, a bare id a contact', () => {
   assert.equal(typeFromId('sit:dyn-x:way/1'), 'site');
-  assert.equal(typeFromId('frc:red-sam-1'), 'unknown');
+  assert.equal(typeFromId('gzm:gizmo-1'), 'unknown');
   assert.equal(typeFromId('T-1'), 'track');
 });
 
@@ -1931,11 +1931,11 @@ test('a preset theater that is not active reads from its table row: Measured cen
 
 test('an unrecognised type: header says so, its fields are text, the fixed line, never green', async () => {
   const m = mountPlaces();
-  const el = await showLoaded(m, 'frc:red-sam-1');
+  const el = await showLoaded(m, 'gzm:gizmo-1');
   const head = byCls(el, 'ic-inspector__titlebar')[0];
   assert.equal(
     text(byCls(head, 'ic-inspector__type')[0]),
-    'Unrecognised item (force)',
+    'Unrecognised item (gizmo)',
   );
   assert.match(text(head), /Not assessed/);
   const g = find(head, (e) => hasCls(e, 'ic-kit-glyph'));
@@ -1995,4 +1995,471 @@ test('with the sim sped up, time to BINGO and a mission ETA say "in sim time"', 
     text(fieldValue(el, 'To BINGO')),
     /≈ 11 min to BINGO in sim time \(≈ 2 min 45 s real\)/,
   );
+});
+
+// ---- the simulated wargame (WG §5.3.4, §5.3.6, §5.3.9) -----------------------------------
+
+const WG_UNTIL = Date.UTC(2026, 8, 27, 14, 10, 0);
+const WG_FIRED = Date.UTC(2026, 8, 27, 14, 5, 12);
+
+function wargameNodes() {
+  return [
+    {
+      id: 'frc:red-aaa-1',
+      type: 'force',
+      label: 'Red AD guns 1',
+      subtitle: 'Red  Air-defence guns  Suppressed  Scenario',
+      status: 'warn',
+      lat: 46.64,
+      lon: 32.62,
+      attrs: {
+        side: 'red',
+        provenance: 'scenario',
+        register: 'scenario',
+        wg_class: 'ad_gun',
+        kind_label: 'Air-defence guns',
+        state: 'suppressed',
+        state_until_ms: WG_UNTIL,
+        ammo: 40,
+        threat_range_m: 2000,
+        threat_ceiling_m: 1000,
+        detection_range_m: 3000,
+        mobile: false,
+        objective: null,
+        correlated: ['trk:TRK-9'],
+        caveats: ['Its envelope covers the whole AO; no route avoids it.'],
+        simulated: true,
+      },
+    },
+    {
+      id: 'frc:blue-artillery-1',
+      type: 'force',
+      label: 'Blue artillery 1',
+      status: 'ok',
+      lat: 46.63,
+      lon: 32.61,
+      attrs: {
+        side: 'blue',
+        provenance: 'scenario',
+        wg_class: 'blue_artillery',
+        kind_label: 'Artillery battery',
+        state: 'active',
+        ammo: 11,
+        strike_range_m: 20000,
+        simulated: true,
+      },
+    },
+    {
+      id: 'trk:TRK-9',
+      type: 'track',
+      label: 'Air-defence guns',
+      subtitle: 'probable · 2 sightings · Scenario contact (simulated)',
+      status: 'warn',
+      lat: 46.6401,
+      lon: 32.6202,
+      attrs: {
+        scenario: true,
+        threat: 'moderate',
+        confidence: 'probable',
+        sightings: 2,
+      },
+    },
+    {
+      id: 'eng:WG-3fa9c1-E7',
+      type: 'engagement',
+      label: 'Engagement E7',
+      status: 'ok',
+      lat: 46.6401,
+      lon: 32.6202,
+      attrs: {
+        kind: 'blue_strike',
+        phase: 'adjudicated',
+        attacker: 'frc:blue-artillery-1',
+        attacker_label: 'Blue artillery 1',
+        target: 'trk:TRK-9',
+        target_label: 'Air-defence guns',
+        vector: null,
+        p_notional: 0.62,
+        inputs: [
+          'Range 3.2 km of 20.0 km',
+          'Perceived as air-defence guns, probable',
+        ],
+        outcome: 'destroyed',
+        outcome_hidden: false,
+        consequence: 'red_effect',
+        bda: { state: 'no_change', looks: 1, last_look_ms: WG_FIRED + 60_000 },
+        approval_id: 'apr-7',
+        authorized_at_ms: WG_FIRED - 30_000,
+        seed: 4417,
+        draw: 3,
+        engine: 'wg-notional/1',
+        proposed_at_ms: WG_FIRED - 90_000,
+        adjudicated_at_ms: WG_FIRED,
+        simulated: true,
+      },
+    },
+    {
+      id: 'vec:cor-2',
+      type: 'vector',
+      label: 'Corridor 2',
+      status: 'ok',
+      lat: 46.6371,
+      lon: 32.6189,
+      attrs: {
+        kind: 'corridor',
+        side: 'blue',
+        from: 'veh:Drone1',
+        to: 'trk:TRK-9',
+        to_point: [46.6401, 32.6202],
+        bearing_deg: 41.6,
+        length_m: 4600,
+        alt_band: 'low',
+        corridor_m: 300,
+        speed_mps: 12,
+        eta_s: 383,
+        exposure_s: 42,
+        p_survive: 0.91,
+        delta_exposure_s: 118,
+        delta_length_m: 1400,
+        legs: [
+          { exposure: 'low', exposure_s: 0, length_m: 2600 },
+          { exposure: 'moderate', exposure_s: 42, length_m: 2000 },
+        ],
+        threat_basis: 'sensed',
+        proposed: true,
+        caveats: [],
+        simulated: true,
+      },
+    },
+  ];
+}
+
+function mountWargame({ wargame = {}, extra = [] } = {}) {
+  const m = mount({
+    entity: (id) => {
+      const n = [...wargameNodes(), ...extra].find((x) => x.id === id);
+      return Promise.resolve(
+        n ? { id, type: n.type, label: n.label, fields: {} } : null,
+      );
+    },
+  });
+  m.store.change({
+    graph: {
+      nodes: [...nodes(), ...wargameNodes(), ...extra],
+      edges: [],
+      meta: {
+        wargame: {
+          active: true,
+          session_id: 'WG-3fa9c1',
+          truth_view: true,
+          pending: [],
+          counts: {},
+          ...wargame,
+        },
+      },
+    },
+  });
+  return m;
+}
+
+test('typeFromId: frc, eng and vec are the wargame types', () => {
+  assert.equal(typeFromId('frc:red-sam-1'), 'force');
+  assert.equal(typeFromId('eng:WG-1-E1'), 'engagement');
+  assert.equal(typeFromId('vec:axis-red-armour-1'), 'vector');
+});
+
+test('a red force in Umpire view: frame, designator, side, state with Scenario, every row, the fixed line', async () => {
+  const m = mountWargame();
+  const el = await showLoaded(m, 'frc:red-aaa-1');
+  const bar = byCls(el, 'ic-inspector__titlebar')[0];
+  assert.equal(text(byCls(bar, 'ic-inspector__title')[0]), 'Red AD guns 1');
+  assert.equal(text(byCls(bar, 'ic-inspector__type')[0]), 'Force');
+  assert.equal(text(byCls(bar, 'ic-inspector__wg-side')[0]), 'Red');
+  assert.match(text(bar), /Suppressed/);
+  assert.ok(find(bar, (e) => e.attrs?.['data-register'] === 'scenario'));
+  const g = find(bar, (e) => hasCls(e, 'ic-kit-glyph'));
+  assert.equal(g.attrs['data-type'], 'force');
+  assert.match(
+    String(g.innerHTML),
+    /M12 2L22 12L12 22L2 12Z/,
+    'the red diamond',
+  );
+  assert.doesNotMatch(String(g.innerHTML), /#5DD39B/i, 'never green');
+  assert.equal(text(fieldValue(el, 'Side')), 'Red');
+  assert.equal(text(fieldValue(el, 'Kind')), 'Air-defence guns');
+  assert.equal(text(fieldValue(el, 'State')), 'Suppressed until 14:10Z');
+  assert.equal(text(fieldValue(el, 'Ammunition')), '40 left');
+  assert.equal(
+    text(fieldValue(el, 'Threat range')),
+    '2 km, up to 1000 m above the unitScenario',
+  );
+  assert.equal(text(fieldValue(el, 'Detection range')), '3 kmScenario');
+  assert.equal(text(fieldValue(el, 'Movement')), 'Static');
+  assert.match(text(fieldValue(el, 'Sensed as')), /Air-defence guns/);
+  assert.match(
+    text(fieldValue(el, 'Caveats')),
+    /covers the whole AO; no route avoids it\. Assumed/,
+  );
+  assert.doesNotMatch(text(el), /Near/, 'no place names');
+  assert.match(
+    text(el),
+    /Simulated scenario unit\. Placed by the wargame, not observed\./,
+  );
+  assert.deepEqual(actionWords(el), [
+    'Ask about this',
+    'Focus',
+    'Show on map',
+    'Plan a simulated strike',
+    'Close',
+  ]);
+  byKey(el, 'act:strike').fire('click');
+  assert.deepEqual(m.bus.last('ask'), {
+    text: 'Plan a simulated strike on contact [[trk:TRK-9|Air-defence guns]] with the least exposure and show me the dry run.',
+    focused_ids: ['frc:red-aaa-1'],
+    draft: true,
+  });
+  byKey(el, 'act:map').fire('click');
+  const req = m.bus.last('map:request');
+  assert.deepEqual(req.ids, ['frc:red-aaa-1']);
+  assert.equal(req.source, 'operator');
+});
+
+test('the strike action needs a session and correlated contacts; blue forces never get it', async () => {
+  let m = mountWargame();
+  let el = await showLoaded(m, 'frc:blue-artillery-1');
+  assert.equal(text(fieldValue(el, 'Strike range')), '20 kmScenario');
+  assert.equal(
+    find(el, (e) => e.tag === 'dt' && text(e) === 'Sensed as'),
+    null,
+    'a blue unit is never sensed',
+  );
+  assert.equal(byKey(el, 'act:strike'), null);
+
+  const uncorrelated = wargameNodes()[0];
+  uncorrelated.id = 'frc:red-aaa-2';
+  uncorrelated.attrs = { ...uncorrelated.attrs, correlated: [] };
+  m = mountWargame({ extra: [uncorrelated] });
+  el = await showLoaded(m, 'frc:red-aaa-2');
+  assert.equal(byKey(el, 'act:strike'), null);
+  assert.equal(text(fieldValue(el, 'Sensed as')), 'Not seen by any sensor yet');
+
+  m = mountWargame({ wargame: { active: false } });
+  el = await showLoaded(m, 'frc:red-aaa-1');
+  assert.equal(byKey(el, 'act:strike'), null, 'no session, no strike');
+});
+
+test('a simulated engagement: title, rows with registers, battle damage and the umpire mismatch', async () => {
+  const m = mountWargame();
+  const el = await showLoaded(m, 'eng:WG-3fa9c1-E7');
+  const bar = byCls(el, 'ic-inspector__titlebar')[0];
+  assert.equal(
+    text(byCls(bar, 'ic-inspector__title')[0]),
+    'Simulated strike on Air-defence guns',
+  );
+  assert.equal(text(byCls(bar, 'ic-inspector__type')[0]), 'Engagement');
+  assert.match(text(bar), /AdjudicatedSimulated/);
+  assert.equal(text(fieldValue(el, 'Attacker')), 'Blue artillery 1Scenario');
+  assert.equal(text(fieldValue(el, 'Target')), 'Air-defence gunsMeasured');
+  assert.equal(
+    text(fieldValue(el, 'Outcome')),
+    'Destroyed (simulated)Scenario',
+  );
+  assert.equal(text(fieldValue(el, 'Consequence')), 'Effect on red');
+  assert.equal(
+    text(fieldValue(el, 'Chance of effect')),
+    '≈ 0.62, notionalEstimated',
+  );
+  assert.match(text(fieldValue(el, 'Inputs')), /Range 3\.2 km of 20\.0 km/);
+  assert.equal(
+    text(fieldValue(el, 'Battle damage')),
+    "No change seen 1 look, last 14:06ZUmpire outcome: destroyed. Sensors haven't confirmed it.",
+  );
+  assert.equal(text(fieldValue(el, 'Approval')), 'Approved by you at 14:04Z');
+  assert.equal(
+    text(fieldValue(el, 'Replay')),
+    'Seed 4417, Engine wg-notional/1, Draw 3',
+  );
+  assert.equal(text(fieldValue(el, 'Adjudicated')), '14:05:12Z');
+  assert.match(text(el), /Simulated\. Nothing real was fired\./);
+  assert.deepEqual(actionWords(el), [
+    'Ask about this',
+    'Focus',
+    'Show on map',
+    'Close',
+  ]);
+});
+
+test('Blue view hides a blue strike outcome until battle damage, and names no red attacker', async () => {
+  const hidden = wargameNodes()[3];
+  hidden.id = 'eng:WG-3fa9c1-E8';
+  hidden.attrs = {
+    ...hidden.attrs,
+    outcome: null,
+    outcome_hidden: true,
+    bda: { state: 'none', looks: 0, last_look_ms: null },
+  };
+  const shot = {
+    ...wargameNodes()[3],
+    id: 'eng:WG-3fa9c1-E9',
+    attrs: {
+      kind: 'red_shot',
+      phase: 'adjudicated',
+      attacker: null,
+      attacker_label: 'Red air defence (not identified)',
+      target: 'veh:Drone1',
+      target_label: 'Drone1',
+      outcome: 'missed',
+      consequence: 'none',
+      simulated: true,
+    },
+  };
+  const m = mountWargame({
+    wargame: { truth_view: false },
+    extra: [hidden, shot],
+  });
+  let el = await showLoaded(m, 'eng:WG-3fa9c1-E8');
+  assert.equal(
+    text(fieldValue(el, 'Outcome')),
+    'Hidden in blue view. Look again to assess damage.Scenario',
+  );
+  const bda = fieldValue(el, 'Battle damage');
+  assert.equal(text(byCls(bda, 'ic-kit-notassessed')[0]), 'Not assessed yet');
+  assert.doesNotMatch(text(bda), /Umpire outcome/);
+  m.inspector.hide();
+  el = await showLoaded(m, 'eng:WG-3fa9c1-E9');
+  assert.equal(
+    text(byCls(el, 'ic-inspector__title')[0]),
+    'Simulated shot on Drone1',
+  );
+  assert.equal(
+    text(fieldValue(el, 'Attacker')),
+    'Red air defence (not identified)Scenario',
+  );
+});
+
+test('a wargame vector: title, rows, legs, threat basis; no Focus', async () => {
+  const m = mountWargame();
+  const el = await showLoaded(m, 'vec:cor-2');
+  assert.equal(
+    text(byCls(el, 'ic-inspector__title')[0]),
+    'Planned corridor from Drone1 to Air-defence guns',
+  );
+  assert.equal(text(fieldValue(el, 'Kind')), 'Planned corridor');
+  assert.equal(text(fieldValue(el, 'Bearing')), '42°');
+  assert.equal(text(fieldValue(el, 'Length')), '4.6 km');
+  assert.equal(text(fieldValue(el, 'Altitude band')), 'Low');
+  assert.equal(text(fieldValue(el, 'Width')), '300 m');
+  assert.equal(text(fieldValue(el, 'Speed')), '12 m/s');
+  assert.equal(text(fieldValue(el, 'ETA')), '≈ 6 min 23 sEstimated');
+  assert.equal(
+    text(fieldValue(el, 'Exposure')),
+    '≈ 42 s exposed; survival ≈ 0.91Estimated',
+  );
+  assert.equal(
+    text(fieldValue(el, 'Against a straight route')),
+    '≈ 118 s less exposure, 1400 m longerEstimated',
+  );
+  const legs = find(el, (e) => e.tag === 'table');
+  assert.equal(findAll(legs, (e) => e.tag === 'tr').length, 3);
+  assert.equal(
+    text(fieldValue(el, 'Threat basis')),
+    'Planned against sensed contactsScenario',
+  );
+  assert.match(text(el), /Simulated\. Computed by the wargame\./);
+  assert.deepEqual(actionWords(el), ['Ask about this', 'Show on map', 'Close']);
+  byKey(el, 'act:map').fire('click');
+  const req = m.bus.last('map:request');
+  assert.ok(req.bbox[0] < 46.6371 && req.bbox[2] > 46.6401, 'both ends inside');
+});
+
+test('the ISR caption pin holds; a scenario contact in a session adds only a Wargame row', async () => {
+  const m = mountWargame();
+  let el = await showLoaded(m, 'trk:TRK-9');
+  assert.equal(
+    text(fieldValue(el, 'Wargame')),
+    'Scenario contact (simulated)Scenario',
+  );
+  assert.match(
+    text(fieldValue(el, 'Threat')),
+    /Model output\. Sensor-posture advice only\./,
+  );
+  m.inspector.hide();
+  // Outside a session, an ordinary contact reads exactly as in ISR mode.
+  const isr = mount();
+  el = await showLoaded(isr, 'trk:T-3fa9c1');
+  assert.equal(
+    find(el, (e) => e.tag === 'dt' && text(e) === 'Wargame'),
+    null,
+  );
+  assert.match(
+    text(fieldValue(el, 'Threat')),
+    /^High ≈EstimatedModel output\. Sensor-posture advice only\.$/,
+  );
+});
+
+test('in a session a mapped site says it is context only; outside it, nothing changes', async () => {
+  const m = mountPlaces({
+    meta: { wargame: { active: true, session_id: 'WG-1' } },
+  });
+  let el = await showLoaded(m, 'sit:dyn-kherson-4f2a:way/1');
+  assert.match(
+    text(el),
+    /Context only\. Real places can't be engaged in the wargame\./,
+  );
+  assert.equal(byKey(el, 'act:strike'), null);
+  const isr = mountPlaces();
+  el = await showLoaded(isr, 'sit:dyn-kherson-4f2a:way/1');
+  assert.doesNotMatch(text(el), /wargame/i);
+});
+
+test('an after-action review offers Read in full', async () => {
+  const m = mount({
+    entity: () =>
+      Promise.resolve({
+        id: 'rpt:aar-WG-1',
+        type: 'report',
+        label: 'After-action review',
+        fields: {
+          report_type: 'AAR',
+          header: { format: 'AAR', report_id: 'aar-WG-1' },
+          markdown: '# After-action review (simulated)',
+        },
+      }),
+  });
+  const el = await showLoaded(m, 'rpt:aar-WG-1');
+  assert.match(text(el), /After-action review \(simulated\)/);
+  byKey(el, 'act:read').fire('click');
+  assert.deepEqual(m.bus.last('read:open'), {
+    id: 'rpt:aar-WG-1',
+    title: 'After-action review (simulated)',
+    markdown: '# After-action review (simulated)',
+  });
+});
+
+test('XSS and bidi fixtures in wargame labels render as text in the inspector (§3.11)', async () => {
+  const hostile = wargameNodes()[0];
+  hostile.id = 'frc:red-x-1';
+  hostile.label = `${BIDI}${XSS}`;
+  hostile.attrs = { ...hostile.attrs, kind_label: XSS, caveats: [XSS] };
+  const eng = wargameNodes()[3];
+  eng.id = 'eng:x';
+  eng.attrs = {
+    ...eng.attrs,
+    attacker: null,
+    attacker_label: XSS,
+    target_label: `${XSS}${BIDI}`,
+  };
+  const m = mountWargame({ extra: [hostile, eng] });
+  for (const id of ['frc:red-x-1', 'eng:x']) {
+    const el = await showLoaded(m, id);
+    assert.equal(findAll(el, (e) => e.tag === 'img').length, 0);
+    assert.equal(
+      findAll(el, (e) => Object.keys(e.attrs || {}).some((k) => /^on/i.test(k)))
+        .length,
+      0,
+    );
+    assert.ok(text(el).includes(XSS));
+    assert.doesNotMatch(text(byCls(el, 'ic-inspector__title')[0]), BIDI_RE);
+    m.inspector.hide();
+  }
 });

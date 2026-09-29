@@ -1367,10 +1367,10 @@ test('approval_request keeps the theater and speed previews and acknowledge_requ
   assert.equal(s.approvals.a2.timeScalePreview, null, 'not an object');
   s = reduce(
     s,
-    ev('approval_request', { approval_id: 'a3', class: 'engagement' }, 3),
+    ev('approval_request', { approval_id: 'a3', class: 'engage' }, 3),
   );
   assert.equal(s.approvals.a3.klass, 'unknown');
-  assert.equal(s.approvals.a3.rawClass, 'engagement');
+  assert.equal(s.approvals.a3.rawClass, 'engage');
   assert.equal(s.rows.c1.klass, 'sim');
 });
 

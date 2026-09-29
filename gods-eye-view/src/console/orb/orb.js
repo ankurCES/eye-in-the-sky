@@ -3,7 +3,8 @@
  *
  *   createOrb(canvas, {onSelect, onHover, a11yHost?, onInput?, onAction?, onNotice?, env?})
  *     → { setGraph, highlight, filter, focus, select, resize, destroy, project,
- *         onFrame, setViewport, snapshot, setOptions, reveal, reframe, … }
+ *         onFrame, setViewport, snapshot, setOptions, reveal, reframe,
+ *         setView, view, … }
  *
  * Default view: the first real picture, and every reset (double-click on
  * empty space, Home), frames the populated latitudes (framingOrientation).
@@ -24,6 +25,14 @@
  * the canvas is off screen, and when `setOptions({paused:true})` (tracking).
  * The canvas backing store changes only on resize(); selecting, opening the
  * inspector plate and focusing move the projection with setViewport().
+ *
+ * The simulated wargame (WG §5.3.3–§5.3.6): forces draw their frames by
+ * side and state, engagements and vectors their burst and arrow, in the
+ * session bands. `setView({umpire})` switches Blue view (every force that is
+ * not provably blue and every red axis hidden, and the Umpire-only edges
+ * with them) and Umpire view (everything, the default). It is a
+ * presentation filter over the graph the shell passes, not a secrecy
+ * boundary; switching is not an arrival, so it rings and announces nothing.
  *
  * Every platform touchpoint (rAF, timers, observers, matchMedia, storage,
  * canvas creation) is feature-checked and injectable through `env`, so the
@@ -49,11 +58,17 @@ import {
 } from './camera.js';
 import {
   COLORS,
-  isKnownType,
+  isOrbType,
   missionPhaseClass,
   statusColor,
   statusKey,
 } from './glyphs.js';
+import {
+  filterForView,
+  isWargameType,
+  wargameGlyphStyle,
+  wargameStyleKey,
+} from './wargameStyles.js';
 import { safeText, siteCategory, theaterChangedText } from './placeText.js';
 import { computeLayout, toVector } from './layout.js';
 import {
@@ -110,10 +125,17 @@ export function densityFactor(n) {
   return Math.min(1.4, Math.max(0.65, 1.4 - n / 400));
 }
 
-/** Node radius in CSS px: (4 + 8·salience)·k, vehicles at least 10. */
+/** Vectors are drawn smaller than other glyphs (WG §5.3.5). */
+export const VECTOR_RADIUS_FACTOR = 0.7;
+
+/**
+ * Node radius in CSS px: (4 + 8·salience)·k, vehicles at least 10, vectors
+ * at 0.7×.
+ */
 export function nodeRadius(node, n) {
   const salience = Math.min(1, Math.max(0, Number(node?.salience) || 0));
   const r = (4 + 8 * salience) * densityFactor(n);
+  if (node?.type === 'vector') return r * VECTOR_RADIUS_FACTOR;
   return node?.type === 'vehicle' ? Math.max(10, r) : r;
 }
 
@@ -478,6 +500,9 @@ export function createOrb(canvas, options = {}) {
   const state = {
     destroyed: false,
     graph: { nodes: [], edges: [] },
+    /** The graph as the shell passed it; `graph` is it filtered for the view. */
+    rawGraph: { nodes: [], edges: [] },
+    view: { umpire: true },
     layout: computeLayout(null),
     vms: [],
     proj: new Float32Array(0),
@@ -778,7 +803,8 @@ export function createOrb(canvas, options = {}) {
     const previous = new Map(state.vms.map((vm) => [vm.id, vm]));
     state.vms = layout.nodes.map((node, index) => {
       const type = String(node.type || '');
-      const known = isKnownType(type);
+      const known = isOrbType(type);
+      const wargame = isWargameType(type);
       // Fail-safe (WG §4.2.1): an unknown type's status is ignored, so it
       // never rings, halos or reads green; a site's status is ignored too.
       const status = offline
@@ -788,6 +814,10 @@ export function createOrb(canvas, options = {}) {
           : type === 'site'
             ? 'ok'
             : statusKey(node.status);
+      // Wargame glyphs (WG §5.3.4, §5.3.6) read side, state, phase,
+      // consequence and kind through closed vocabularies only.
+      const attrs = wargame ? node.attrs : undefined;
+      const wgStyle = wargame ? wargameGlyphStyle(type, attrs, status) : null;
       const phase = node.attrs?.phase;
       const conf =
         type === 'track' ? confidenceKey(node.attrs?.confidence) : '';
@@ -796,10 +826,17 @@ export function createOrb(canvas, options = {}) {
         (Number(node.attrs?.duplicate_count) > 0 ||
           (node.attrs?.duplicates?.length ?? 0) > 0);
       const category = type === 'site' ? siteCategory(node) : undefined;
-      const spec = { type, status, phase, conf, dup, category };
-      const glyphKey = !known ? '?' : category ? `site:${category}` : type;
-      const style =
-        type === 'mission'
+      const spec = { type, status, phase, conf, dup, category, attrs };
+      const glyphKey = !known
+        ? '?'
+        : wargame
+          ? wargameStyleKey(type, attrs, status)
+          : category
+            ? `site:${category}`
+            : type;
+      const style = wgStyle
+        ? wgStyle.color
+        : type === 'mission'
           ? offline
             ? COLORS.stale
             : missionPhaseClass(phase) === 'fill'
@@ -817,6 +854,8 @@ export function createOrb(canvas, options = {}) {
         spriteKey: `${glyphKey}|${status}|${type === 'mission' ? missionPhaseClass(phase) : ''}|${conf}|${dup ? 1 : 0}`,
         color: style,
         critical: status === 'critical',
+        // A wargame style says whether its critical wears the halo.
+        halo: wgStyle ? wgStyle.halo : undefined,
         label: truncate(nodeLabel(node), 32),
         fullLabel: nodeLabel(node),
         subtitle: marginSubtitle(
@@ -1162,6 +1201,7 @@ export function createOrb(canvas, options = {}) {
       hovered: indexOf(hoveredId),
       focus: focusIdx,
       colorOf: (i) => vms[i]?.color,
+      umpire: state.view.umpire,
     });
     // Not live: the canvas desaturates, so the magenta mission lines go grey too.
     if (pictureNotLive(opts.pictureStatus))
@@ -1234,6 +1274,8 @@ export function createOrb(canvas, options = {}) {
       recent,
       detectionsDown: state.detectionsDown,
       sites: siteBandState(state.graph, layout),
+      wargame: layout.wargame,
+      profile: layout.profile,
     });
     const captions =
       R >= 160
@@ -1282,7 +1324,9 @@ export function createOrb(canvas, options = {}) {
       watermark,
       pointsBack: state.ladder >= 1 || n >= 300,
       dropBackHalos: state.ladder >= 1,
-      equipmentTicks: n > 150,
+      // The session profile puts blue forces at −47°, so equipment (−46°)
+      // collapses to ticks (WG §5.3.5).
+      equipmentTicks: n > 150 || layout.profile === 'session',
     };
   }
 
@@ -1766,8 +1810,9 @@ export function createOrb(canvas, options = {}) {
       const prevStatus = new Map(state.vms.map((vm) => [vm.id, vm.status]));
       const prevVms = new Map(state.vms.map((vm) => [vm.id, vm]));
       const prevGraph = state.graph;
-      state.graph =
+      state.rawGraph =
         graph && typeof graph === 'object' ? graph : { nodes: [], edges: [] };
+      state.graph = filterForView(state.rawGraph, state.view);
       state.layout = computeLayout(state.graph, prevLayout);
       state.detectionsDown = detectionsDown(state.graph);
       const { layout } = state;
@@ -1909,6 +1954,36 @@ export function createOrb(canvas, options = {}) {
       refreshTwin();
       scheduleHousekeeping();
       invalidate();
+    },
+    /**
+     * Blue view (`umpire: false`) or Umpire view (`umpire: true`, the
+     * default) (WG §5.3.3). Blue view hides every force that is not provably
+     * blue and every red axis, and the `axis` and `correlates` edges; Umpire
+     * view shows the graph as given. Nodes keep their slots across a switch,
+     * and a switch is not an arrival: no ripple, no notice. A presentation
+     * filter, not a secrecy boundary (the shell asks the server for
+     * `truth=1` only in Umpire view). Anything but a boolean is ignored.
+     * @param {{umpire?: boolean}} [view]
+     * @returns {{umpire: boolean}} the view now in force
+     */
+    setView({ umpire } = {}) {
+      if (
+        !state.destroyed &&
+        typeof umpire === 'boolean' &&
+        umpire !== state.view.umpire
+      ) {
+        state.view = { umpire };
+        orb.setGraph(state.rawGraph, {
+          added: [],
+          removed: [],
+          theaterChanged: null,
+        });
+      }
+      return { ...state.view };
+    },
+    /** The view in force: `{umpire}`. */
+    get view() {
+      return { ...state.view };
     },
     /** Chip or search-result hover: ring + label, others at 70 %. Never rotates. */
     highlight(ids, { by = 'analyst' } = {}) {

@@ -4,13 +4,20 @@ import { AuthError, HttpError, OfflineError } from './api.js';
 import { createBus } from './bus.js';
 import {
   BACKOFF_MS,
+  DEFAULT_WARGAME_VIEW,
   POLL_MS,
+  WARGAME_VIEW_KEY,
   alarmFingerprint,
   alarmFromPayload,
+  blueViewOf,
   createIntelStore,
   diffNodes,
+  graphPath,
   theaterChangeBetween,
+  wargameSessionOf,
 } from './intelStore.js';
+import { isTruthView, wargameOf } from './railWargame.js';
+import { rankNodes } from './search.js';
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -656,4 +663,371 @@ test('theaterChangeBetween: id or both epochs; a missing epoch is not a change',
     2,
   );
   assert.equal(theaterChangeBetween({ id: '' }, { id: 'b' }), null);
+});
+
+// ---- the simulated wargame's view (WG §5.3.3) ---------------------------------------
+
+function wgGraph(active, sessionId = 'WG-3fa9c1', extra = {}) {
+  return graph([node('veh:Drone1', 'vehicle')], [], {
+    meta: {
+      counts: {},
+      caveats: [],
+      wargame: active
+        ? { active: true, session_id: sessionId, truth_view: false }
+        : { active: false, last: null },
+      ...extra,
+    },
+  });
+}
+
+function brokenStorage() {
+  return {
+    getItem() {
+      throw new Error('SecurityError: storage is blocked');
+    },
+    setItem() {
+      throw new Error('QuotaExceededError');
+    },
+  };
+}
+
+test('graphPath: without truth it is the ISR request, byte for byte', () => {
+  assert.equal(graphPath('theater'), '/intel/graph?scope=theater');
+  assert.equal(graphPath('all', false), '/intel/graph?scope=all');
+  assert.equal(
+    graphPath('theater', true),
+    '/intel/graph?scope=theater&truth=1',
+  );
+  assert.equal(wargameSessionOf(wgGraph(true)), 'WG-3fa9c1');
+  assert.equal(wargameSessionOf(wgGraph(false)), null);
+  assert.equal(wargameSessionOf(graph([])), null);
+});
+
+test('ISR mode: no session, no truth, no view; the request never changes', async () => {
+  const { store, api, clock } = setup({
+    replies: [wgGraph(false), graph([])],
+  });
+  store.start();
+  await flush();
+  await clock.advance(POLL_MS);
+  assert.deepEqual(api.calls, [
+    '/intel/graph?scope=theater',
+    '/intel/graph?scope=theater',
+  ]);
+  assert.equal(store.get().view, null);
+  assert.equal(store.get().truth, false);
+  assert.equal(store.view, null);
+  store.stop();
+});
+
+test('a session starts in Umpire view: the store asks again at once with truth=1', async () => {
+  const bus = createBus();
+  const views = [];
+  bus.on('wargame:view', (p) => views.push(p));
+  const { store, api, clock, changes } = setup({
+    replies: [wgGraph(true), wgGraph(true)],
+    bus,
+  });
+  store.start();
+  await flush();
+  assert.equal(store.get().view, DEFAULT_WARGAME_VIEW);
+  assert.equal(changes.at(-1).view, true);
+  assert.deepEqual(views[0], {
+    view: 'umpire',
+    truth: true,
+    session_id: 'WG-3fa9c1',
+  });
+  await clock.advance(0);
+  assert.deepEqual(api.calls, [
+    '/intel/graph?scope=theater',
+    '/intel/graph?scope=theater&truth=1',
+  ]);
+  assert.equal(store.get().truth, true);
+  assert.deepEqual(clock.delays(), [POLL_MS], 'then the usual cadence');
+  store.stop();
+});
+
+test('Blue view drops truth, is kept per session, and a new session starts in Umpire', async () => {
+  const storage = fakeStorage();
+  const { store, api, clock } = setup({
+    storage,
+    replies: [
+      wgGraph(true, 'WG-1'),
+      wgGraph(true, 'WG-1'),
+      wgGraph(true, 'WG-1'),
+      wgGraph(true, 'WG-2'),
+      wgGraph(true, 'WG-2'),
+    ],
+  });
+  store.start();
+  await flush();
+  await clock.advance(0);
+  assert.equal(store.setView('blue'), true);
+  await flush();
+  assert.equal(api.calls.at(-1), '/intel/graph?scope=theater');
+  assert.equal(store.get().view, 'blue');
+  assert.equal(store.get().truth, false);
+  assert.deepEqual(JSON.parse(storage.map.get(WARGAME_VIEW_KEY)), {
+    'WG-1': 'blue',
+  });
+  assert.equal(store.setView('blue'), false, 'no change, no poll');
+  assert.equal(store.setView('red'), false, 'not a view');
+  await clock.advance(POLL_MS);
+  assert.equal(store.get().wargameSession, 'WG-2');
+  assert.equal(store.get().view, 'umpire', 'a new session starts in Umpire');
+  await clock.advance(0);
+  assert.equal(api.calls.at(-1), '/intel/graph?scope=theater&truth=1');
+  store.stop();
+
+  // A reload in the same session restores its view from storage.
+  const again = setup({ storage, replies: [wgGraph(true, 'WG-1')] });
+  again.store.start();
+  await flush();
+  assert.equal(again.store.get().view, 'blue');
+  await again.clock.advance(0);
+  assert.deepEqual(again.api.calls, ['/intel/graph?scope=theater']);
+  again.store.stop();
+});
+
+test('the view flag survives storage failure: it holds in memory and still steers truth', async () => {
+  const { store, api, clock } = setup({
+    storage: brokenStorage(),
+    replies: [wgGraph(true), wgGraph(true), wgGraph(true), wgGraph(true)],
+  });
+  store.start();
+  await flush();
+  assert.equal(store.get().view, 'umpire', 'the default, with no storage');
+  await clock.advance(0);
+  assert.doesNotThrow(() => store.setView('blue'));
+  await flush();
+  assert.equal(store.get().view, 'blue');
+  assert.equal(store.view, 'blue');
+  assert.equal(api.calls.at(-1), '/intel/graph?scope=theater');
+  await clock.advance(POLL_MS);
+  assert.equal(store.get().view, 'blue', 'kept across polls');
+  assert.equal(api.calls.at(-1), '/intel/graph?scope=theater');
+  store.stop();
+});
+
+test('setView drops an in-flight answer for the old view', async () => {
+  let release;
+  const stale = wgGraph(true);
+  stale.nodes.push(node('frc:red-sam-1', 'force'));
+  const { store, api, clock } = setup({
+    replies: [
+      wgGraph(true),
+      () => new Promise((r) => (release = () => r(stale))),
+      wgGraph(true),
+    ],
+  });
+  store.start();
+  await flush();
+  await clock.advance(0);
+  store.setView('blue');
+  await flush();
+  release();
+  await flush();
+  assert.deepEqual(api.calls, [
+    '/intel/graph?scope=theater',
+    '/intel/graph?scope=theater&truth=1',
+    '/intel/graph?scope=theater',
+  ]);
+  assert.ok(
+    !store.get().byId.has('frc:red-sam-1'),
+    'the umpire answer never landed',
+  );
+  store.stop();
+});
+
+test('when the session ends the store returns to the ISR request', async () => {
+  const { store, api, clock } = setup({
+    replies: [wgGraph(true), wgGraph(true), wgGraph(false), wgGraph(false)],
+  });
+  store.start();
+  await flush();
+  await clock.advance(0);
+  await clock.advance(POLL_MS);
+  assert.equal(store.get().view, null);
+  await clock.advance(0);
+  assert.equal(api.calls.at(-1), '/intel/graph?scope=theater');
+  assert.equal(store.get().truth, false);
+  store.stop();
+});
+
+test('entity() asks for truth only in Umpire view during a session (B17)', async () => {
+  const { store, api, clock } = setup({
+    replies: [
+      wgGraph(true),
+      wgGraph(true),
+      { id: 'frc:red-sam-1', fields: {} },
+      { id: 'frc:red-sam-1', fields: {} },
+      wgGraph(true),
+      { id: 'frc:blue-artillery-1', fields: {} },
+    ],
+  });
+  store.start();
+  await flush();
+  await clock.advance(0);
+  assert.equal(store.get().view, 'umpire');
+  await store.entity('frc:red-sam-1');
+  assert.equal(api.calls.at(-1), '/intel/entity/frc%3Ared-sam-1?truth=1');
+  assert.equal(store.setView('blue'), true);
+  await store.entity('frc:red-sam-1');
+  assert.equal(api.calls.at(-1), '/intel/entity/frc%3Ared-sam-1');
+  store.stop();
+});
+
+// ---- leaving Umpire drops the truth in hand at once (review B, ui) ------------------
+
+/** An Umpire (`truth=1`) graph: red truth, truth-only edges, full red counts. */
+function umpireGraph({ reveal = false } = {}) {
+  const force = (id, side, label, extra = {}) =>
+    node(id, 'force', {
+      label,
+      attrs: { side, provenance: 'scenario', simulated: true, ...extra },
+    });
+  return graph(
+    [
+      node('veh:Drone1', 'vehicle', {
+        attrs: { wargame_state: 'lost', wargame_lost_by: 'frc:r1' },
+      }),
+      node('trk:T-1', 'track', { label: 'Contact T-1' }),
+      force('frc:r1', 'red', 'Red SAM 2', { correlated: ['trk:T-1'] }),
+      force('frc:b1', 'blue', 'Blue strike 1'),
+      node('vec:ax1', 'vector', {
+        label: 'Red axis from Red SAM 2',
+        attrs: { kind: 'axis', side: 'red' },
+      }),
+      node('vec:c1', 'vector', {
+        attrs: { kind: 'corridor', side: 'blue' },
+      }),
+      node('eng:e1', 'engagement', {
+        attrs: {
+          kind: 'red_shot',
+          attacker: 'frc:r1',
+          attacker_label: 'Red SAM 2',
+          p_notional: { kill: 0.4 },
+          inputs: ['range'],
+          outcome: 'hit',
+        },
+      }),
+      node('eng:e2', 'engagement', {
+        attrs: { kind: 'blue_strike', outcome: 'destroyed', bda: { looks: 0 } },
+      }),
+    ],
+    [
+      { a: 'frc:r1', b: 'trk:T-1', kind: 'correlates' },
+      { a: 'frc:r1', b: 'veh:Drone1', kind: 'threatens' },
+      { a: 'vec:ax1', b: 'frc:r1', kind: 'axis' },
+      { a: 'eng:e1', b: 'frc:r1', kind: 'launched_by' },
+      { a: 'eng:e1', b: 'veh:Drone1', kind: 'attacks' },
+    ],
+    {
+      meta: {
+        counts: { track: 1 },
+        caveats: [],
+        wargame: {
+          active: true,
+          session_id: 'WG-1',
+          reveal_red: reveal,
+          truth_view: true,
+          counts: { blue: { total: 1 }, red: { total: 1, active: 1, seen: 1 } },
+        },
+      },
+    },
+  );
+}
+
+test('Blue view drops the truth in hand at once and keeps it dropped when the Blue poll fails', async () => {
+  const bus = createBus();
+  const order = [];
+  bus.on('wargame:view', (p) => order.push(`bus:${p.view}`));
+  const { store, api, clock, changes } = setup({
+    bus,
+    replies: [umpireGraph(), umpireGraph(), new OfflineError()],
+  });
+  store.on('change', (d) => d.view && order.push('change'));
+  store.start();
+  await flush();
+  await clock.advance(0);
+  assert.equal(api.calls.at(-1), '/intel/graph?scope=theater&truth=1');
+  assert.equal(store.node('frc:r1')?.label, 'Red SAM 2', 'Umpire shows red');
+  order.length = 0;
+
+  assert.equal(store.setView('blue'), true);
+  assert.deepEqual(order, ['bus:blue', 'change'], 'the orb hides red first');
+  const diff = changes.at(-1);
+  assert.equal(diff.graph, true);
+  assert.ok(diff.removed.includes('frc:r1'));
+  await flush();
+  assert.equal(api.calls.at(-1), '/intel/graph?scope=theater');
+
+  const st = store.get();
+  assert.equal(st.status, 'stale', 'the Blue poll failed');
+  assert.equal(st.view, 'blue');
+  assert.equal(st.truth, false);
+  assert.equal(store.node('frc:r1'), null);
+  assert.equal(store.node('vec:ax1'), null);
+  assert.deepEqual(rankNodes(st.graph, 'sam'), [], 'search finds no red');
+  assert.equal(isTruthView(st.graph, st.truth), false, 'inspector, rail');
+  assert.deepEqual(wargameOf(st.graph).counts.red, { seen: 1 });
+  assert.equal(store.node('frc:b1').label, 'Blue strike 1');
+  assert.equal(store.node('vec:c1').attrs.kind, 'corridor');
+  assert.deepEqual(
+    st.graph.edges.map((e) => e.kind),
+    ['attacks'],
+    'no truth-only edge, nothing at a dropped node',
+  );
+  const e1 = store.node('eng:e1').attrs;
+  assert.equal(e1.attacker, null);
+  assert.equal(e1.attacker_label, 'Red air defence (not identified)');
+  assert.equal(e1.p_notional, null);
+  assert.deepEqual(e1.inputs, []);
+  const e2 = store.node('eng:e2').attrs;
+  assert.equal(e2.outcome, null);
+  assert.equal(e2.outcome_hidden, true);
+  assert.equal(store.node('veh:Drone1').attrs.wargame_lost_by, null);
+  assert.equal(st.graph.meta.counts.track, 1, 'the ISR picture is kept');
+  store.stop();
+});
+
+test('blueViewOf: a revealed session keeps red but never truth-only data; outside a session it is the graph', () => {
+  const g = umpireGraph({ reveal: true });
+  const blue = blueViewOf(g);
+  assert.ok(
+    blue.nodes.some((n) => n.id === 'frc:r1'),
+    'revealed red stays',
+  );
+  const r1 = blue.nodes.find((n) => n.id === 'frc:r1');
+  assert.equal(Object.hasOwn(r1.attrs, 'correlated'), false);
+  assert.deepEqual(blue.edges.map((e) => e.kind).sort(), [
+    'attacks',
+    'launched_by',
+  ]);
+  assert.equal(blue.meta.wargame.truth_view, true);
+  assert.deepEqual(blue.meta.wargame.counts, g.meta.wargame.counts);
+  assert.ok(g.nodes.find((n) => n.id === 'frc:r1').attrs.correlated, 'pure');
+  const isr = wgGraph(false);
+  assert.equal(blueViewOf(isr), isr);
+  assert.equal(blueViewOf(null), null);
+});
+
+test('Umpire from Blue keeps the Blue graph until the truth graph lands', async () => {
+  const blue = wgGraph(true, 'WG-1');
+  const { store, clock, changes } = setup({
+    storage: fakeStorage(),
+    replies: [blue, umpireGraph(), blue],
+  });
+  store.start();
+  await flush();
+  await clock.advance(0);
+  store.setView('blue');
+  await flush();
+  const before = store.get().graph;
+  const n = changes.length;
+  store.setView('umpire');
+  assert.equal(store.get().graph, before, 'nothing to drop');
+  assert.equal(changes.length, n + 1);
+  assert.equal(changes.at(-1).graph, false);
+  store.stop();
 });

@@ -303,6 +303,30 @@
   color: #bba7e0;
 }
 
+/* The simulated wargame (WG §5.3.1): Sand is the umpire's ink. An
+   engagement waiting on the operator reads in Sand; the Scenario register is
+   a Sand tag ("Set by the wargame, not seen by a sensor.", as its title). */
+:where(.ic-root) .ic-orb-list__status[data-status='sand'] {
+  color: var(--ic-sand, #cdbc8c);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-orb-list__register[data-register='scenario'] {
+  color: var(--ic-sand, #cdbc8c);
+  white-space: nowrap;
+}
+
+:where(.ic-root) .ic-orb-list__register[data-register='scenario']::before {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 2px;
+  background: var(--ic-sand, #cdbc8c);
+  vertical-align: 0;
+}
+
 :where(.ic-root) .ic-orb-list__empty {
   margin: 0;
   padding: 16px 12px;
@@ -338,6 +362,10 @@
   :where(.ic-root) .ic-orb-label__sub,
   :where(.ic-root) .ic-orb-more {
     color: CanvasText;
+  }
+
+  :where(.ic-root) .ic-orb-list__register[data-register='scenario']::before {
+    background: CanvasText;
   }
 
   :where(.ic-root) .ic-orb-label__new {

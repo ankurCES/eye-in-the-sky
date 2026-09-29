@@ -2,7 +2,8 @@
 
 The policy must FAIL CLOSED and must cover every tool the real server
 registers, so this file builds the real GodseyeUavServer in-process (no sim
-needed just to list tools) and iterates its catalog.
+needed just to list tools) and iterates its catalog -- and its never-mounted
+simulated wargame registry (`srv.wargame_mcp`, M14a; WG spec §5.2.11, §6).
 """
 import asyncio
 import dataclasses
@@ -13,9 +14,11 @@ import re
 import pytest
 from godseye_uav import analyst_policy as pol
 from godseye_uav import theater_tools
+from godseye_uav import wargame_tools as wargame_registry
 from godseye_uav.analyst_policy import (
     COMMAND,
     DRY_RUN_TOOLS,
+    ENGAGEMENT,
     KNOWN_TOOLS,
     PLAN,
     READ,
@@ -47,9 +50,13 @@ EXPECTED_CLASS = {
         "uav_list_tracks", "intel_overview", "intel_search", "intel_entity",
         "read_intel_resource", "ui_focus", "ui_track", "ui_show_orb", "ui_inspect",
         # runtime theaters (WG spec §3.7, A8)
-        "geo_lookup", "geo_sites", "ui_show_map")},
+        "geo_lookup", "geo_sites", "ui_show_map",
+        # simulated wargame (M14a, WG spec §5.2.11, B7)
+        "wg_session_status", "wg_list_forces", "wg_list_classes")},
     "mission_dry_run": PLAN,
     "theater_propose": PLAN,
+    "wg_plan_corridor": PLAN,
+    "wg_propose_strike": PLAN,
     **{t: SENSOR for t in ("uav_get_detections", "uav_scan_targets", "uav_capture_image",
                            "uav_set_gimbal", "uav_set_fov")},
     **{t: COMMAND for t in (
@@ -61,8 +68,11 @@ EXPECTED_CLASS = {
     **{t: SIM for t in ("sim_set_time", "sim_set_weather", "sim_spawn_target",
                         "sim_move_target", "sim_set_gps_degradation", "sim_hydrate_real_data",
                         "sim_spawn_order_of_battle", "sim_set_environment",
-                        "sim_set_theater", "sim_set_time_scale")},
+                        "sim_set_theater", "sim_set_time_scale",
+                        "wg_session_start", "wg_session_end", "wg_generate_scenario",
+                        "wg_spawn_force")},
     **{t: SAFETY_OVERRIDE for t in ("sim_set_fuel", "sim_set_link_state", "sim_reset")},
+    "wg_execute_engagement": ENGAGEMENT,
 }
 
 MOVEMENT_AND_MISSION = (
@@ -72,15 +82,29 @@ MOVEMENT_AND_MISSION = (
 
 
 @pytest.fixture(scope="module")
-def server_tools(tmp_path_factory):
-    """``{name: Tool}`` for every tool the real server registers."""
+def catalogs(tmp_path_factory):
+    """``({name: Tool}, {name: Tool})``: every tool the real server registers on
+    /mcp, and every tool of its never-mounted wargame registry (M14a)."""
     store = Store(tmp_path_factory.mktemp("policy-store"))
     try:
         srv = GodseyeUavServer(None, store)
         tools = asyncio.run(srv.mcp.list_tools())
-        return {t.name: t for t in tools}
+        wargame = asyncio.run(srv.wargame_mcp.list_tools())
+        return {t.name: t for t in tools}, {t.name: t for t in wargame}
     finally:
         store.close()
+
+
+@pytest.fixture(scope="module")
+def server_tools(catalogs):
+    """``{name: Tool}`` for every tool the real server registers."""
+    return catalogs[0]
+
+
+@pytest.fixture(scope="module")
+def wargame_tools(catalogs):
+    """``{name: Tool}`` for every tool on `srv.wargame_mcp`."""
+    return catalogs[1]
 
 
 @pytest.fixture(scope="module")
@@ -111,7 +135,7 @@ def test_expected_table_matches_policy_exactly():
         assert d.klass == klass, name
         assert d.auto is (klass in (READ, PLAN)), name
         assert d.allow_session is (klass == SENSOR), name
-        assert d.acknowledge is (klass == SAFETY_OVERRIDE), name
+        assert d.acknowledge is (klass in (SAFETY_OVERRIDE, ENGAGEMENT)), name
     assert set(EXPECTED_CLASS) == set(KNOWN_TOOLS)
 
 
@@ -216,9 +240,9 @@ def test_only_sensor_tools_may_be_allowed_for_the_session():
             assert d.allow_session is True and d.auto is False, name
 
 
-def test_command_sim_and_override_are_never_session_approvable():
+def test_command_sim_override_and_engagement_are_never_session_approvable():
     for name, klass in EXPECTED_CLASS.items():
-        if klass in (COMMAND, SIM, SAFETY_OVERRIDE):
+        if klass in (COMMAND, SIM, SAFETY_OVERRIDE, ENGAGEMENT):
             for args in ({}, {"vehicle": "Drone1"}, {"vehicle": "Drone1", "survey": True}):
                 d = classify(name, args)
                 assert d.allow_session is False and d.auto is False, name
@@ -227,8 +251,8 @@ def test_command_sim_and_override_are_never_session_approvable():
 # --------------------------------------------------------- static allowlist --
 
 def test_static_auto_tools_hold_only_arg_independent_reads():
-    forbidden = {n for n, k in EXPECTED_CLASS.items() if k in (SENSOR, COMMAND, SIM,
-                                                               SAFETY_OVERRIDE)}
+    forbidden = {n for n, k in EXPECTED_CLASS.items() if k in (PLAN, SENSOR, COMMAND, SIM,
+                                                               SAFETY_OVERRIDE, ENGAGEMENT)}
     assert not (STATIC_AUTO_TOOLS & forbidden)
     assert "mission_dry_run" not in STATIC_AUTO_TOOLS  # arg-dependent: lost_link_plan
     assert not (STATIC_AUTO_TOOLS & DRY_RUN_TOOLS)
@@ -261,7 +285,7 @@ def test_titles_summaries_and_consequences_are_human(name):
     assert d.summary and len(d.summary) <= 200
     assert "_" not in d.title, d.title
     assert isinstance(d.consequences, tuple)
-    if d.klass in (COMMAND, SENSOR, SIM, SAFETY_OVERRIDE):
+    if d.klass in (COMMAND, SENSOR, SIM, SAFETY_OVERRIDE, ENGAGEMENT):
         assert d.consequences, name
     for c in d.consequences:
         assert _sentence_case(c) and c.endswith("."), c
@@ -594,10 +618,11 @@ def test_a_lost_link_plan_on_a_theater_tool_is_not_claimed(name):
 
 # ------------------------------------------------------------ acknowledge --
 
-def test_only_safety_overrides_ask_for_an_acknowledgement():
-    assert pol.ACKNOWLEDGE_CLASSES == {SAFETY_OVERRIDE}
+def test_only_safety_overrides_and_engagements_ask_for_an_acknowledgement():
+    assert pol.ACKNOWLEDGE_CLASSES == {SAFETY_OVERRIDE, ENGAGEMENT}
     for name, klass in EXPECTED_CLASS.items():
-        assert classify(name, {"vehicle": "Drone1"}).acknowledge is (klass == SAFETY_OVERRIDE)
+        assert classify(name, {"vehicle": "Drone1"}).acknowledge is (
+            klass in (SAFETY_OVERRIDE, ENGAGEMENT)), name
     assert classify("uav_teleport", {}).acknowledge is False
 
 
@@ -746,40 +771,88 @@ def test_theater_read_and_plan_summaries():
 
 
 # ------------------------------------------------------ the analyst prompt --
+# WG spec §5.2.11 (B7): `analyst_prompt.md` is the base (everything except
+# `## Identity`), `analyst_prompt_isr.md` the default identity and
+# `analyst_prompt_wargame.md` the simulated wargame addendum (session only).
 
-#: The eleven chip prefixes of Phase A (WG spec §3.1: `sit` joins the ten).
-PROMPT_PREFIXES = ["veh", "msn", "trk", "unit", "ob", "rpt", "thr", "poi", "sit", "alarm", "feed"]
+#: The fourteen chip prefixes (WG spec §3.1: `sit` in Phase A; `frc eng vec` in B).
+PROMPT_PREFIXES = ["veh", "msn", "trk", "unit", "ob", "rpt", "thr", "poi", "sit", "frc", "eng",
+                   "vec", "alarm", "feed"]
+PROMPT_FILES = ("analyst_prompt.md", "analyst_prompt_isr.md", "analyst_prompt_wargame.md")
+
+#: `analyst_prompt.md:9-14` at Phase A, moved verbatim into the ISR identity.
+HEAD_ISR_IDENTITY = """\
+## Identity: ISR only
+
+This system observes, classifies and reports. It has no weapons and you never reason about engaging,
+striking, targeting for fires or prosecuting anything. If asked to attack, say plainly that this is an
+ISR system and offer observation instead. Threat output is sensor-posture and self-protection advice
+only (stand off, climb, change aspect, break contact), never an engagement recommendation.
+"""
+#: WG spec §5.2.11: the paragraph that follows it.
+M14A_OFF = ("The simulated wargame (M14a) is off in this session. If the operator asks to simulate "
+            "an attack between simulated forces, offer to start one with `wg_session_start`, which "
+            "they approve. Until then you have no wargame tools. Real places are never targets in "
+            "any mode.")
+#: The ISR refusal line: in the ISR identity, never in the wargame prompt.
+REFUSAL_LINE = ("If asked to attack, say plainly that this is an ISR system and offer observation "
+                "instead.")
+WARGAME_HEADING = "## Identity: simulated wargame (M14a)"
+_BIDI = {chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))}
+_TOOL_RX = re.compile(r"\b((?:wg|uav|mission|sim|intel|ui|geo|theater)_[a-z_]+)")
+PYPROJECT = pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml"
+PYI_SPEC = pathlib.Path(__file__).resolve().parents[1] / "packaging" / "macos" / "EyeInTheSky.spec"
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _read_prompt(name: str) -> str:
+    from importlib.resources import files
+
+    return files("godseye_uav").joinpath(name).read_text(encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
 def prompt_text():
-    from importlib.resources import files
+    """The base prompt."""
+    return _read_prompt("analyst_prompt.md")
 
-    return files("godseye_uav").joinpath("analyst_prompt.md").read_text(encoding="utf-8")
+
+@pytest.fixture(scope="module")
+def isr_text():
+    return _read_prompt("analyst_prompt_isr.md")
 
 
-def test_prompt_keeps_the_isr_only_identity_where_b7_splits_it(prompt_text):
+@pytest.fixture(scope="module")
+def wargame_text():
+    return _read_prompt("analyst_prompt_wargame.md")
+
+
+def test_the_base_prompt_is_everything_but_the_identity(prompt_text):
     lines = prompt_text.splitlines()
-    # WG spec §5.1: B7 splits `analyst_prompt.md:9-14` out as the ISR identity.
-    assert lines[8] == "## Identity: ISR only"
-    assert lines[10].startswith("This system observes, classifies and reports.")
-    assert lines[13].endswith("never an engagement recommendation.")
-    assert lines[14] == "" and lines[15] == "## How the console works"
-    assert prompt_text.count("## Identity") == 1
+    assert lines[0] == "# Eye in the Sky — ISR analyst"
+    # the intro paragraph, then straight into the console section
+    assert lines[7] == "" and lines[8] == "## How the console works"
+    assert "## Identity" not in prompt_text
+    assert REFUSAL_LINE not in _flat(prompt_text)
     assert "No engagement recommendations." in prompt_text
+    assert "wg_" not in prompt_text                        # wargame tools: addendum only
 
 
-def test_prompt_prefix_list_has_the_eleven_prefixes(prompt_text):
-    flat = " ".join(prompt_text.split())
-    m = re.search(r"The prefixes are exactly these eleven \(`([a-z ]+)`\)", flat)
+def test_prompt_prefix_list_has_the_fourteen_prefixes(prompt_text):
+    flat = _flat(prompt_text)
+    m = re.search(r"The prefixes are exactly these fourteen \(`([a-z ]+)`\)", flat)
     assert m, "the prefix sentence moved or changed"
     assert m.group(1).split() == PROMPT_PREFIXES
     used = set(re.findall(r"\[\[([a-z]+):", prompt_text)) - {"type"}
     assert used == set(PROMPT_PREFIXES)
+    assert "`[[frc:…|Red SAM 1]]`" in prompt_text          # a generic designator
 
 
 def test_prompt_teaches_the_theater_workflow(prompt_text):
-    flat = " ".join(prompt_text.split())
+    flat = _flat(prompt_text)
     for needle in (
         "call `geo_lookup` (or take the coordinates the operator gives), then `theater_propose`",
         "Choose `airframe=\"group3_fixed_wing\"` for areas wider than about 6 km.",
@@ -793,7 +866,7 @@ def test_prompt_teaches_the_theater_workflow(prompt_text):
         "A missing site is not an absent one.",
         "`ui_show_map` shows an area on the map.",
         "A recce is `mission_recon_route` or `mission_grid_search`, dry run first.",
-        "it stays ISR only, and a real place is context, never a target.",
+        "it never changes the doctrine mode, and a real place is context, never a target.",
     ):
         assert needle in flat, needle
 
@@ -801,7 +874,7 @@ def test_prompt_teaches_the_theater_workflow(prompt_text):
 def test_prompt_names_every_phase_a_tool_and_their_approval_class(prompt_text):
     for name in PHASE_A_TITLES:
         assert f"`{name}`" in prompt_text, name
-    flat = " ".join(prompt_text.split())
+    flat = _flat(prompt_text)
     reads = flat[flat.index("**Reads run at once.**"):flat.index("**Everything else waits")]
     for name in ("geo_lookup", "geo_sites", "theater_propose"):
         assert name in reads and EXPECTED_CLASS[name] in (READ, PLAN)
@@ -810,8 +883,350 @@ def test_prompt_names_every_phase_a_tool_and_their_approval_class(prompt_text):
         assert name in asks and EXPECTED_CLASS[name] == SIM
 
 
-def test_prompt_stays_isr_in_phase_a(prompt_text):
-    assert "wg_" not in prompt_text
-    assert "ISR only" in prompt_text
-    bidi = {chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))}
-    assert not bidi & set(prompt_text)
+def test_the_isr_identity_is_the_phase_a_section_verbatim_then_the_m14a_paragraph(isr_text):
+    assert isr_text.startswith(HEAD_ISR_IDENTITY + "\n")
+    rest = isr_text[len(HEAD_ISR_IDENTITY) + 1:]
+    assert _flat(rest) == M14A_OFF
+    assert "ISR only" in isr_text and REFUSAL_LINE in _flat(isr_text)
+    assert isr_text.count("## ") == 1
+    # the only wargame tool it names is one the ISR toolbelt carries
+    named = set(_TOOL_RX.findall(isr_text))
+    assert named == {"wg_session_start"} and named <= pol.WG_ENTRY_TOOLS
+
+
+def test_the_wargame_addendum_is_its_own_identity(wargame_text):
+    lines = wargame_text.splitlines()
+    assert lines[0] == WARGAME_HEADING and wargame_text.count("## ") == 1
+    flat = _flat(wargame_text)
+    assert REFUSAL_LINE not in flat and "ISR only" not in flat
+    assert "## Identity: ISR only" not in wargame_text
+    for needle in (
+        "A simulated wargame session is active.",
+        "Nothing real is fired.",
+        "Only scenario units can be engaged.",
+        "never targets; the server refuses them.",
+        "give positions relative to the AO centre.",
+        "Drones never deliver effects. Shooters are blue scenario units.",
+        "`wg_propose_strike(shooter_id, target_track_id)`",
+        "then call `wg_execute_engagement` with `execute_args` exactly.",
+        "The operator approves every engagement in the console.",
+        "in blue view outcomes stay hidden until battle damage assessment.",
+        "`wg_plan_corridor(relook=true)` and fly `mission_recon_route(**recon_args)`, dry run first;",
+        "Probabilities are notional play-balance numbers; say so.",
+        ("End with `wg_session_end` and cite the after-action review as "
+         "`uav://reports/aar-<session id>`."),
+    ):
+        assert needle in flat, needle
+
+
+def test_every_tool_the_prompts_name_is_one_the_policy_knows(prompt_text, isr_text,
+                                                             wargame_text):
+    """A prompt must never teach a tool the policy would fail closed on."""
+    for text in (prompt_text, isr_text, wargame_text):
+        for name in set(_TOOL_RX.findall(text)):
+            assert name in KNOWN_TOOLS, name
+    assert {"wg_propose_strike", "wg_execute_engagement", "wg_plan_corridor",
+            "wg_session_end"} <= set(_TOOL_RX.findall(wargame_text))
+
+
+def test_the_prompts_hold_no_bidi_and_no_real_system_tokens(prompt_text, isr_text, wargame_text):
+    from support.wg_tokens import assert_no_real_system_tokens
+
+    for text in (prompt_text, isr_text, wargame_text):
+        assert not _BIDI & set(text)
+        assert "none may be added" not in text.lower()     # doctrine lint (B0)
+    # The addendum's own "No weaponeering:" line names the banned terms to ban
+    # them; every other line of it is held to the wargame token rule.
+    lines = [ln for ln in _flat(wargame_text).split("- ") if not ln.startswith("No weaponeering")]
+    assert len(lines) >= 6
+    assert_no_real_system_tokens(lines)
+    assert_no_real_system_tokens(M14A_OFF)
+
+
+def test_every_prompt_file_ships_as_package_data():
+    import tomllib
+
+    data = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    listed = data["tool"]["setuptools"]["package-data"]["godseye_uav"]
+    spec = PYI_SPEC.read_text(encoding="utf-8")
+    for name in PROMPT_FILES:
+        assert name in listed, name
+        assert f'"{name}"' in spec, name
+        assert _read_prompt(name).strip(), name
+
+
+def test_the_composed_prompt_follows_the_mode():
+    """B8's `_load_prompt(mode)` returns base + identity (WG spec §5.2.11).  The
+    ISR prompt keeps "ISR only" and the refusal line (`test_chat.py:490`); the
+    wargame prompt has its own identity and lacks the refusal line."""
+    import inspect
+
+    from godseye_uav import chat
+
+    if not inspect.signature(chat._load_prompt).parameters:
+        pytest.skip("B8 adds _load_prompt(mode); not merged yet")
+    isr = chat._load_prompt("isr")
+    assert isr == chat._load_prompt()                        # ISR is the default
+    wargame = chat._load_prompt("wargame")
+    base = _flat(_read_prompt("analyst_prompt.md"))
+    assert "ISR only" in isr and REFUSAL_LINE in _flat(isr)
+    assert _flat(HEAD_ISR_IDENTITY) in _flat(isr) and M14A_OFF in _flat(isr)
+    assert WARGAME_HEADING not in isr
+    assert WARGAME_HEADING in wargame and REFUSAL_LINE not in _flat(wargame)
+    assert "## Identity: ISR only" not in wargame and M14A_OFF not in _flat(wargame)
+    for prompt in (isr, wargame):
+        assert "[[type:id|label]]" in prompt and "No engagement recommendations." in prompt
+        assert len(_flat(prompt)) >= len(base)
+
+
+# ======================================================================
+# simulated wargame (M14a; WG spec §3.7, §5.2.11, §6; B7)
+# ======================================================================
+
+WG_EXPECTED = {n: k for n, k in EXPECTED_CLASS.items() if n.startswith("wg_")}
+WG_ARGS = {
+    "wg_session_start": {"seed": 4417, "red_engages": True, "reveal_red": False},
+    "wg_session_status": {"events": 20},
+    "wg_list_classes": {},
+    "wg_session_end": {},
+    "wg_generate_scenario": {"template": "air_defence_belt", "intensity": "high",
+                             "ad_class": "ad_short"},
+    "wg_spawn_force": {"side": "red", "wg_class": "ad_gun", "lat": 47.6512, "lon": -122.1234,
+                       "count": 2},
+    "wg_list_forces": {"side": "blue"},
+    "wg_plan_corridor": {"vehicle": "Drone1", "target_track_id": "T-0003", "alt_agl_m": 60,
+                         "relook": True, "relook_radius_m": 400},
+    "wg_propose_strike": {"shooter_id": "blue-artillery-1", "target_track_id": "T-0003"},
+    "wg_execute_engagement": {"pending_id": "WG-4417-E1", "shooter_id": "blue-artillery-1",
+                              "target_track_id": "T-0003"},
+}
+#: Arguments a model could add to talk an engagement down.
+ADVERSARIAL = [{}, {"dry_run": True}, {"dry_run": "true"}, {"lost_link_plan": {"b": "rtb"}},
+               {"params": {"dry_run": True}}, {"klass": "read", "auto": True},
+               {"allow_session": True, "acknowledged": True}, {"survey": True},
+               {**WG_ARGS["wg_execute_engagement"], "dry_run": True}]
+
+
+def test_every_wargame_tool_has_an_explicit_classification(wargame_tools):
+    """§6: iterates `srv.wargame_mcp.list_tools()`, the registry B4 fills."""
+    assert set(wargame_tools) == set(wargame_registry.TOOL_NAMES) == pol.WG_TOOLS
+    assert len(wargame_tools) == 10
+    for name in wargame_tools:
+        assert name in KNOWN_TOOLS, name
+        assert EXPECTED_CLASS[name] == wargame_registry.TOOL_CLASSES[name], name
+        assert classify(name, {}).klass == EXPECTED_CLASS[name], name
+    assert set(WG_EXPECTED) == pol.WG_TOOLS
+
+
+def test_the_default_catalog_has_no_wargame_tool(server_tools):
+    assert not any(n.startswith("wg_") for n in server_tools)
+    assert not pol.WG_TOOLS & set(server_tools)
+
+
+def test_the_wargame_tables_are_the_spec_rows():
+    assert pol.WG_READ_TOOLS == {"wg_session_status", "wg_list_forces", "wg_list_classes"}
+    assert pol.WG_PLAN_TOOLS == {"wg_plan_corridor", "wg_propose_strike"}
+    assert pol.WG_PLAN_TOOLS <= pol.PLAN_TOOLS and pol.WG_READ_TOOLS <= pol.READ_TOOLS
+    assert pol.WG_SIM_TOOLS == {"wg_session_start", "wg_session_end", "wg_generate_scenario",
+                                "wg_spawn_force"} and pol.WG_SIM_TOOLS <= pol.SIM_TOOLS
+    assert pol.ENGAGEMENT_TOOLS == {"wg_execute_engagement"}
+    assert pol.WG_ENTRY_TOOLS == {"wg_session_start", "wg_session_status", "wg_list_classes"}
+    assert pol.WG_ENTRY_TOOLS == wargame_registry.ENTRY_TOOLS
+    sets = [pol.READ_TOOLS, pol.PLAN_TOOLS, pol.SENSOR_TOOLS, pol.COMMAND_TOOLS, pol.SIM_TOOLS,
+            pol.SAFETY_OVERRIDE_TOOLS, pol.ENGAGEMENT_TOOLS]
+    for i, a in enumerate(sets):                           # exactly one class per tool
+        for b in sets[i + 1:]:
+            assert not a & b, a & b
+
+
+def test_engagement_is_a_class_of_its_own():
+    assert ENGAGEMENT == "engagement" and ENGAGEMENT in pol.CLASSES
+    assert ENGAGEMENT not in pol.AUTO_CLASSES and ENGAGEMENT not in pol.SESSION_CLASSES
+    assert ENGAGEMENT in pol.ACKNOWLEDGE_CLASSES
+    assert not pol.ENGAGEMENT_TOOLS & STATIC_AUTO_TOOLS
+
+
+@pytest.mark.parametrize("args", ADVERSARIAL)
+@pytest.mark.parametrize("tool", ["wg_execute_engagement", f"{TOOL_PREFIX}wg_execute_engagement"])
+def test_an_engagement_always_asks_with_an_acknowledgement(tool, args):
+    d = classify(tool, args)
+    assert d.klass == ENGAGEMENT
+    assert d.auto is False and d.allow_session is False and d.acknowledge is True
+    assert d.title == "Execute a simulated engagement"
+    assert "dry run" not in d.summary and "lost-link" not in d.summary
+    assert not any("lost-link" in c or "nothing is queued" in c for c in d.consequences)
+
+
+def test_a_policy_bug_keeps_an_engagement_an_engagement(monkeypatch):
+    """Fail closed means the stricter class: the fallback must not turn an
+    engagement into a plain command (no acknowledgement, no console path)."""
+    monkeypatch.setattr(pol, "_summary", lambda *a, **k: 1 / 0)
+    d = classify("wg_execute_engagement", WG_ARGS["wg_execute_engagement"])
+    assert d.klass == ENGAGEMENT and d.acknowledge is True
+    assert d.auto is False and d.allow_session is False
+    assert d.consequences == pol.WG_ENGAGEMENT_NOTES
+    other = classify("wg_spawn_force", WG_ARGS["wg_spawn_force"])
+    assert other.klass == COMMAND and other.auto is False and other.acknowledge is False
+
+
+@pytest.mark.parametrize("tool", ["wg_fire", "wg_execute_engagement2", "wg_",
+                                  "mcp__other__wg_execute_engagement", "wg_session_starts"])
+def test_an_unknown_wargame_name_fails_closed(tool):
+    d = classify(tool, {"dry_run": True})
+    assert d.klass == COMMAND and d.auto is False and d.allow_session is False
+
+
+def test_wargame_reads_run_at_once_and_everything_else_wg_waits():
+    for name, klass in WG_EXPECTED.items():
+        for args in ADVERSARIAL:
+            d = classify(name, args)
+            assert d.klass == klass, (name, args)
+            assert d.auto is (klass in (READ, PLAN)), name
+            assert d.allow_session is False, name
+            assert (name in STATIC_AUTO_TOOLS) is (klass == READ), name
+
+
+def test_wargame_titles_match_the_registry_the_server_and_the_console(wargame_tools):
+    for name in pol.WG_TOOLS:
+        assert pol._TITLES[name] == wargame_registry.TITLES[name], name
+        assert wargame_tools[name].title == pol._TITLES[name], name    # the server title wins
+        assert classify(name, {}).title == pol._TITLES[name], name
+    if FORMAT_JS.is_file():
+        text = FORMAT_JS.read_text(encoding="utf-8")
+        block = text[text.index("export const TOOL_TITLES"):]
+        block = block[:block.index("});")]
+        js = dict(re.findall(r"^\s*([a-z_]+): '([^']*)',?\s*$", block, re.MULTILINE))
+        for name in pol.WG_TOOLS:
+            assert js.get(name) == pol._TITLES[name], name
+
+
+def test_session_start_consequences_are_the_spec_lines():
+    d = classify("wg_session_start", WG_ARGS["wg_session_start"])
+    assert d.klass == SIM and d.title == "Start a simulated wargame"
+    assert d.summary == "seed 4417 · red may fire"
+    assert d.consequences == (
+        ("Starts a simulated wargame session (M14a). The analyst gets the wargame tools; every "
+         "engagement will still ask you first."),
+        "Nothing real is fired. Scenario units are simulated and kept away from mapped real places.",
+        ("Red air defence may down drones automatically; a downed drone's current task is "
+         "aborted and it stays down until the wargame ends."),
+        ("Refused under real AirSim, during a theater switch, and in theaters not cleared for "
+         "the wargame."),
+    )
+    held = classify("wg_session_start", {"seed": 4417, "red_engages": False, "reveal_red": True})
+    assert held.consequences[2] == "Red forces won't fire in this session."
+    assert held.summary == "seed 4417 · red holds fire · red revealed to the planner"
+
+
+@pytest.mark.parametrize("value", [None, True, "false", 0, "no"])
+def test_red_holds_fire_is_claimed_only_for_a_literal_false(value):
+    """Erring toward "red may fire" keeps the card honest: it never promises a
+    quiet session the server might not give."""
+    args = {} if value is None else {"red_engages": value}
+    d = classify("wg_session_start", args)
+    assert d.consequences[2].startswith("Red air defence may down drones")
+
+
+def test_session_end_generate_and_spawn_consequences_are_the_spec_lines():
+    assert classify("wg_session_end", {}).consequences == (
+        ("Ends the simulated wargame: scenario units, their contacts and waiting engagements "
+         "are removed."),
+        "Downed drones are restored at home, landed. The after-action review is kept as a report.",
+        "Aircraft keep their current tasks.",
+    )
+    gen = classify("wg_generate_scenario", WG_ARGS["wg_generate_scenario"])
+    assert gen.summary == "air-defence belt · high · surface-to-air, short range"
+    assert gen.consequences == (
+        "Places simulated scenario units for the air-defence belt template (high).",
+        ("Units are kept at least 500 m from mapped places and theater points and, for red, "
+         "1 km from home."),
+        "Refused if the area has no room for them.",
+    )
+    assert classify("wg_generate_scenario", {"template": "mech_advance"}).consequences[0] == (
+        "Places simulated scenario units for the mechanised advance template (medium).")
+    spawn = classify("wg_spawn_force", WG_ARGS["wg_spawn_force"])
+    assert spawn.summary == "red · air-defence guns · ×2 · 47.6512, -122.1234"
+    assert spawn.consequences == (
+        "Adds 2 simulated red air-defence guns near 47.6512, -122.1234.",
+        ("Refused within 500 m of a mapped place or theater point, within 1 km of home (red), "
+         "or within 200 m of another unit."),
+    )
+    one = classify("wg_spawn_force", {"side": "blue", "wg_class": "blue_artillery",
+                                      "lat": 47.6, "lon": -122.1})
+    assert one.consequences[0] == "Adds 1 simulated blue artillery battery near 47.6000, -122.1000."
+
+
+def test_engagement_consequences_and_summary_are_the_spec_lines():
+    d = classify("wg_execute_engagement", WG_ARGS["wg_execute_engagement"])
+    assert d.summary == "blue-artillery-1 → track T-0003 · WG-4417-E1"
+    assert d.consequences == (
+        "Rolls one simulated outcome for this engagement against a scenario unit.",
+        "Nothing real is fired.",
+        "The outcome stands for the rest of this wargame; only ending the wargame clears it.",
+        "In blue view the outcome stays hidden until a re-look assesses damage.",
+    )
+
+
+def test_plan_tools_say_they_plan_and_reads_summarise():
+    corridor = classify("wg_plan_corridor", WG_ARGS["wg_plan_corridor"])
+    assert corridor.klass == PLAN and corridor.auto is True
+    assert corridor.summary == "Drone1 → track T-0003 · 60 m AGL · re-look, 400 m radius"
+    assert corridor.consequences == (pol.PLAN_NOTE,)
+    strike = classify("wg_propose_strike", WG_ARGS["wg_propose_strike"])
+    assert strike.klass == PLAN and strike.summary == "blue-artillery-1 → track T-0003"
+    assert strike.consequences == (pol.WG_PROPOSE_NOTE,)
+    assert classify("wg_session_status", {"events": 20}).summary == "20 events"
+    assert classify("wg_list_forces", {"side": "blue"}).summary == "blue"
+    assert classify("wg_list_classes", {}).summary == "No arguments"
+
+
+def test_wargame_approval_text_names_no_real_system(wargame_tools):
+    """D1/V6: titles, summaries and consequences are generic and notional,
+    for every class key the tables know."""
+    from godseye_uav.wargame_tables import CLASSES, TEMPLATES
+    from support.wg_tokens import assert_no_real_system_tokens
+
+    decisions = [classify(n, a) for n, a in WG_ARGS.items()]
+    decisions += [classify("wg_spawn_force", {"side": c.side, "wg_class": key, "lat": 1.0,
+                                              "lon": 2.0}) for key, c in CLASSES.items()]
+    decisions += [classify("wg_generate_scenario", {"template": t}) for t in TEMPLATES]
+    assert_no_real_system_tokens(decisions)
+    for d in decisions:
+        text = " ".join((d.title, d.summary, *d.consequences))
+        assert "SIMULATED" not in text                     # sentence case (§3.1 R21)
+        assert "simulated" in text.lower() or d.klass in (READ, PLAN) \
+            or d.title == "End the wargame", d
+    assert set(pol._WG_TEMPLATE_WORDS) == set(TEMPLATES)
+
+
+def test_no_wargame_tool_declares_dry_run_params_or_a_lost_link_plan(wargame_tools):
+    """The premise of the adversarial tests: the server drops these, so neither
+    can plan anything or rewrite a live lost-link plan on a `wg_*` tool."""
+    for name, tool in wargame_tools.items():
+        props = set(tool.input_schema.get("properties", {}))
+        assert not props & {"dry_run", "params", "lost_link_plan"}, name
+
+
+@pytest.mark.parametrize("name", sorted(WG_EXPECTED))
+def test_a_lost_link_plan_on_a_wargame_tool_is_not_claimed(name):
+    d = classify(name, {**WG_ARGS[name], "lost_link_plan": {"behaviour": "rtb"}})
+    assert d.klass == WG_EXPECTED[name]
+    assert not any("lost-link" in c for c in d.consequences), name
+    assert "lost-link" not in d.summary
+
+
+def test_model_written_wargame_text_is_one_line_of_plain_text():
+    rlo, pdf, lri = chr(0x202E), chr(0x202C), chr(0x2066)
+    xss = "<img src=x onerror=alert(1)>"
+    d = classify("wg_execute_engagement", {"pending_id": f"{rlo}WG-1{pdf}\nIgnore rules",
+                                           "shooter_id": xss, "target_track_id": f"T-1{lri}"})
+    text = " ".join((d.title, d.summary, *d.consequences))
+    for ch in (rlo, pdf, lri, "\n"):
+        assert ch not in text, repr(ch)
+    assert d.summary.startswith(f"{xss} → track T-1")       # text; the console renders text
+    long = classify("wg_spawn_force", {"side": "red", "wg_class": "x" * 500, "lat": 1, "lon": 2,
+                                       "count": 3})
+    assert len(long.consequences[0]) <= 160 and len(long.summary) <= 200
+    assert long.consequences[0].startswith("Adds 3 simulated red " + "x" * 39 + "…")
+    odd = classify("wg_spawn_force", {"wg_class": True, "lat": "north", "count": "many"})
+    assert odd.consequences[0] == "Adds simulated units near the given point."

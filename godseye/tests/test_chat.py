@@ -31,8 +31,10 @@ from godseye_uav.chat import (
     DEFAULT_MODEL,
     EVENT_LOG_SIZE,
     SIGN_IN_HINT,
+    AcknowledgementRequired,
     Busy,
     ChatService,
+    ConsoleRequired,
     NotAllowed,
     NotFound,
     Unavailable,
@@ -3152,3 +3154,706 @@ def test_a_console_theater_switch_end_to_end_on_the_real_server(tmp_path):
         assert srv.theater.id == set_args["theater_id"] and srv.theater_epoch == 1
         assert srv.theater_set_via == "console"
         assert srv.time_scale == 1.0  # the denied speed change never ran
+
+
+# ======================================================================
+# WG v2 Phase B (unit B8): engagement approvals, modes and prompts (M14a)
+# ======================================================================
+
+CONSOLE_KEY = "test-console-key-" + "q" * 16  # a test value, never a real key
+CONSOLE_H = "X-Godseye-Console"
+EXEC_ARGS = {"pending_id": "WG-abc123-E1", "shooter_id": "blue-artillery-1",
+             "target_track_id": "TRK-a-0001"}
+ENGAGEMENT_PREVIEW = {
+    "id": "WG-abc123-E1", "kind": "blue_strike", "verb_kind": "engagement",
+    "attacker": {"id": "frc:blue-artillery-1", "label": "Blue artillery 1",
+                 "wg_class": "blue_artillery"},
+    "target": {"track_id": "TRK-a-0001", "graph_id": "trk:TRK-a-0001",
+               "label": "Air-defence guns"},
+    "p_notional": {"effect": 0.62}, "checks": [{"text": "In range", "ok": True}],
+    "t": (1, 2), "simulated": True}
+
+
+class _StubWargame:
+    """The engine surface the chat service uses: mode key, preview, authorize, deny."""
+
+    def __init__(self, mode="wargame:WG-abc123", refuse=None, preview=None):
+        self.mode = mode
+        self.refuse = refuse
+        self._preview = ENGAGEMENT_PREVIEW if preview is None else preview
+        self.calls: list[tuple] = []
+
+    def mode_key(self):
+        if isinstance(self.mode, Exception):
+            raise self.mode
+        return self.mode
+
+    def preview(self, pending_id):
+        self.calls.append(("preview", pending_id))
+        if isinstance(self._preview, Exception):
+            raise self._preview
+        return self._preview
+
+    def authorize(self, pending_id, approval_id, *, chat_session, args):
+        self.calls.append(("authorize", pending_id, approval_id, chat_session, dict(args)))
+        if self.refuse is not None:
+            raise self.refuse
+
+    def deny(self, pending_id):
+        self.calls.append(("deny", pending_id))
+
+    def names(self):
+        return [c[0] for c in self.calls]
+
+
+class _WgStubServer(_StubServer):
+    def __init__(self, wargame):
+        super().__init__()
+        self.wargame = wargame
+
+
+def _engagement_turn(seen: dict, args=None, cid="toolu_e"):
+    args = dict(EXEC_ARGS if args is None else args)
+
+    async def turn(client, prompt):
+        yield init()
+        yield tool_use(cid, "wg_execute_engagement", args)
+        seen["perm"] = perm = await client.ask(f"{TOOL_PREFIX}wg_execute_engagement", args, cid)
+        if isinstance(perm, PermissionResultAllow):
+            yield tool_result(cid, {"executed": True, "engagement_id": args["pending_id"],
+                                    "simulated": True})
+        elif perm is not None:
+            yield deny_result(cid, perm)
+        yield ResultMessage()
+    return turn
+
+
+def test_engagement_approvals_need_the_console_key_then_the_acknowledgement(tmp_path):
+    engine, seen = _StubWargame(), {}
+    svc = make_service(tmp_path, FakeSdk(_engagement_turn(seen)),
+                       server=_WgStubServer(engine), console_key=CONSOLE_KEY)
+    app = _app(svc)
+    good = {**H, CONSOLE_H: CONSOLE_KEY}
+    cases = [  # WG v2 §3.5, checked in order
+        (H, {"decision": "approve", "acknowledged": True}, "console_required"),
+        ({**H, CONSOLE_H: CONSOLE_KEY[:-1] + "x"}, {"decision": "approve", "acknowledged": True},
+         "console_required"),
+        ({**H, CONSOLE_H: CONSOLE_KEY + "x"}, {"decision": "approve", "acknowledged": True},
+         "console_required"),
+        ({**H, CONSOLE_H: ""}, {"decision": "approve", "acknowledged": True},
+         "console_required"),
+        (H, {"decision": "approve_session", "acknowledged": True}, "console_required"),
+        (good, {"decision": "approve"}, "acknowledgement_required"),
+        (good, {"decision": "approve", "acknowledged": False}, "acknowledgement_required"),
+        (good, {"decision": "approve", "acknowledged": None}, "acknowledgement_required"),
+        (good, {"decision": "approve_session", "acknowledged": True}, "not_allowed"),
+    ]
+
+    async def main():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            sid, rec, _ = await start_turn(svc, "Engage it")
+            req = await rec.wait_name("approval_request")
+            url = f"/chat/sessions/{sid}/approvals/{req['approval_id']}"
+            for headers, body, code in cases:
+                r = await c.post(url, headers=headers, json=body)
+                assert r.status_code == 422 and r.json()["error"] == code, (body, r.json())
+            for body in ({"decision": "approve", "acknowledged": "true"},
+                         {"decision": "approve", "acknowledged": 1}):
+                r = await c.post(url, headers=good, json=body)  # only a JSON true counts
+                assert r.status_code == 422, body
+            assert engine.names() == ["preview"]  # nothing authorized or denied yet
+            assert req["approval_id"] in svc._sessions[sid].pending
+            ok = await c.post(url, headers=good, json={"decision": "approve",
+                                                       "acknowledged": True})
+            assert ok.status_code == 200 and ok.json() == {"ok": True}
+            await rec.wait_name("turn_end")
+            text = json.dumps(rec.events)
+            await svc.shutdown()
+        return sid, req, rec, text
+
+    sid, req, rec, text = asyncio.run(main())
+    assert req["class"] == "engagement" and req["tool"] == "wg_execute_engagement"
+    assert req["acknowledge_required"] is True and req["allow_session"] is False
+    assert req["grant_scope"] is None and req["dry_runnable"] is False
+    assert req["engagement"] == {**ENGAGEMENT_PREVIEW, "t": [1, 2]}  # plain JSON
+    assert rec.of("tool_call")[0]["class"] == "engagement"
+    assert isinstance(seen["perm"], PermissionResultAllow)
+    assert seen["perm"].updated_input == EXEC_ARGS
+    assert engine.calls == [("preview", "WG-abc123-E1"),
+                            ("authorize", "WG-abc123-E1", req["approval_id"], sid, EXEC_ARGS)]
+    assert rec.of("approval_resolved")[0]["decision"] == "approved"
+    assert rec.of("tool_result")[0]["outcome"] == "ok"
+    assert CONSOLE_KEY not in text and CONSOLE_KEY not in json.dumps(svc.status())
+
+
+def test_without_a_configured_key_no_engagement_can_be_approved(tmp_path):
+    engine, seen = _StubWargame(), {}
+    svc = make_service(tmp_path, FakeSdk(_engagement_turn(seen)),
+                       server=_WgStubServer(engine))
+    assert svc.console_key is None
+    app = _app(svc)
+
+    async def main():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            sid, rec, _ = await start_turn(svc)
+            req = await rec.wait_name("approval_request")
+            url = f"/chat/sessions/{sid}/approvals/{req['approval_id']}"
+            for header in (None, "", CONSOLE_KEY, "None"):
+                headers = H if header is None else {**H, CONSOLE_H: header}
+                r = await c.post(url, headers=headers, json={"decision": "approve",
+                                                             "acknowledged": True})
+                assert r.status_code == 422 and r.json()["error"] == "console_required"
+            # Even a caller that claims the console check passed: no key, no approval.
+            with pytest.raises(ConsoleRequired):
+                await svc.resolve_approval(sid, req["approval_id"], "approve",
+                                           acknowledged=True, console=True)
+            r = await c.post(url, headers=H, json={"decision": "deny"})  # no key, no box
+            assert r.status_code == 200
+            await rec.wait_name("turn_end")
+            await svc.shutdown()
+    asyncio.run(main())
+    assert engine.names() == ["preview", "deny"]
+    assert isinstance(seen["perm"], PermissionResultDeny)
+
+
+def test_console_matches_is_exact_and_never_raises():
+    match = chat_mod.console_matches
+    assert match(CONSOLE_KEY, CONSOLE_KEY) is True
+    for key, header in ((CONSOLE_KEY, CONSOLE_KEY + " "), (CONSOLE_KEY, CONSOLE_KEY.upper()),
+                        (None, CONSOLE_KEY), ("", ""), (CONSOLE_KEY, None),
+                        (CONSOLE_KEY, "ü" * 33), (CONSOLE_KEY, 42)):
+        assert match(key, header) is False, (key, header)
+    assert chat_mod.CONSOLE_HEADER == CONSOLE_H
+    assert make_service(Path("/nonexistent"), FakeSdk(), console_key="").console_key is None
+
+
+def test_a_failed_authorize_denies_the_call_with_its_message(tmp_path):
+    from godseye_uav.wargame import WargameRefused
+
+    engine, seen = _StubWargame(refuse=WargameRefused(
+        "out_of_range", "The shooter is out of range of that contact.")), {}
+    svc = make_service(tmp_path, FakeSdk(_engagement_turn(seen)),
+                       server=_WgStubServer(engine), console_key=CONSOLE_KEY)
+
+    async def main():
+        sid, rec, _ = await start_turn(svc)
+        req = await rec.wait_name("approval_request")
+        with pytest.raises(AcknowledgementRequired):
+            await svc.resolve_approval(sid, req["approval_id"], "approve", console=True)
+        await svc.resolve_approval(sid, req["approval_id"], "approve", acknowledged=True,
+                                   console=True)
+        await rec.wait_name("turn_end")
+        await svc.shutdown()
+        return sid, req, rec
+
+    sid, req, rec = asyncio.run(main())
+    perm = seen["perm"]
+    assert isinstance(perm, PermissionResultDeny) and perm.interrupt is False
+    assert "The shooter is out of range of that contact." in perm.message
+    assert "not authorized" in perm.message and "Nothing was fired" in perm.message
+    # Authorized only after the approval, never denied on top (WG v2 §3.8 step 4).
+    assert engine.calls == [("preview", "WG-abc123-E1"),
+                            ("authorize", "WG-abc123-E1", req["approval_id"], sid, EXEC_ARGS)]
+    result = rec.of("tool_result")[0]
+    assert result["outcome"] == "not_run" and "out of range" in result["error"]
+
+
+def test_any_authorize_failure_denies(tmp_path):
+    engine, seen = _StubWargame(refuse=RuntimeError("engine bug")), {}
+    svc = make_service(tmp_path, FakeSdk(_engagement_turn(seen)),
+                       server=_WgStubServer(engine), console_key=CONSOLE_KEY)
+
+    async def main():
+        sid, rec, _ = await start_turn(svc)
+        req = await rec.wait_name("approval_request")
+        await svc.resolve_approval(sid, req["approval_id"], "approve", acknowledged=True,
+                                   console=True)
+        await rec.wait_name("turn_end")
+        await svc.shutdown()
+    asyncio.run(main())
+    assert isinstance(seen["perm"], PermissionResultDeny)
+    assert "couldn't be authorized" in seen["perm"].message
+    assert "engine bug" not in seen["perm"].message
+
+
+@pytest.mark.parametrize("how", ["deny", "expire", "interrupt"])
+def test_an_engagement_that_is_not_approved_is_denied_in_the_engine(tmp_path, how):
+    engine, seen = _StubWargame(), {}
+    svc = make_service(tmp_path, FakeSdk(_engagement_turn(seen)),
+                       server=_WgStubServer(engine), console_key=CONSOLE_KEY,
+                       approval_timeout_s=0.05 if how == "expire" else 600.0)
+
+    async def main():
+        sid, rec, _ = await start_turn(svc)
+        req = await rec.wait_name("approval_request")
+        if how == "deny":
+            await svc.resolve_approval(sid, req["approval_id"], "deny", "Not now.")
+        elif how == "interrupt":
+            await svc.interrupt(sid)
+        await rec.wait_name("turn_end")
+        await svc.shutdown()
+        return rec
+
+    rec = asyncio.run(main())  # also drains the executor a cancelled path used
+    assert engine.names() == ["preview", "deny"]
+    assert engine.calls[1] == ("deny", "WG-abc123-E1")
+    assert seen["perm"] is None or isinstance(seen["perm"], PermissionResultDeny)
+    word = {"deny": "denied", "expire": "expired", "interrupt": "cancelled"}[how]
+    assert rec.of("approval_resolved")[0]["decision"] == word
+
+
+def test_an_engagement_is_never_automatic_or_session_granted(tmp_path, monkeypatch):
+    """Defence in depth: whatever the policy table says, `wg_execute_engagement`
+    asks every time and is acknowledged (D2)."""
+    real = chat_mod.classify
+
+    def lenient(tool, args):
+        d = real(tool, args)
+        if tool.endswith("wg_execute_engagement"):
+            return dataclasses.replace(d, klass="read", auto=True, allow_session=True,
+                                       acknowledge=False)
+        return d
+
+    monkeypatch.setattr(chat_mod, "classify", lenient)
+    engine, seen = _StubWargame(), {}
+    svc = make_service(tmp_path, FakeSdk(_engagement_turn(seen)),
+                       server=_WgStubServer(engine), console_key=CONSOLE_KEY)
+
+    async def main():
+        sid = await svc.create_session()
+        svc._sessions[sid].grants["wg_execute_engagement"] = 1  # a forged grant
+        rec = Recorder(svc, sid)
+        await svc.post_message(sid, "Engage")
+        req = await rec.wait_name("approval_request")
+        with pytest.raises(ConsoleRequired):
+            await svc.resolve_approval(sid, req["approval_id"], "approve_session",
+                                       acknowledged=True)
+        with pytest.raises(NotAllowed):
+            await svc.resolve_approval(sid, req["approval_id"], "approve_session",
+                                       acknowledged=True, console=True)
+        await svc.resolve_approval(sid, req["approval_id"], "deny")
+        await rec.wait_name("turn_end")
+        await svc.shutdown()
+        return req
+
+    req = asyncio.run(main())
+    assert req["class"] == "engagement" and req["acknowledge_required"] is True
+    assert req["allow_session"] is False
+    assert isinstance(seen["perm"], PermissionResultDeny)
+    assert engine.names() == ["preview", "deny"]
+
+
+def test_a_missing_or_failing_engagement_preview_is_empty(tmp_path):
+    """`{}` makes the console's slip Deny-only (WG v2 §3.6)."""
+    reqs = []
+    for server in (None, _StubServer(), _WgStubServer(_StubWargame(preview=KeyError("x"))),
+                   _WgStubServer(_StubWargame(preview=["not", "a", "dict"]))):
+        seen = {}
+        svc = make_service(tmp_path, FakeSdk(_engagement_turn(seen)), server=server,
+                           console_key=CONSOLE_KEY)
+
+        async def main(svc=svc):
+            sid, rec, _ = await start_turn(svc)
+            req = await rec.wait_name("approval_request")
+            await svc.resolve_approval(sid, req["approval_id"], "deny")
+            await rec.wait_name("turn_end")
+            await svc.shutdown()
+            return req
+        reqs.append(asyncio.run(main()))
+    for req in reqs:
+        assert req["engagement"] == {} and req["class"] == "engagement"
+
+
+def test_non_engagement_approvals_need_no_console_key(tmp_path):
+    seen: dict = {}
+
+    async def turn(client, prompt):
+        yield init()
+        args = {"vehicle": "Drone1", "fuel_pct": 100}
+        yield tool_use("toolu_f", "sim_set_fuel", args)
+        seen["perm"] = await client.ask(f"{TOOL_PREFIX}sim_set_fuel", args, "toolu_f")
+        yield ResultMessage()
+
+    engine = _StubWargame()
+    svc = make_service(tmp_path, FakeSdk(turn), server=_WgStubServer(engine),
+                       console_key=CONSOLE_KEY)
+
+    async def main():
+        sid, rec, _ = await start_turn(svc)
+        req = await rec.wait_name("approval_request")
+        assert req["acknowledge_required"] is True and "engagement" not in req
+        await svc.resolve_approval(sid, req["approval_id"], "approve")  # as today
+        await rec.wait_name("turn_end")
+        await svc.shutdown()
+    asyncio.run(main())
+    assert isinstance(seen["perm"], PermissionResultAllow)
+    assert engine.calls == []
+
+
+# ---- prompts and modes ------------------------------------------------------
+
+P_BASE = "# Analyst\n\nIntro.\n\n## How the console works\n\n- Reads run at once.\n"
+P_ISR = "## Identity: ISR only\n\nObserve, classify and report.\n"
+P_WARGAME = "## Identity: simulated wargame (M14a)\n\nEverything here is simulated.\n"
+
+
+def _prompt_files(tmp_path, monkeypatch, files: dict) -> None:
+    """Prompt files only beside a stand-in module path (no package data)."""
+    import importlib.resources
+
+    def missing(_package):
+        raise FileNotFoundError("no package data")
+
+    monkeypatch.setattr(importlib.resources, "files", missing)
+    monkeypatch.setattr(chat_mod, "__file__", str(tmp_path / "chat.py"))
+    for name, text in files.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+
+
+def test_the_prompt_is_the_base_plus_the_modes_identity(tmp_path, monkeypatch):
+    _prompt_files(tmp_path, monkeypatch, {"analyst_prompt.md": P_BASE,
+                                          "analyst_prompt_isr.md": P_ISR,
+                                          "analyst_prompt_wargame.md": P_WARGAME})
+    isr = chat_mod._load_prompt("isr")
+    assert isr == P_BASE.rstrip("\n") + "\n\n" + P_ISR.strip() + "\n"
+    assert chat_mod._load_prompt() == chat_mod._load_prompt("umpire") == isr  # ISR default
+    wargame = chat_mod._load_prompt("wargame")
+    assert wargame == P_BASE.rstrip("\n") + "\n\n" + P_WARGAME.strip() + "\n"
+    assert "ISR only" not in wargame
+
+
+def test_prompt_fallbacks_never_give_a_wargame_identity_by_accident(tmp_path, monkeypatch):
+    inline = P_BASE.replace("## How", P_ISR + "\n## How")  # the prompt before the split
+    _prompt_files(tmp_path, monkeypatch, {"analyst_prompt.md": inline})
+    assert chat_mod._load_prompt("isr") == inline  # complete for ISR on its own
+    assert chat_mod._load_prompt("wargame") == chat_mod.STUB_PROMPT
+    (tmp_path / "analyst_prompt_wargame.md").write_text(P_WARGAME, encoding="utf-8")
+    wargame = chat_mod._load_prompt("wargame")
+    assert wargame.count("## Identity") == 1 and "ISR only" not in wargame
+    assert "## How the console works" in wargame and "Everything here is simulated." in wargame
+    (tmp_path / "analyst_prompt.md").write_text(P_BASE, encoding="utf-8")  # split, no ISR file
+    assert chat_mod._load_prompt("isr") == chat_mod.STUB_PROMPT
+    (tmp_path / "analyst_prompt.md").unlink()
+    assert chat_mod._load_prompt("wargame") == chat_mod._load_prompt() == chat_mod.STUB_PROMPT
+
+
+def test_the_packaged_prompts_by_mode():
+    isr = chat_mod._load_prompt("isr")
+    assert "ISR only" in isr and "[[type:id|label]]" in isr
+    assert isr.count("## Identity") == 1
+    wargame = chat_mod._load_prompt("wargame")
+    if not Path(chat_mod.__file__).with_name("analyst_prompt_wargame.md").is_file():
+        assert wargame == chat_mod.STUB_PROMPT  # B7's file not merged: fail safe
+        return
+    assert "## Identity: simulated wargame (M14a)" in wargame
+    assert "## Identity: ISR only" not in wargame and wargame.count("## Identity") == 1
+    assert "[[type:id|label]]" in wargame  # the same base
+
+
+class _WgListing:
+    def __init__(self, names):
+        self.names = list(names)
+
+    async def list_tools(self):
+        return [_ListedTool(n, {"type": "object", "properties": {}}) for n in self.names]
+
+
+class _ModeServer(_WgStubServer):
+    def __init__(self, wargame):
+        from godseye_uav import wargame_tools
+
+        super().__init__(wargame)
+        self.wargame_mcp = _WgListing(wargame_tools.TOOL_NAMES)
+
+
+def _wg_tools(client) -> set:
+    return {t.name for t in client.options.kw["mcp_servers"]["godseye"]["tools"]
+            if t.name.startswith("wg_")}
+
+
+def test_a_mode_change_rebuilds_the_cli_and_says_so_on_the_next_prompt(tmp_path):
+    from godseye_uav import wargame_tools
+
+    engine = _StubWargame(mode="isr")
+    sdk = FakeSdk(*[ok_turn_factory() for _ in range(5)])
+    svc = make_service(tmp_path, sdk, server=_ModeServer(engine))
+
+    async def main():
+        sid = await svc.create_session()
+        rec = Recorder(svc, sid)
+
+        async def say(text):
+            tid = await svc.post_message(sid, text)
+            await rec.wait(lambda e: e[1] == "turn_end" and e[2]["turn_id"] == tid)
+
+        await say("one")
+        engine.mode = "wargame:WG-abc123"
+        await say("two")
+        await say("three")
+        engine.mode = "isr"
+        await say("four")
+        engine.mode = RuntimeError("engine down")  # fails safe: ISR, nothing changes
+        await say("five")
+        await svc.shutdown()
+        return rec
+
+    rec = asyncio.run(main())
+    c = sdk.clients
+    assert len(c) == 3 and c[0].disconnected and c[1].disconnected
+    assert c[0].prompts == ["one"]
+    wg_prefix = chat_mod.mode_change_prefix("wargame:WG-abc123")
+    isr_prefix = chat_mod.mode_change_prefix("isr")
+    assert c[1].prompts == [f"{wg_prefix}\n\ntwo", "three"]
+    assert c[2].prompts == [f"{isr_prefix}\n\nfour", "five"]
+    # The bundled CLI keeps a resumed conversation's first system prompt, so
+    # the new mode's identity also rides in the conversation (B17, E2E B1).
+    assert wg_prefix.startswith(
+        "[Mode changed: simulated wargame session WG-abc123 is active]\n\n"
+        "## Identity: simulated wargame (M14a)")
+    assert isr_prefix.startswith("[Mode changed: back to ISR]\n\n## Identity: ISR only")
+    assert [e["text"] for e in rec.of("turn_start")] == ["one", "two", "three", "four", "five"]
+    isr_prompt, wg_prompt = chat_mod._load_prompt("isr"), chat_mod._load_prompt("wargame")
+    assert c[0].options.kw["system_prompt"] == c[2].options.kw["system_prompt"] == isr_prompt
+    assert c[1].options.kw["system_prompt"] == wg_prompt != isr_prompt
+    assert c[1].options.kw["resume"] == "claude-sess-1"  # the conversation carries over
+    assert _wg_tools(c[0]) == _wg_tools(c[2]) == set(wargame_tools.ENTRY_TOOLS)
+    assert _wg_tools(c[1]) == set(wargame_tools.TOOL_NAMES)
+    for client in c:
+        assert not any("wg_" in t for t in client.options.kw["disallowed_tools"])
+        # never pre-allowed: an engagement always goes through can_use_tool
+        assert f"{TOOL_PREFIX}wg_execute_engagement" not in client.options.kw["allowed_tools"]
+
+
+def test_the_mode_key_reads_the_engine_and_fails_safe(tmp_path):
+    cases = [(None, "isr"), (_StubServer(), "isr"),
+             (_WgStubServer(_StubWargame(mode="isr")), "isr"),
+             (_WgStubServer(_StubWargame(mode="wargame:WG-1a2b3c")), "wargame:WG-1a2b3c"),
+             (_WgStubServer(_StubWargame(mode=RuntimeError("x"))), "isr"),
+             (_WgStubServer(_StubWargame(mode="umpire")), "isr"),
+             (_WgStubServer(_StubWargame(mode=None)), "isr")]
+    for server, want in cases:
+        assert make_service(tmp_path, FakeSdk(), server=server)._mode_key() == want
+    assert chat_mod.mode_name("wargame:WG-1") == "wargame" and chat_mod.mode_name("isr") == "isr"
+    assert chat_mod.mode_changed_line("isr") == "[Mode changed: back to ISR]"
+
+
+def test_the_mode_change_prefix_falls_back_to_the_line_without_an_identity(monkeypatch):
+    monkeypatch.setattr(chat_mod, "_read_prompt_file", lambda name: None)
+    assert chat_mod.mode_change_prefix("isr") == "[Mode changed: back to ISR]"
+    assert chat_mod.mode_change_prefix("wargame:WG-1") == (
+        "[Mode changed: simulated wargame session WG-1 is active]")
+
+
+# ---- a console engagement end to end on the real server ---------------------
+
+@contextmanager
+def wargame_server(tmp_path):
+    """A default-theater server (the wargame's only cleared preset) on a fake
+    sim in this file's ports 52200-52299, engine thread off, map data off."""
+    from godseye_uav import theaters
+    from godseye_uav.geo import canonical_altitude
+
+    theater = theaters.get("default")
+    home = GeoPoint(theater.home_lat, theater.home_lon,
+                    canonical_altitude(theater.home_alt_msl_m, theater.home_lat,
+                                       theater.home_lon, datum="msl").alt_hae)
+    sim = srv = None
+    honour_msgpack_bind_host()
+    for _ in range(len(_PORTS)):
+        port = next(_PORT)
+        if not _nothing_listens(port):
+            continue
+        sim = FakeAirSim(home=home, port=port)
+        try:
+            sim.start()
+            break
+        except OSError:
+            sim.stop()
+            sim = None
+    assert sim is not None, "no free port in 52200-52299"
+    store = Store(tmp_path / "srv")
+    try:
+        client = airsim.MultirotorClient(port=sim.port)
+        client.confirmConnection()
+        srv = GodseyeUavServer(UavBackend(client, home, sim=sim), store, theater=theater)
+        srv.wargame.run_thread = False
+        yield srv, home
+    finally:
+        if srv is not None:
+            srv.wargame.close()
+            srv.stop_monitor()
+            with contextlib.suppress(Exception):
+                srv.tasking.shutdown()
+        store.close()
+        sim.stop()
+
+
+def _offset(home, dn_m: float, de_m: float) -> tuple[float, float]:
+    import math
+
+    return (home.latitude + dn_m / 111_320.0,
+            home.longitude + de_m / (111_320.0 * math.cos(math.radians(home.latitude))))
+
+
+def _sense(srv, name: str, times: int = 3):
+    """Fold `times` detections of sim object `name` into a track, the way the
+    server's ingest does (the scenario hook first)."""
+    import time
+
+    lat, lon, alt = srv.backend.sim.object_geo(name)
+    track = None
+    for _ in range(times):
+        det = {"name": name, "geo_point": {"latitude": lat, "longitude": lon, "altitude": alt},
+               "slant_range_m": 400.0, "pixels_on_target": 60}
+        for t in srv.tracks.ingest([det], sensor={"sensor": "scene", "fov_deg": 60},
+                                   observer={"lat": lat, "lon": lon + 0.003,
+                                             "alt_m": alt + 150.0, "vehicle": "Drone1"}):
+            if not srv._note_scenario_track(t):
+                srv.pol.observe_track(t)
+            track = t
+        time.sleep(0.002)
+    return track
+
+
+async def _run_approved(client, cid: str, tool: str, args: dict) -> tuple[dict, dict]:
+    perm = await client.ask(f"{TOOL_PREFIX}{tool}", args, cid)
+    assert isinstance(perm, PermissionResultAllow), (tool, perm)
+    out = await client.run_tool(f"{TOOL_PREFIX}{tool}", perm.updated_input)
+    return out, json.loads(out["content"][0]["text"])
+
+
+def _as_result(cid: str, out: dict):
+    return UserMessage([ToolResultBlock(cid, out["content"], out.get("is_error"))])
+
+
+def test_a_console_engagement_end_to_end_on_the_real_server(tmp_path):
+    """Real server, engine, wargame registry and toolbelt: the analyst starts
+    a session from ISR, the next turn runs in wargame mode, a strike is
+    proposed on a sensed scenario track, the proxy alone can't execute it, the
+    console approves it with its key and the acknowledgement, the engine
+    authorizes it for this chat session and it executes once; ending the
+    session returns the analyst to ISR."""
+    from godseye_uav import wargame_tools
+    from support.wg_tokens import assert_no_real_system_tokens
+
+    got: dict = {}
+    with wargame_server(tmp_path) as (srv, home):
+        p_red, p_blue = _offset(home, 1600, 1000), _offset(home, -900, -900)
+
+        async def start(client, prompt):
+            yield init()
+            args = {"seed": 4417, "red_engages": False}
+            yield tool_use("t1", "wg_session_start", args)
+            out, got["start"] = await _run_approved(client, "t1", "wg_session_start", args)
+            yield _as_result("t1", out)
+            yield ResultMessage()
+
+        async def engage(client, prompt):
+            yield init()
+            units = []
+            for cid, side, cls, (lat, lon) in (("t2", "red", "ad_gun", p_red),
+                                               ("t3", "blue", "blue_rocket", p_blue)):
+                args = {"side": side, "wg_class": cls, "lat": lat, "lon": lon}
+                yield tool_use(cid, "wg_spawn_force", args)
+                out, spawned = await _run_approved(client, cid, "wg_spawn_force", args)
+                yield _as_result(cid, out)
+                units.append(spawned["units"][0])
+            red, blue = units
+            track = _sense(srv, srv.wargame._session.units[red["unit_id"]].object_name)
+            args = {"shooter_id": blue["unit_id"], "target_track_id": track.track_id}
+            yield tool_use("t4", "wg_propose_strike", args)
+            out, got["proposal"] = await _run_approved(client, "t4", "wg_propose_strike", args)
+            yield _as_result("t4", out)
+            execute = got["proposal"]["execute_args"]
+            # This session's own proxy, before the console approved: refused.
+            early = await client.run_tool(f"{TOOL_PREFIX}wg_execute_engagement", execute)
+            got["early"] = json.loads(early["content"][0]["text"])
+            yield tool_use("t5", "wg_execute_engagement", execute)
+            out, got["fired"] = await _run_approved(client, "t5", "wg_execute_engagement",
+                                                    execute)
+            yield _as_result("t5", out)
+            got["fired_count"] = sum(1 for e in srv.wargame._session.engagements
+                                     if e.fired_at_ms)
+            yield ResultMessage()
+
+        async def end(client, prompt):
+            yield init()
+            yield tool_use("t6", "wg_session_end", {})
+            out, got["end"] = await _run_approved(client, "t6", "wg_session_end", {})
+            yield _as_result("t6", out)
+            aar = await client.run_tool(f"{TOOL_PREFIX}read_intel_resource",
+                                        {"uri": got["end"]["resource"]})
+            got["aar"] = json.loads(aar["content"][0]["text"])
+            yield ResultMessage()
+
+        sdk = FakeSdk(start, engage, end, ok_turn_factory())
+        svc = ChatService(server=srv, intel=None, store_dir=tmp_path / "store", sdk=sdk,
+                          console_key=CONSOLE_KEY)
+        app = _app(svc)
+
+        async def main():
+            sid = await svc.create_session()
+            rec = Recorder(svc, sid)
+            engagements: list[dict] = []
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+                async def approver():
+                    handled: set = set()
+                    while True:
+                        for _, name, data in list(rec.events):
+                            if name != "approval_request" or data["approval_id"] in handled:
+                                continue
+                            handled.add(data["approval_id"])
+                            if data["class"] != "engagement":
+                                await svc.resolve_approval(sid, data["approval_id"], "approve")
+                                continue
+                            engagements.append(data)
+                            url = f"/chat/sessions/{sid}/approvals/{data['approval_id']}"
+                            r = await c.post(url, headers={**H, CONSOLE_H: CONSOLE_KEY},
+                                             json={"decision": "approve", "acknowledged": True})
+                            assert r.status_code == 200, r.json()
+                        await asyncio.sleep(0.01)
+
+                task = asyncio.create_task(approver())
+                try:
+                    for text in ("Start a simulated wargame", "Engage the guns", "End it",
+                                 "Status?"):
+                        tid = await svc.post_message(sid, text)
+                        await rec.wait(lambda e, tid=tid: e[1] == "turn_end"
+                                       and e[2]["turn_id"] == tid, timeout=30)
+                finally:
+                    task.cancel()
+            await svc.shutdown()
+            return rec, engagements
+
+        rec, engagements = asyncio.run(main())
+        assert srv.wargame.active is False and "latest" not in srv.reports
+
+    session_id = got["start"]["session_id"]
+    c = sdk.clients
+    assert len(c) == 3  # ISR, the wargame session, ISR again
+    assert c[0].prompts == ["Start a simulated wargame"]
+    assert c[1].prompts == [
+        f"{chat_mod.mode_change_prefix('wargame:' + session_id)}\n\nEngage the guns",
+        "End it"]
+    assert c[1].prompts[0].startswith(
+        f"[Mode changed: simulated wargame session {session_id} is active]\n\n")
+    assert c[2].prompts == [f"{chat_mod.mode_change_prefix('isr')}\n\nStatus?"]
+    assert _wg_tools(c[0]) == set(wargame_tools.ENTRY_TOOLS)
+    assert _wg_tools(c[1]) == set(wargame_tools.TOOL_NAMES)
+    assert c[1].options.kw["system_prompt"] == chat_mod._load_prompt("wargame")
+    (req,) = engagements
+    assert req["tool"] == "wg_execute_engagement" and req["acknowledge_required"] is True
+    preview = req["engagement"]
+    assert {"checks", "target", "attacker", "p_notional"} <= set(preview), sorted(preview)
+    assert preview["checks"] and all(ch["ok"] for ch in preview["checks"]), preview["checks"]
+    assert preview["simulated"] is True and preview["target"]["scenario"] is True
+    assert got["early"]["error"] == "engagement_requires_console_approval"
+    assert got["fired"]["executed"] is True and got["fired"]["simulated"] is True
+    assert got["fired_count"] == 1
+    assert got["end"]["ended"] is True and got["end"]["aar_id"] == f"aar-{session_id}"
+    assert got["aar"]["report_type"] == "AAR" and got["aar"]["simulated"] is True
+    assert CONSOLE_KEY not in json.dumps(rec.events)
+    assert_no_real_system_tokens([preview, got["proposal"], got["fired"], got["end"]])

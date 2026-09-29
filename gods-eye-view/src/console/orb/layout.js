@@ -18,13 +18,24 @@
  * when another theater held it in the previous layout (either scope); mapped
  * sites sit in their own sector-anchored row at +42°, with the contact belt
  * topped at +35°. A type the contract lacks goes to `other`.
+ *
+ * WG spec §5.3.5 (the session profile, only while a simulated wargame is on
+ * or its nodes are in the picture): red forces at −41° and blue forces at
+ * −47°, each in a sector-anchored row; reports move up to −54°; engagements
+ * and vectors share a ring at −61°. An ISR picture lays out exactly as
+ * before.
  */
 
 import {
+  SESSION_REPORT_LAT,
   SITE_BAND,
+  WARGAME_BANDS,
+  forceSectorKey,
+  forceSlotsFor,
   placeSectorRow,
   sectorRowLon,
   siteSectorKey,
+  wargameBandKey,
 } from './contextBands.js';
 
 const DEG = Math.PI / 180;
@@ -82,18 +93,21 @@ export const BANDS = Object.freeze({
   }),
   other: Object.freeze({ caption: 'Other', lat: -31, min: 36 }),
   unit: Object.freeze({ caption: 'Units', lat: -36, min: 72, anchored: true }),
+  force_red: WARGAME_BANDS.force_red,
   equipment: Object.freeze({
     caption: 'Equipment',
     lat: -46,
     min: 72,
     anchored: true,
   }),
+  force_blue: WARGAME_BANDS.force_blue,
   report: Object.freeze({
     caption: 'Reports',
     lat: -58,
     min: 48,
     anchored: true,
   }),
+  engagement: WARGAME_BANDS.engagement,
   alarm: Object.freeze({
     caption: 'Alarms',
     latTop: -68,
@@ -121,10 +135,22 @@ export const BAND_ORDER = Object.freeze([
   'track',
   'other',
   'unit',
+  'force_red',
   'equipment',
+  'force_blue',
   'report',
+  'engagement',
   'alarm',
 ]);
+
+/** Band keys that are not node types (a node typed `force_red` is unknown). */
+const BAND_ONLY_KEYS = new Set(['other', ...Object.keys(WARGAME_BANDS)]);
+/** Wargame node types by band, when the node itself is not at hand. */
+const WARGAME_TYPE_BANDS = Object.freeze({
+  force: 'force_red',
+  engagement: 'engagement',
+  vector: 'engagement',
+});
 
 /** Parallels the graticule draws: band-group boundaries only (spec §4.1). */
 export const GRATICULE_PARALLELS = Object.freeze({
@@ -142,9 +168,21 @@ export const EDGE_POINTS = EDGE_SEGMENTS + 1;
 export const EDGE_STRIDE = EDGE_POINTS * 3;
 const EDGE_LIFT = 0.18;
 
-/** The band a node type lives in. */
+/**
+ * The band a node type lives in. A force's band depends on its side, so
+ * prefer `bandOfNode`; by type alone a force goes to the red band.
+ */
 export function bandOfType(type) {
-  return Object.hasOwn(BANDS, type) && type !== 'other' ? type : 'other';
+  if (typeof type === 'string' && Object.hasOwn(WARGAME_TYPE_BANDS, type))
+    return WARGAME_TYPE_BANDS[type];
+  return Object.hasOwn(BANDS, type) && !BAND_ONLY_KEYS.has(type)
+    ? type
+    : 'other';
+}
+
+/** The band a node lives in: blue forces at −47°, other forces at −41°. */
+export function bandOfNode(node) {
+  return wargameBandKey(node) ?? bandOfType(node?.type);
 }
 
 /** The contact sector for a node group; unknown groups are unclassified. */
@@ -386,10 +424,18 @@ export function computeLayout(graph, previous = null) {
   const members = {};
   for (const key of BAND_ORDER) members[key] = [];
   for (const id of ids) {
-    const key = bandOfType(byId.get(id).type);
+    const key = bandOfNode(byId.get(id));
     band[index.get(id)] = key;
     members[key].push(id);
   }
+  // The session profile (§5.3.5): a wargame session is on, or its nodes are
+  // in the picture. Otherwise nothing below moves an ISR band.
+  const session =
+    graph?.meta?.wargame?.active === true ||
+    members.force_red.length +
+      members.force_blue.length +
+      members.engagement.length >
+      0;
 
   const set = (i, la, lo) => {
     lat[i] = la;
@@ -618,6 +664,49 @@ export function computeLayout(graph, previous = null) {
     }
   }
 
+  // Forces (session profile): one row per side at −41° (red) and −47°
+  // (blue), anchored to their sector: 12 slots of 3°, packing tighter in a
+  // crowded sector. A force is never hidden (a hidden red air-defence unit
+  // would be a lie); a slot count change re-seats that sector's row.
+  for (const key of ['force_red', 'force_blue']) {
+    const bySector = new Map();
+    for (const id of members[key]) {
+      const s = sectorOf(forceSectorKey(byId.get(id), sectorKeys));
+      sector[index.get(id)] = s;
+      const item = {
+        id,
+        sector: s,
+        salience: Number(byId.get(id)?.salience) || 0,
+      };
+      if (bySector.has(s)) bySector.get(s).push(item);
+      else bySector.set(s, [item]);
+    }
+    for (const [s, items] of bySector) {
+      const slots = forceSlotsFor(items.length, BANDS[key].slotsPerSector);
+      const row = placeSectorRow(items, {
+        slots,
+        previous: (id) => {
+          const was = prevAssign?.get(id);
+          return was?.pool === key && was.capacity === slots ? was : null;
+        },
+      });
+      for (const item of items) {
+        const { slot } = row.slots.get(item.id);
+        set(
+          index.get(item.id),
+          BANDS[key].lat,
+          sectorRowLon(s, slot, { slotDeg: SECTOR_WIDTH_DEG / slots }),
+        );
+        assignments.set(item.id, {
+          pool: key,
+          sector: s,
+          slot,
+          capacity: slots,
+        });
+      }
+    }
+  }
+
   fillPool('other', members.other, BANDS.other.min, ring(BANDS.other.lat));
   fillPool(
     'unit',
@@ -638,9 +727,31 @@ export function computeLayout(graph, previous = null) {
     'report',
     members.report,
     BANDS.report.min,
-    ring(BANDS.report.lat),
+    ring(session ? SESSION_REPORT_LAT : BANDS.report.lat),
     (id, capacity) =>
       anchorAt(placedLons(outgoing('reports_on', id)))(id, capacity),
+  );
+
+  // Engagements and vectors (session profile) share one ring at −61°: an
+  // engagement at its target's longitude, a vector at its origin's.
+  fillPool(
+    'engagement',
+    members.engagement,
+    BANDS.engagement.min,
+    ring(BANDS.engagement.lat),
+    (id, capacity) => {
+      const node = byId.get(id);
+      const vector = node?.type === 'vector';
+      const ref = vector ? node?.attrs?.from : node?.attrs?.target;
+      const direct = typeof ref === 'string' ? index.get(ref) : undefined;
+      const anchors =
+        direct != null
+          ? [direct]
+          : vector
+            ? incoming('along', id)
+            : outgoing('attacks', id);
+      return anchorAt(placedLons(anchors))(id, capacity);
+    },
   );
 
   // Alarms: columns by subject longitude, newest nearest −68°.
@@ -697,6 +808,14 @@ export function computeLayout(graph, previous = null) {
   for (const key of BAND_ORDER) counts[key] = members[key].length;
   const sectorCounts = bySector.map((list) => list.length);
   const overflow = { site: siteRow.overflow.length };
+  // What the wargame band captions count beyond their totals.
+  const wargame = {
+    vectors: members.engagement.filter((id) => byId.get(id).type === 'vector')
+      .length,
+    sideNotSet: members.force_red.filter(
+      (id) => byId.get(id)?.attrs?.side !== 'red',
+    ).length,
+  };
 
   return {
     n,
@@ -716,5 +835,7 @@ export function computeLayout(graph, previous = null) {
     sectorCounts,
     hidden,
     overflow,
+    profile: session ? 'session' : 'isr',
+    wargame,
   };
 }

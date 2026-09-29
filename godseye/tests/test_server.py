@@ -21,6 +21,7 @@ import math
 import os
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import airsim
 import pytest
@@ -1308,6 +1309,76 @@ def test_no_kinetic_tool_exists(server):
               "prosecute", "designate_for_strike", "release")
     for name in server.mcp._tool_manager._tools:
         assert not any(b in name.lower() for b in banned), name
+
+
+# ---- M14a scoped catalog (WG v2 §6, B5). B5's ports: 53650-53679. ----
+_WG_PORTS = list(range(53650, 53680))
+_WG_PORT = itertools.cycle(_WG_PORTS[os.getpid() % len(_WG_PORTS):]
+                           + _WG_PORTS[:os.getpid() % len(_WG_PORTS)])
+_KINETIC = ("fire", "strike", "engage", "weapon", "launch_missile", "attack",
+            "prosecute", "designate_for_strike", "release")
+#: Wargame tool classes (WG §3.7); none is `command`, `sensor` or an override.
+_WG_CLASSES = {"engagement", "sim", "plan", "read"}
+#: Minimal arguments that get each mutating `wg_*` tool past validation, so
+#: the only refusal left is the missing session.
+_WG_ARGS = {
+    "wg_session_end": {},
+    "wg_generate_scenario": {"template": "air_defence_belt"},
+    "wg_spawn_force": {"side": "red", "wg_class": "ad_gun",
+                       "lat": HOME.latitude + 0.015, "lon": HOME.longitude},
+    "wg_execute_engagement": {"pending_id": "WG-000000-E1", "shooter_id": "blue-artillery-1",
+                              "target_track_id": "T-0001"},
+    "wg_plan_corridor": {"vehicle": "Drone1", "target_track_id": "T-0001"},
+    "wg_propose_strike": {"shooter_id": "blue-artillery-1", "target_track_id": "T-0001"},
+}
+
+
+def _refusal_code(out) -> str | None:
+    err = out.get("error") if isinstance(out, dict) else None
+    return err.get("code") if isinstance(err, dict) else err
+
+
+def test_the_default_catalog_has_no_wargame_tool(tmp_path):
+    """`wargame_mcp=False` (the default): nothing `wg_*` on /mcp; the wargame
+    registry exists but is a separate, never-mounted server (WG §5.2.10)."""
+    with build_server(tmp_path, ports=_WG_PORTS, nxt=_WG_PORT) as srv:
+        assert not any(n.startswith("wg_") for n in srv.mcp._tool_manager._tools)
+        assert srv.wargame_mcp is not srv.mcp
+        assert srv.wargame_mcp_enabled is False
+
+
+def test_wargame_catalog_is_scoped(tmp_path):
+    """Under `--wargame-mcp`, every tool that trips the kinetic ban list is a
+    simulated `wg_*` tool of a wargame class; every mutating one takes an
+    idempotency key, refuses without a session and is documented."""
+    pytest.importorskip("godseye_uav.wargame_tools",
+                        reason="B4 registers the wg_* tools; not merged yet")
+    from godseye_uav import analyst_policy
+    if not hasattr(analyst_policy, "ENGAGEMENT"):
+        pytest.skip("B7 adds the engagement class; not merged yet")
+    contract = (Path(__file__).resolve().parents[1] / "TOOL_CONTRACT.md").read_text()
+    with build_server(tmp_path, ports=_WG_PORTS, nxt=_WG_PORT, wargame_mcp=True) as srv:
+        tools = srv.mcp._tool_manager._tools
+        wg = sorted(n for n in tools if n.startswith("wg_"))
+        assert set(wg) == {t.name for t in run(srv.wargame_mcp.list_tools())}
+        for name in tools:
+            if any(b in name.lower() for b in _KINETIC):
+                assert name.startswith("wg_"), name
+        mutating = []
+        for name in wg:
+            klass = analyst_policy.classify(name, {}).klass
+            assert klass in _WG_CLASSES, (name, klass)
+            if klass in ("sim", "engagement"):
+                mutating.append(name)
+        assert "wg_execute_engagement" in mutating
+        for name in mutating:
+            assert "idempotency_key" in schema_of(srv, name), name
+            assert f"`{name}`" in contract or name in contract, name
+            if name == "wg_session_start":
+                continue                    # the one that opens a session
+            out = run(tools[name].fn(**_WG_ARGS.get(name, {})))
+            assert _refusal_code(out) == "wargame_inactive", (name, out)
+        assert srv.wargame.active is False
 
 
 def test_every_altitude_parameter_names_its_datum(server):
@@ -4530,6 +4601,14 @@ def test_the_mapped_order_of_battle_actually_spawns(tmp_path):
                     f"limit={bad} was accepted and returned "
                     f"ok={res.get('ok')} spawned={res.get('spawned')}")
                 assert res["error"]["code"] == "invalid_parameter"
+            # WG §5.0 (B5): a second run no longer OVERWRITES the sites it
+            # already placed; each one is refused as a duplicate name.
+            again = await tool(srv, "sim_spawn_order_of_battle")()
+            assert again["spawned"] == 0 and again["ok"] is False
+            assert {r["result"]["error"] for r in again["refusals"]} == {"duplicate_name"}
+            for name in list(srv.targets):
+                await srv.backend.destroy_object(name)
+                srv.targets.pop(name)
             one = await tool(srv, "sim_spawn_order_of_battle")(limit=1)
             assert one.get("error") is None and one["spawned"] == 1, one
         run(main())

@@ -28,11 +28,13 @@ from godseye_uav.threat import (
 )
 from godseye_uav.targets import (
     OB_LIBRARY,
+    SCENARIO_CONTACT_NOTE,
     PatternOfLife,
     Track,
     TrackManager,
     classify,
 )
+from support.wg_tokens import assert_no_real_system_tokens, find_real_system_tokens
 
 _port = itertools.count(45000)
 
@@ -687,3 +689,77 @@ class TestCeilingIsHeightAboveTheShooter:
         out = assess_track(track, obs, now=1000.0)
         assert out["in_envelope"] is True
         assert out["assessment"]["capability"]["above_weapon_ceiling"] is False
+
+
+# ---------------------------------------------------------------------------
+# M14a (WG §5.2.9, unit B3b): a scenario contact is marked, and nothing else
+# about its assessment moves — it stays sensor posture only, and an ISR
+# track's assessment is unchanged.
+# ---------------------------------------------------------------------------
+
+SCENARIO_KEYS = {"scenario", "scenario_note", "simulated"}
+OBS = {"lat": 33.7230, "lon": 51.7250, "alt_m": 100.0}
+DEFENDED = [{"lat": 33.74, "lon": 51.725, "name": "FOB"}]
+
+
+def _shape(obj):
+    """`obj` with every string blanked: keys, numbers, levels' positions and
+    list lengths stay, so two assessments that differ only in wording match."""
+    if isinstance(obj, dict):
+        return {k: _shape(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_shape(v) for v in obj]
+    return "" if isinstance(obj, str) else obj
+
+
+def _scenario_pair():
+    isr = _observed_track(name="sam_short_range_1")
+    scen = Track.from_dict(json.loads(json.dumps(isr.to_dict())))
+    scen.scenario = True
+    return isr, scen
+
+
+class TestScenarioAssessment:
+    def test_a_scenario_track_carries_exactly_the_three_keys(self):
+        isr, scen = _scenario_pair()
+        a = assess_track(isr, OBS, DEFENDED, now=1045.0)
+        b = assess_track(scen, OBS, DEFENDED, now=1045.0)
+        assert set(b) - set(a) == SCENARIO_KEYS
+        assert b["scenario"] is True and b["simulated"] is True
+        assert b["scenario_note"] == SCENARIO_CONTACT_NOTE == "Scenario contact (simulated)"
+        # D1 (B17 relabel): the names are generic; every number, level and
+        # key is the ISR assessment's.
+        assert _shape({k: v for k, v in b.items() if k not in SCENARIO_KEYS}) == _shape(a)
+        assert find_real_system_tokens(a)
+        assert_no_real_system_tokens(b)
+
+    def test_a_scenario_assessment_names_no_real_system_anywhere(self):
+        _, scen = _scenario_pair()
+        assert_no_real_system_tokens(assess_track(scen, OBS, DEFENDED, now=1045.0))
+        assert_no_real_system_tokens(assess_area([scen], OBS, now=1045.0))
+
+    def test_an_isr_track_has_none_of_them(self):
+        isr, _ = _scenario_pair()
+        out = assess_track(isr, OBS, DEFENDED, now=1045.0)
+        assert SCENARIO_KEYS.isdisjoint(out)
+        assert out["isr_only"] is True and out["authority"] == ISR_AUTHORITY_NOTE
+
+    def test_a_scenario_assessment_is_still_sensor_posture_only(self):
+        _, scen = _scenario_pair()
+        out = assess_track(scen, OBS, DEFENDED, now=1045.0)
+        assert out["isr_only"] is True
+        assert out["authority"] == ISR_AUTHORITY_NOTE
+        assert out["sensor_posture"]["advisory"].startswith("SENSOR POSTURE:")
+        guard = TestIsrOnly()
+        for s in guard._strings(out):
+            for banned in TestIsrOnly.BANNED:
+                assert re.search(banned, s.lower()) is None, f"{banned!r} in {s!r}"
+
+    def test_the_rollup_summary_keeps_the_marker(self):
+        isr, scen = _scenario_pair()
+        scen.track_id = "TRK-scen-0001"
+        out = assess_area([isr, scen], OBS, now=1045.0)
+        by_id = {c["track_id"]: c for c in out["assessments"]}
+        assert by_id["TRK-scen-0001"]["scenario"] is True
+        assert by_id["TRK-scen-0001"]["scenario_note"] == SCENARIO_CONTACT_NOTE
+        assert SCENARIO_KEYS.isdisjoint(by_id[isr.track_id])

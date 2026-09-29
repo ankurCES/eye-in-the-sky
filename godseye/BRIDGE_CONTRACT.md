@@ -33,13 +33,22 @@ Every route except `/health` needs `Authorization: Bearer <token>`. `/events` al
 | `GET /camera/{veh}?cam=0&type=0` | Latest PNG frame; subscribes on first request; 503 when no frame |
 | `POST /camera/subscribe` | Body `{vehicle, camera?, type?}` → `{subscribed, ttl_s, vehicle, camera, type, active[]}` |
 | `POST /control/mission` | Forwards `{vehicle, kind, params, speed_mps?}` to `uav_mission` |
-| `POST /control/command` | Forwards `{tool, arguments, vehicle}` to that MCP tool |
+| `POST /control/command` | Forwards `{tool, arguments, vehicle}` to that MCP tool, except a simulated wargame `wg_*` tool: 403 `{rejected:true, error:"wargame_tools_not_forwarded", message:"The bridge does not forward simulated wargame tools; use the console."}`, before MCP is called (M14a) |
 | `GET /control/status/{veh}` | `uav_get_telemetry` for that vehicle |
 
 `/control/*` exists for God's Eye View's mission panel and the console's direct Abort
 (`POST /control/command {tool:"uav_abort", vehicle}`). It adds no command of its own, and the
 analyst never uses it. `tests/test_bridge.py` pins the exact POST route set (`/control/mission`,
 `/control/command`, `/camera/subscribe`), so new routes are never added inside `create_app`.
+
+**Simulated wargame tools are never forwarded** (PLAN.md §4.5a M14a, WG v2 §3.4). `POST
+/control/command` refuses any tool in the `wg_*` namespace with the 403 above, even against a server
+started with `--wargame-mcp`: the browser proxy is not the console's approval path, and a simulated
+engagement is confirmed only there (`INTEL_CONSOLE.md`, "Simulated wargame (M14a)"). The name check
+ignores case and surrounding whitespace (`bridge.is_wargame_tool`), a non-string `tool` is passed
+through as before (MCP names are strings), and the bearer check still runs first, so a request
+without the token gets 401. `POST /control/mission` always sends `uav_mission` and ignores a body
+`tool`.
 
 ## `/snapshot`
 
@@ -154,6 +163,13 @@ mission-state change. Every feature carries `properties.kind`:
 | `target` | Point | `properties.track_id`, `confidence`, `category`, `threat_level` |
 | `threat_ring` | Polygon | `properties.track_id`, `radius_m`, `ring` (`engagement` \| `acquisition`) |
 
+`threat_ring` is the ISR threat estimate's ring round a sensed contact; `ring: "engagement"` names the
+estimate's envelope, not a simulated engagement. The simulated wargame's forces, envelopes
+(`force_envelope`), vectors and engagements are never on `/mission-overlay`: the map reads them from
+the host's `/intel/overlay` (`INTEL_CONSOLE.md`). During a wargame session a scenario unit's track
+appears in `/tracks` and `contacts[]` like any contact (the raw `/tracks` row carries
+`scenario: true`); the bridge adds nothing else for the wargame.
+
 ## `/events`
 
 One-way SSE, reconnect-safe. The stream opens with a comment and `retry: 3000`, sends a comment
@@ -209,7 +225,9 @@ The theater can change while the app runs: the analyst proposes one and the oper
 - **The table grows.** A theater set from chat has a `dyn-…` id and lives in the process's dynamic
   registry (`theaters.register_dynamic`). `/theaters` lists it after the static rows, and the
   active block's `in_table` is true for it. The geofence document's `theater` block gains `epoch`
-  (an integer) and `dynamic` (a bool); the rest of that document is unchanged.
+  (an integer) and `dynamic` (a bool); M14a adds a top-level `doctrine` block (`mode`,
+  `wargame_session`, `wargame_mcp`, `rule`), which the bridge doesn't read. The rest of that
+  document is unchanged.
 - **Re-reading the geofence.** Loop C reads `uav://safety/geofence` at once when nothing is cached,
   retries every 30 s (`GEOFENCE_RETRY_S`) while no read has succeeded, and re-reads a good document
   every 30 s (`GEOFENCE_REREAD_S`). The slow re-read catches a theater change no listener reported,
@@ -274,10 +292,12 @@ itself) are how the bridge follows an approved theater switch; none of them comm
 ## Routes the host adds
 
 `host.py` adds these to the same app from outside `create_app` (details in `INTEL_CONSOLE.md`):
-`/app/config`, `/intel/graph`, `/intel/entity/{id}`, `/intel/events/recent`, `/intel/overlay`,
-`/chat/*`, `/settings/llm*`, `/mcp`, `/api/*` (404 `not_available_in_app_host`), and the built UI at
-`/` with the token injected into `index.html`. It also wraps the app in a loopback `Host`-header check and strips the bridge's CORS
-headers from the token-bearing pages.
+`/app/config`, `POST /app/console-claim` (the console's engagement approval key, once per launch),
+`/intel/graph`, `/intel/entity/{id}`, `/intel/events/recent`, `/intel/overlay`, `/chat/*`,
+`/settings/llm*`, `POST /wargame/session/end` (the simulated wargame's End), `/mcp`, `/api/*` (404
+`not_available_in_app_host`), and the built UI at `/` with the token injected into `index.html`
+(never the console key). It also wraps the app in a loopback `Host`-header check and strips the
+bridge's CORS headers from the token-bearing pages.
 
 ## CORS
 
@@ -288,7 +308,8 @@ credentials off. `GET /health` echoes the effective policy under `cors`.
 ## Rules
 
 1. **Read-only.** The bridge exposes no flight command of its own. `/control/*` forwards to MCP and
-   must not become a second command authority.
+   must not become a second command authority; it never forwards a simulated wargame `wg_*` tool
+   (403 `wargame_tools_not_forwarded`, M14a).
 2. **T6 write cap.** Entity property writes are capped at 2–5 Hz, with client-side interpolation so
    5 Hz data renders as smooth motion.
 3. **Fail visibly.** Degradation is state (`sim_state`, `datum_degraded`, `telemetry_error`,

@@ -15,7 +15,20 @@ literal, so a later unit cannot widen an ISR surface by accident:
 * `threat.ISR_AUTHORITY_NOTE`, `realdata.MAPPED_DATA_CAVEAT` and the
   `chat.py` stub prompt are the HEAD literals.
 
-No network; the fake sim binds A6a's range (53100-53149).
+Phase B (WG v2 §5.0, B5): in ISR mode (no session, no `--wargame-mcp`) Phase B
+changes ONLY these surfaces, each pinned below:
+
+* `uav://safety/geofence` adds `doctrine` (mode "isr"); `isr_only` unchanged;
+* `_submit` adds only the `vehicle_lost` refusal (same five keys);
+* `sim_spawn_target` refuses a duplicate label (`duplicate_name`);
+* `/intel/graph` meta adds `wargame:{active:false,last}` (B10);
+* the analyst toolbelt adds only the 3 `WG_ENTRY_TOOLS` (B7/B8);
+* the analyst prompt is base + ISR identity, which keeps "ISR only" (B7);
+* `/mcp` and every ISR text above are unchanged (the Phase A pins hold).
+Rows for units not merged yet skip on that unit's own absence.
+
+No network; the fake sim binds A6a's range (53100-53149), and B5's Phase B
+rows bind 53680-53699.
 """
 from __future__ import annotations
 
@@ -165,19 +178,27 @@ HEAD_CHAT_STUB_PROMPT = (
     "every command in the UI; never claim a command ran until its result says so.")
 
 
+#: B5's Phase B rows (WG §5.4 test ports 53600-53699).
+_B5_PORTS = list(range(53680, 53700))
+_B5_PORT = itertools.cycle(_B5_PORTS[os.getpid() % len(_B5_PORTS):]
+                           + _B5_PORTS[:os.getpid() % len(_B5_PORTS)])
+
+
 @contextmanager
-def isr_server(tmp_path):
+def isr_server(tmp_path, ports=None, port_cycle=None):
     """A default ISR server (no real data, no geodata) on a fake sim."""
+    ports = _PORTS if ports is None else ports
+    port_cycle = _PORT if port_cycle is None else port_cycle
     sim = srv = None
-    for _ in range(len(_PORTS)):
-        sim = FakeAirSim(home=HOME, port=next(_PORT))
+    for _ in range(len(ports)):
+        sim = FakeAirSim(home=HOME, port=next(port_cycle))
         try:
             sim.start()
             break
         except OSError:
             sim.stop()
             sim = None
-    assert sim is not None, "no free port in 53100-53149"
+    assert sim is not None, f"no free port in {ports[0]}-{ports[-1]}"
     store = Store(tmp_path)
     try:
         client = airsim.MultirotorClient(port=sim.port)
@@ -233,7 +254,8 @@ def test_the_geofence_adds_only_the_theater_epoch_and_dynamic_flag(tmp_path):
 
     with isr_server(tmp_path) as srv:
         doc = asyncio.run(read(srv))
-        assert set(doc) == HEAD_GEOFENCE_KEYS
+        # Phase B adds exactly `doctrine` at the top level (pinned below).
+        assert set(doc) == HEAD_GEOFENCE_KEYS | {"doctrine"}
         assert set(doc["theater"]) == HEAD_GEOFENCE_THEATER_KEYS | {"epoch", "dynamic"}
         assert doc["theater"]["epoch"] == 0 and doc["theater"]["dynamic"] is False
         assert doc["theater"]["id"] == THEATER.id
@@ -305,3 +327,117 @@ def test_the_chat_stub_prompt_is_the_head_literal(monkeypatch, tmp_path):
     monkeypatch.setattr(importlib.resources, "files", missing)
     monkeypatch.setattr(chat, "__file__", str(tmp_path / "chat.py"))
     assert chat._load_prompt() == HEAD_CHAT_STUB_PROMPT
+
+
+# =========================================================================
+# Phase B rows (WG v2 §5.0; B5). ISR mode: no session, no --wargame-mcp.
+# =========================================================================
+
+HEAD_DOCTRINE = {
+    "mode": "isr", "wargame_session": None, "wargame_mcp": False,
+    "rule": ("M14a: ISR by default; simulated wargame tools exist only in an "
+             "operator-approved session.")}
+#: The `## Identity` section of analyst_prompt.md at Phase A (B7 moves it,
+#: verbatim, into analyst_prompt_isr.md).
+HEAD_ISR_IDENTITY = (
+    "## Identity: ISR only\n\nThis system observes, classifies and reports. It has "
+    "no weapons and you never reason about engaging,\nstriking, targeting for fires "
+    "or prosecuting anything. If asked to attack, say plainly that this is an\nISR "
+    "system and offer observation instead. Threat output is sensor-posture and "
+    "self-protection advice\nonly (stand off, climb, change aspect, break contact), "
+    "never an engagement recommendation.")
+M14A_OFF_PARAGRAPH = (
+    "The simulated wargame (M14a) is off in this session. If the operator asks to "
+    "simulate an attack between simulated forces, offer to start one with "
+    "`wg_session_start`, which they approve. Until then you have no wargame tools. "
+    "Real places are never targets in any mode.")
+WG_ENTRY_TOOLS = frozenset({"wg_session_start", "wg_session_status", "wg_list_classes"})
+
+
+def _squash(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_phase_b_geofence_doctrine_is_isr_and_isr_only_is_unchanged(tmp_path):
+    async def read(srv):
+        items = list(await srv.mcp.read_resource("uav://safety/geofence"))
+        return json.loads(items[0].content)
+
+    with isr_server(tmp_path, _B5_PORTS, _B5_PORT) as srv:
+        doc = asyncio.run(read(srv))
+    assert doc["doctrine"] == HEAD_DOCTRINE
+    assert doc["isr_only"] == HEAD_ISR_ONLY
+    assert set(doc) - HEAD_GEOFENCE_KEYS == {"doctrine"}
+
+
+def test_phase_b_submit_adds_only_the_vehicle_lost_refusal(tmp_path):
+    shape = {"rejected", "error", "message", "rejected_tool", "vehicle"}
+    with isr_server(tmp_path, _B5_PORTS, _B5_PORT) as srv:
+        assert srv.vehicles_lost == {}                 # nothing lost in ISR mode
+        srv.vehicles_lost["Drone1"] = {"by": "Red SAM 1", "at_ms": 0}
+        lost = srv._submit("Drone1", "uav_hover", {}, None)
+        other = srv._submit("Drone2", "uav_hover", {}, None)
+    assert set(lost) == shape and lost["error"] == "vehicle_lost"
+    assert other.get("status") == "accepted"
+
+
+def test_phase_b_sim_spawn_target_refuses_a_duplicate_label(tmp_path):
+    lat, lon = THEATER.home_lat + 0.002, THEATER.home_lon
+    with isr_server(tmp_path, _B5_PORTS, _B5_PORT) as srv:
+        spawn = srv.mcp._tool_manager._tools["sim_spawn_target"].fn
+        first = asyncio.run(spawn(lat=lat, lon=lon, ob_class="supply_truck", name="t1"))
+        again = asyncio.run(spawn(lat=lat + 0.002, lon=lon, ob_class="supply_truck",
+                                  name="t1"))
+        assert first["status"] == "accepted"
+        assert again["error"] == "duplicate_name" and again["rejected"] is True
+        assert set(again) == {"rejected", "error", "message"}
+        assert srv.targets["t1"]["lat"] == lat            # never overwritten
+
+
+def test_phase_b_mcp_has_no_wargame_tool_and_its_own_registry_is_unmounted(tmp_path):
+    with isr_server(tmp_path, _B5_PORTS, _B5_PORT) as srv:
+        assert not any(n.startswith("wg_") for n in _tools(srv))
+        assert srv.wargame_mcp is not srv.mcp and srv.wargame_mcp_enabled is False
+        assert srv.wargame.mode_key() == "isr"
+
+
+def test_phase_b_intel_graph_meta_says_the_wargame_is_off(tmp_path):
+    pytest.importorskip("godseye_uav.intel_scenario",
+                        reason="B10 adds meta.wargame; not merged yet")
+    from godseye_uav.intel_graph import IntelService
+
+    class Ctx:
+        def snapshot(self):
+            return {"vehicles": [], "missions": [], "contacts": [], "feeds": {}}
+
+        def theaters(self):
+            return {"theaters": theaters.as_payload()["theaters"],
+                    "active": theaters.active_unknown("not read yet")}
+
+    with isr_server(tmp_path, _B5_PORTS, _B5_PORT) as srv:
+        meta = IntelService(Ctx(), srv).graph()["meta"]
+    assert meta["wargame"] == {"active": False, "last": None}
+
+
+def test_phase_b_toolbelt_entry_tools_are_the_three(tmp_path):
+    from godseye_uav import analyst_policy
+    if not hasattr(analyst_policy, "WG_ENTRY_TOOLS"):
+        pytest.skip("B7 adds WG_ENTRY_TOOLS; not merged yet")
+    assert frozenset(analyst_policy.WG_ENTRY_TOOLS) == WG_ENTRY_TOOLS
+
+
+def test_phase_b_the_isr_prompt_keeps_its_identity(tmp_path):
+    import inspect
+    import pathlib
+
+    here = pathlib.Path(chat.__file__).with_name("analyst_prompt_isr.md")
+    if not here.is_file():
+        pytest.skip("B7 splits the analyst prompt; not merged yet")
+    isr = here.read_text(encoding="utf-8")
+    base = here.with_name("analyst_prompt.md").read_text(encoding="utf-8")
+    assert _squash(isr).startswith(_squash(HEAD_ISR_IDENTITY))
+    assert _squash(M14A_OFF_PARAGRAPH) in _squash(isr)
+    assert "## Identity" not in base and "No engagement recommendations." in base
+    params = inspect.signature(chat._load_prompt).parameters
+    prompt = chat._load_prompt("isr") if params else chat._load_prompt()
+    assert "ISR only" in prompt and _squash(HEAD_ISR_IDENTITY) in _squash(prompt)

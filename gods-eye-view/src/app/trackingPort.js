@@ -28,10 +28,13 @@
  *                          (CesiumWidget._canRender goes false), and the
  *                          render loop is gated too (see tools.js)
  *   openMissionPanel()     expand the UAV mission drawer
- *   setViewportInset({right, bottom})  narrow the map to leave `right` px
- *                          for the console's dock, recentring the cockpit
+ *   setViewportInset({right, bottom, top})  narrow the map to leave `right`
+ *                          px for the console's dock, recentring the cockpit
  *                          keyhole; `bottom` (the narrow bottom sheet) only
- *                          lifts the UAV alarm toasts above the sheet
+ *                          lifts the UAV alarm toasts above the sheet; `top`
+ *                          (the simulated wargame's 28 px strip, WG v2
+ *                          §5.3.2) lowers the map's top edge, recentring the
+ *                          keyhole again. A missing `top` is 0
  *   keyhole()              {x, y, r} of the keyhole circle in page (= viewport;
  *                          the page never scrolls) coordinates, or null
  *
@@ -55,7 +58,13 @@
  *                          credits and the UAV alarm stack stay; the UAV layer
  *                          and its context overlay switch on. Never the cockpit
  *   setOverlayVisibility({sites, forces, engagements, vectors})  per-kind show
- *   onPick(cb)             cb({id}) for a context id (sit:…) or veh:{name}
+ *                          (an optional boolean `truth` sets the view too)
+ *   setOverlayTruth(bool)  the console's wargame view (WG v2 §5.3.3): true is
+ *                          Umpire view (the overlay asks truth=1 and draws
+ *                          red), false is Blue view (red is never drawn).
+ *                          Blue view until the console says otherwise
+ *   onPick(cb)             cb({id}) for a context id (sit:…, frc:…, eng:…,
+ *                          vec:…) or veh:{name}
  *                          clicked on the map while in overview; unsubscribe
  *   overlayStatus()        the context overlay's counts (sites drawn and not
  *                          drawn, degraded, attribution), or null
@@ -85,6 +94,9 @@ export const MAP_INSET_VAR = '--gev-map-inset-right';
  *  sit above it instead of over its composer. */
 export const ALARM_INSET_CLASS = 'gev-alarm-inset';
 export const ALARM_INSET_VAR = '--gev-alarm-inset-bottom';
+/** The simulated wargame's session strip sits over the map's top edge. */
+export const MAP_INSET_TOP_CLASS = 'gev-map-inset-top';
+export const MAP_INSET_TOP_VAR = '--gev-map-inset-top';
 /** The console's map overview (§4.2.7): GEV chrome hidden, map kept. */
 export const OVERVIEW_CLASS = 'gev-console-overview';
 /** showArea: each half-extent grows by this fraction. */
@@ -151,6 +163,12 @@ const NOT_INERT = new Set([
  * width, 52vh). The UAV alarm toasts move left of the dock. In the map
  * overview with the narrow bottom sheet, the credits (which must stay
  * visible and clickable) sit above the sheet as the alarm toasts do.
+ *
+ * The top inset (the wargame strip) lowers #cesiumContainer's and the cockpit
+ * HUD's top edge; the rims and the cloud pass then centre on the map's own
+ * middle, 50vh + top / 2 down the page, with the radius's height term taken
+ * from the map's height (52 % of 100vh - top). These rules come after the
+ * right-inset ones and carry both insets, so either or both may be set.
  */
 export const TRACKING_PORT_CSS = `
 html body.${MAP_HIDDEN_CLASS} #cesiumContainer,
@@ -163,6 +181,10 @@ html body.${MAP_INSET_CLASS} .cockpit-speed-rim{left:calc(50vw - var(${MAP_INSET
 html body.${MAP_INSET_CLASS} #cockpit-cloud-effects{clip-path:circle(min(calc((100vw - var(${MAP_INSET_VAR},0px)) * 0.4),52vh) at calc(50vw - var(${MAP_INSET_VAR},0px) / 2) 50%)}
 html body.${MAP_INSET_CLASS} .uav-alarm-stack{right:calc(var(${MAP_INSET_VAR},0px) + 16px)}
 html body.${ALARM_INSET_CLASS} .uav-alarm-stack{bottom:calc(var(${ALARM_INSET_VAR},0px) + 16px)}
+html body.${MAP_INSET_TOP_CLASS} #cesiumContainer{height:auto;top:var(${MAP_INSET_TOP_VAR},0px);bottom:0}
+html body.${MAP_INSET_TOP_CLASS} #cockpit-hud{top:var(${MAP_INSET_TOP_VAR},0px)}
+html body.${MAP_INSET_TOP_CLASS} .cockpit-altitude-rim{--cockpit-keyhole-radius:min(calc((100vw - var(${MAP_INSET_VAR},0px)) * 0.4),calc((100vh - var(${MAP_INSET_TOP_VAR},0px)) * 0.52));top:calc(50vh - var(${MAP_INSET_TOP_VAR},0px) / 2 - var(--cockpit-keyhole-radius) + 20px)}
+html body.${MAP_INSET_TOP_CLASS} #cockpit-cloud-effects{clip-path:circle(min(calc((100vw - var(${MAP_INSET_VAR},0px)) * 0.4),calc((100vh - var(${MAP_INSET_TOP_VAR},0px)) * 0.52)) at calc(50vw - var(${MAP_INSET_VAR},0px) / 2) calc(50vh + var(${MAP_INSET_TOP_VAR},0px) / 2))}
 html body.${OVERVIEW_CLASS}.${ALARM_INSET_CLASS} #cesium-credits{bottom:calc(var(${ALARM_INSET_VAR},0px) + 8px)!important}
 html body.${OVERVIEW_CLASS} #title-bar,
 html body.${OVERVIEW_CLASS} #style-indicator,
@@ -421,6 +443,7 @@ export function createTrackingPort({
   const listeners = new Set();
   let mapHidden = false;
   let insetRight = 0;
+  let insetTop = 0;
   let renderSync = null;
   let enterToken = 0;
   let pending = null; // {token, reference, resolve, poll, timeout}
@@ -784,18 +807,22 @@ export function createTrackingPort({
     if (changed) syncRendering();
   }
 
-  function setViewportInset({ right = 0, bottom = 0 } = {}) {
+  function setViewportInset({ right = 0, bottom = 0, top = 0 } = {}) {
     if (destroyed) return;
     const value = Number(right);
     insetRight = Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
     const low = Number(bottom);
     const insetBottom = Number.isFinite(low) ? Math.max(0, Math.round(low)) : 0;
+    const high = Number(top);
+    insetTop = Number.isFinite(high) ? Math.max(0, Math.round(high)) : 0;
     ensureStyle();
     const host = body();
     host?.style?.setProperty?.(MAP_INSET_VAR, `${insetRight}px`);
     toggleClass(host, MAP_INSET_CLASS, insetRight > 0);
     host?.style?.setProperty?.(ALARM_INSET_VAR, `${insetBottom}px`);
     toggleClass(host, ALARM_INSET_CLASS, insetBottom > 0);
+    host?.style?.setProperty?.(MAP_INSET_TOP_VAR, `${insetTop}px`);
+    toggleClass(host, MAP_INSET_TOP_CLASS, insetTop > 0);
     if (viewer && !viewer.isDestroyed?.()) {
       viewer.resize?.();
       viewer.scene?.requestRender?.();
@@ -964,6 +991,24 @@ export function createTrackingPort({
     return uavLayer?.setContextVisibility?.(kinds) ?? null;
   }
 
+  /**
+   * The console's wargame view (§5.3.3): true is Umpire view, anything else
+   * Blue view. It rides the context layer's switch call, which the overlay
+   * reads as its view.
+   * @param {boolean} on Umpire view.
+   * @returns {boolean|null} The view in force, or null without an overlay.
+   */
+  function setOverlayTruth(on) {
+    if (destroyed) return null;
+    const truth = on === true;
+    if (typeof uavLayer?.setContextTruth === 'function')
+      return uavLayer.setContextTruth(truth) === true;
+    if (typeof uavLayer?.setContextVisibility !== 'function') return null;
+    uavLayer.setContextVisibility({ truth });
+    const status = uavLayer.getContextStatus?.();
+    return typeof status?.truth === 'boolean' ? status.truth : truth;
+  }
+
   function forwardPick(pick) {
     if (!overview || destroyed) return;
     const id = typeof pick?.id === 'string' ? pick.id : '';
@@ -993,6 +1038,9 @@ export function createTrackingPort({
     enterOverview: () => true,
     exitOverview: () => true,
     setOverlayVisibility: () =>
+      typeof uavLayer?.setContextVisibility === 'function',
+    setOverlayTruth: () =>
+      typeof uavLayer?.setContextTruth === 'function' ||
       typeof uavLayer?.setContextVisibility === 'function',
     onPick: () => typeof uavLayer?.onContextPick === 'function',
     overlayStatus: () => typeof uavLayer?.getContextStatus === 'function',
@@ -1026,6 +1074,7 @@ export function createTrackingPort({
     toggleClass(body(), MAP_HIDDEN_CLASS, false);
     toggleClass(body(), MAP_INSET_CLASS, false);
     toggleClass(body(), ALARM_INSET_CLASS, false);
+    toggleClass(body(), MAP_INSET_TOP_CLASS, false);
     if (overview) uavLayer?.setContextActive?.(false);
     overview = false;
     toggleClass(body(), OVERVIEW_CLASS, false);
@@ -1034,6 +1083,7 @@ export function createTrackingPort({
     pickListeners.clear();
     body()?.style?.removeProperty?.(MAP_INSET_VAR);
     body()?.style?.removeProperty?.(ALARM_INSET_VAR);
+    body()?.style?.removeProperty?.(MAP_INSET_TOP_VAR);
     styleEl?.remove?.();
     styleEl = null;
     listeners.clear();
@@ -1066,6 +1116,7 @@ export function createTrackingPort({
     enterOverview,
     exitOverview,
     setOverlayVisibility,
+    setOverlayTruth,
     onPick,
     overlayStatus: () => uavLayer?.getContextStatus?.() ?? null,
     // GEV-internal.
@@ -1078,6 +1129,8 @@ export function createTrackingPort({
       renderSync = typeof fn === 'function' ? fn : null;
     },
     viewportInset: () => insetRight,
+    /** The top inset in force (px): the wargame strip, else 0. */
+    viewportInsetTop: () => insetTop,
     /** True while the console's map overview is on. */
     isOverview: () => overview,
     destroy,
@@ -1091,6 +1144,7 @@ const DEFERRED_OVERVIEW_METHODS = new Set([
   'enterOverview',
   'exitOverview',
   'setOverlayVisibility',
+  'setOverlayTruth',
   'onPick',
 ]);
 
@@ -1119,6 +1173,8 @@ export function createDeferredTrackingPort() {
   let unsubscribe = null;
   let mapVisible = null;
   let inset = null;
+  // The wargame view is state, like the inset: the latest wins on attach.
+  let overlayTruth = null;
   // Map-overview calls made before the real port exists, replayed in order.
   const queue = [];
   const pickListeners = new Set();
@@ -1237,6 +1293,20 @@ export function createDeferredTrackingPort() {
       const out = call('setOverlayVisibility', [kinds], null);
       return port ? out : null;
     },
+    /**
+     * The wargame view. Remembered before the real port attaches and applied
+     * then, ahead of the queued overview calls, so the first overlay fetch
+     * already asks for the right view.
+     */
+    setOverlayTruth(on) {
+      overlayTruth = on === true;
+      if (!port) return null;
+      try {
+        return port.setOverlayTruth?.(overlayTruth) ?? null;
+      } catch {
+        return null;
+      }
+    },
     onPick(cb) {
       if (typeof cb !== 'function') return () => {};
       pickListeners.add(cb);
@@ -1257,6 +1327,13 @@ export function createDeferredTrackingPort() {
       pickOff = typeof off === 'function' ? off : null;
       if (mapVisible !== null) port.setMapVisible(mapVisible);
       if (inset !== null) port.setViewportInset(inset);
+      if (overlayTruth !== null) {
+        try {
+          port.setOverlayTruth?.(overlayTruth);
+        } catch {
+          /* an older port: Blue view, the safe side */
+        }
+      }
       replay(port);
       if (!failure) resolveArrival(port);
     },

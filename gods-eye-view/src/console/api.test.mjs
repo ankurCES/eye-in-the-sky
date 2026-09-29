@@ -2,12 +2,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   AuthError,
+  CONSOLE_CLAIM_PATH,
   HttpError,
   OfflineError,
   SSE_RETRY_MS,
   TimeoutError,
+  WARGAME_END_PATH,
   createApi,
   formatZulu,
+  intelGraphPath,
   joinUrl,
   neutralizeBidi,
   showBidi,
@@ -559,4 +562,114 @@ test('settings error codes read as words; provider_changed is a default SSE even
     assert.equal(e.message, ERROR_WORDS.needs_check);
     return true;
   });
+});
+
+// ---- simulated wargame routes (WG §3.5) ---------------------------------------------
+
+test('claimConsole POSTs the claim route once with the bearer; 409 is worded', async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    response(200, { console_key: 'k3Y_abcdefghijklmnopqrstuvwxyz012' }),
+  );
+  const api = createApi({
+    base: 'http://127.0.0.1:52100',
+    token: 't',
+    fetchImpl,
+  });
+  const out = await api.claimConsole();
+  assert.equal(out.console_key, 'k3Y_abcdefghijklmnopqrstuvwxyz012');
+  assert.equal(CONSOLE_CLAIM_PATH, '/app/console-claim');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'http://127.0.0.1:52100/app/console-claim');
+  assert.equal(calls[0].init.method, 'POST');
+  assert.equal(calls[0].init.headers.Authorization, 'Bearer t');
+  assert.equal(calls[0].init.body, '{}');
+  assert.doesNotMatch(calls[0].url, /token|key/i, 'nothing secret in the URL');
+
+  const refused = createApi({
+    fetchImpl: recordingFetch(
+      response(409, { error: 'console_already_claimed' }),
+    ).fetchImpl,
+  });
+  await assert.rejects(refused.claimConsole(), (err) => {
+    assert.ok(err instanceof HttpError);
+    assert.equal(err.status, 409);
+    assert.equal(err.code, 'console_already_claimed');
+    assert.equal(
+      err.message,
+      'another client already claimed engagement approvals',
+    );
+    return true;
+  });
+});
+
+test('endWargame POSTs the end route; with no session it is a worded 409', async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    response(200, { ok: true, aar_id: 'aar-WG-1a2b3c' }),
+  );
+  const api = createApi({ token: 't', fetchImpl });
+  assert.deepEqual(await api.endWargame(), {
+    ok: true,
+    aar_id: 'aar-WG-1a2b3c',
+  });
+  assert.equal(WARGAME_END_PATH, '/wargame/session/end');
+  assert.equal(calls[0].url, '/wargame/session/end');
+  assert.equal(calls[0].init.method, 'POST');
+  assert.equal(calls[0].init.body, '{}');
+  await api.endWargame({ reason: '  operator  ' });
+  assert.equal(calls[1].init.body, '{"reason":"operator"}');
+
+  const inactive = createApi({
+    fetchImpl: recordingFetch(response(409, { error: 'wargame_inactive' }))
+      .fetchImpl,
+  });
+  await assert.rejects(inactive.endWargame(), (err) => {
+    assert.equal(err.status, 409);
+    assert.equal(err.code, 'wargame_inactive');
+    assert.equal(err.message, 'no wargame is running');
+    return true;
+  });
+});
+
+test('the approval refusals read as words (console_required, acknowledgement_required)', async () => {
+  for (const [code, words] of [
+    [
+      'console_required',
+      "this console doesn't hold the engagement approval key",
+    ],
+    [
+      'acknowledgement_required',
+      'the acknowledgement box has to be checked first',
+    ],
+    [
+      'engagement_requires_console_approval',
+      'an engagement needs your approval in the console first',
+    ],
+    [
+      'wargame_tools_not_forwarded',
+      "wargame tools aren't sent through the bridge",
+    ],
+  ]) {
+    const api = createApi({
+      fetchImpl: recordingFetch(response(422, { error: code })).fetchImpl,
+    });
+    await assert.rejects(api.post('/x', {}), (err) => {
+      assert.equal(err.code, code);
+      assert.equal(err.message, words);
+      return true;
+    });
+  }
+});
+
+test('intelGraphPath: the ISR path unchanged, truth=1 only for Umpire view', () => {
+  assert.equal(intelGraphPath(), '/intel/graph?scope=theater');
+  assert.equal(intelGraphPath({ scope: 'all' }), '/intel/graph?scope=all');
+  assert.equal(
+    intelGraphPath({ scope: 'theater', truth: true }),
+    '/intel/graph?scope=theater&truth=1',
+  );
+  assert.equal(
+    intelGraphPath({ scope: 'x', truth: 'yes' }),
+    '/intel/graph?scope=theater',
+    'only a real true asks for truth',
+  );
 });

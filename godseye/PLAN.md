@@ -1,7 +1,7 @@
 # godSeye — Agentic UAV Mission Simulation System
 ## Technical Implementation Plan v1.1 (reviewed: military ISR + systems engineering; adds live-mission command-center view + laptop execution)
 
-**Vision:** God's Eye View (Cesium photorealistic 3D globe) is the C2 UI. Microsoft AirSim is the UAV physics + sensor backend. A Python MCP server exposes mission control to an agentic harness (LLM + `godseye-uav` skill) flying recon / tracking / target-ID / threat-assessment missions on real-world maps with GPS positioning, flight-path mapping, and fuel modeling. **ISR-only: no kinetic tools exist anywhere in the system.**
+**Vision:** God's Eye View (Cesium photorealistic 3D globe) is the C2 UI. Microsoft AirSim is the UAV physics + sensor backend. A Python MCP server exposes mission control to an agentic harness (LLM + `godseye-uav` skill) flying recon / tracking / target-ID / threat-assessment missions on real-world maps with GPS positioning, flight-path mapping, and fuel modeling. **ISR by default (M14); an opt-in, operator-approved simulated wargame mode (M14a, §4.5a) adjudicates notional engagements between simulated scenario units only.**
 
 **Review status:** Incorporates all findings from `REVIEW_MILITARY.md` (M1–M22) and `REVIEW_TECHNICAL.md` (T1–T9). Criticals fixed in design: M1/M2/M3/M7/M13, T1/T2/T7.
 
@@ -167,7 +167,31 @@ Server: Python, colocated with sim host. Long ops (>2 s) return `task_id` immedi
 - **Fuel integrator (T5):** each telemetry tick: recompute phase from *measured* climb/cruise (not commanded), `fuel −= rate(phase, wind)·dt`, persist (JSONL). Dry-run estimates use the SAME integrator over the waypoint plan.
 - **Lost-link (M9):** per-mission `lost_link_plan` (hold-orbit / climb-for-LOS / RTB / continue) executed autonomously by server on link loss; LOAL events logged to INTREP.
 - Watchdog: future not resolved in timeout → fail handle → hover-recovery (T2). Harness disconnect → lost_link_plan.
-- ISR-only: no kinetic tools. Threat assessment outputs `recommended_roe` REMOVED (M14) — system reports; command authority stays with the operator.
+- ISR by default (M14, amended by M14a §4.5a): no kinetic tools in ISR mode; the simulated wargame's `wg_*` tools exist only in an approved session. Threat assessment outputs `recommended_roe` REMOVED (M14) — system reports; command authority stays with the operator.
+
+### 4.5a M14a — ISR default, opt-in simulated wargame mode (amends M14)
+- **ISR is the default.** Every tool, resource and output behaves as M14 describes unless an
+  operator-approved simulated wargame session is active. Default builds publish no `wg_*` tool on
+  `/mcp` or `/control/command`; `--wargame-mcp` is an explicit opt-in for external harnesses.
+- **The wargame is a simulation.** Its forces are scenario units spawned by the wargame (provenance
+  `scenario`, generic designators such as "Red SAM 1"). Effects are abstract and notional:
+  probability-of-detection and probability-of-effect tables, unit states (active, suppressed,
+  damaged, destroyed) and threat envelopes, all round play-balance numbers. No weaponeering: no real
+  munition or system names or specifications, no blast radii, no fuzing, no aimpoints. Every wargame
+  output is stamped as simulated (`simulated: true`).
+- **Real data is never a target.** OpenStreetMap sites, mapped installations, real air traffic and
+  named real facilities (including the preset theaters' sites) are context only. The server refuses
+  any engagement whose target is not a scenario unit of the active session, keeps scenario units at
+  least 500 m from mapped footprints and theater points, and names no real place in wargame output.
+- **Drones never deliver effects.** Aircraft fly ISR: recce and battle-damage re-looks.
+- **Every engagement needs the operator.** Class `engagement`: asked on every call, never
+  session-grantable, acknowledgement required, never automatic. The server holds a pending engagement
+  and executes it only after the console's approval path authorizes it; `/mcp` and
+  `/control/command` can never confirm.
+- **M14's authority principle stands:** the system proposes, the operator decides, ROE is read-only
+  configuration. The M5 standoff floor and MAPPED_DATA_CAVEAT are unchanged.
+- **Separation:** wargame code lives in `wargame*.py` and the `wg_*` namespace; `threat.py`,
+  `missions.py` and `targets.OB_LIBRARY` stay ISR-only.
 
 ### 4.6 Threat assessment — structured pipeline (M13)
 Deterministic, not LLM vibes: (a) match each track against **order-of-battle library** (type → capabilities, weapon ranges, mobility); (b) evaluate **intent indicators** (posture, movement toward asset, pattern-of-life deviation from M12 store, emissions if modeled); (c) confidence = confirmed/probable/possible with cited evidence per element; (d) score = capability × intent, each component traceable. Harness narrates; scores come from the model.

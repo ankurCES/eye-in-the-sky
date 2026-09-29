@@ -104,8 +104,11 @@ if ICON and not Path(ICON).is_file():
 datas = [
     (str(UI), "ui"),
     # geo.py reads data/us_nga_egm96_15.tif next to the package (PROJ vgridshift);
-    # chat.py reads analyst_prompt.md through importlib.resources.
-    *collect_data_files("godseye_uav", includes=["data/*.tif", "analyst_prompt.md"]),
+    # chat.py reads the analyst prompt (base, ISR identity, wargame addendum; M14a)
+    # through importlib.resources.
+    *collect_data_files("godseye_uav", includes=["data/*.tif", "analyst_prompt.md",
+                                                 "analyst_prompt_isr.md",
+                                                 "analyst_prompt_wargame.md"]),
     *collect_data_files("egm96"),                 # the geoid fallback's model file
     *copy_metadata("godseye-uav"),                # app_version() for /app/config
 ]

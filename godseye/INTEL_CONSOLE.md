@@ -4,14 +4,16 @@ This is the reference for the Eye in the Sky app: the single-process host, its H
 the analyst's approval policy, and the data-honesty rules the console follows. Everything here was
 checked against the code: `host.py`, `app.py`, `chat.py`, `analyst_policy.py`, `analyst_toolbelt.py`,
 `intel_graph.py`, `intel_sites.py`, `intel_overlay.py`, `theater_tools.py`, `theater_plan.py`,
-`theater_switch.py`, `llm_settings.py` and `llm_providers.py` in `mcp/godseye_uav/`, and
+`theater_switch.py`, `llm_settings.py` and `llm_providers.py` in `mcp/godseye_uav/`, the simulated
+wargame's `wargame.py`, `wargame_tools.py`, `wargame_aar.py` and `intel_scenario.py` there too, and
 `gods-eye-view/src/console/` (plus `src/app/trackingPort.js` and `src/layers/uav/context*.js` for the
 map). Where this file and the code disagree, the code wins.
 
-**ISR-only.** The analyst observes, classifies and reports. Nothing it can call is kinetic, and threat
-output is sensor-posture advice only. Every action that moves an aircraft, tasks a sensor or changes
-the sim waits for the operator. That includes moving the simulation to another place: a real place
-is context only, and its mapped sites are never targets.
+**ISR by default (M14a).** The analyst observes, classifies and reports. Nothing it can call is
+kinetic, and threat output is sensor-posture advice only. Every action that moves an aircraft, tasks a
+sensor or changes the sim waits for the operator. That includes moving the simulation to another
+place: a real place is context only, and its mapped sites are never targets. In a simulated wargame
+session the analyst also has `wg_*` tools; every engagement asks the operator.
 
 ## Contents
 
@@ -26,6 +28,7 @@ is context only, and its mapped sites are never targets.
 - [Map overview and mapped sites](#map-overview-and-mapped-sites)
 - [The analyst's toolbelt](#the-analysts-toolbelt)
 - [Runtime theaters and sim speed](#runtime-theaters-and-sim-speed)
+- [Simulated wargame (M14a)](#simulated-wargame-m14a)
 - [Analyst sign-in and Anthropic's policy](#analyst-sign-in-and-anthropics-policy)
 - [Analyst providers and keys](#analyst-providers-and-keys)
 - [Settings routes](#settings-routes)
@@ -52,6 +55,9 @@ The app opens on an intelligence console, not a map:
 - **analyst settings** (⌘, or Ctrl+, or "Analyst settings…" in the analyst's menu): which model
   provider the analyst uses, its model and its key. The analyst's header names the model and the
   provider ("claude-opus-5 via Claude login (this Mac)").
+- during an operator-approved **simulated wargame** only: the session strip and frame, scenario
+  forces, engagements and vectors on the orb, the rail and the map, engagement slips and umpire rows
+  in the transcript (see [Simulated wargame (M14a)](#simulated-wargame-m14a)).
 
 The Cesium map from God's Eye View (GEV) appears in two modes only: **tracking mode**, following one
 drone in the cockpit view, and **map overview**, which frames an area (the theater, sites, drones)
@@ -68,6 +74,7 @@ launcher included (`gods-eye-view/src/main.js`).
  │                                                                                                   │
  │  /                 built console UI (gods-eye-view/dist), window.__GODSEYE__ injected            │
  │  /app/config  /intel/*  /chat/*  /settings/llm*    host routers, added outside create_app        │
+ │  /app/console-claim  /wargame/*                     (the simulated wargame, M14a)                │
  │  /mcp              GodseyeUavServer, Streamable HTTP + bearer       <── external MCP harnesses   │
  │  /health /snapshot /mission-overlay /theaters /events /tracks /control/* /camera/*   bridge      │
  │  /api/*            404 {"error":"not_available_in_app_host"}                                      │
@@ -106,30 +113,34 @@ that fails validation gets FastAPI's standard 422 (`{"detail": [...]}`).
 | Route | Auth | Response |
 |---|---|---|
 | `GET /` and `GET /index.html` | none | The built UI with `<script>window.__GODSEYE__={"bridgeUrl":"","token":"…"}</script>` inserted before the first module script. Sent with `no-store`, `X-Frame-Options: DENY`, `Content-Security-Policy: frame-ancestors 'none'` and `Cross-Origin-Resource-Policy: same-origin`; CORS headers are stripped. If the UI is not built, a page that says how to build it. |
-| `GET /app/config` | none | `{app:"eye-in-the-sky", version, theater:{id,label,epoch}, chat:{available, model, reason?, provider?:{id,label}}, mcp_path:"/mcp", ui:"built"\|"missing"}`. `theater` is read from the running server, so it follows a runtime switch; `epoch` is its `theater_epoch`. Never the token, and never the provider's host, base URL or key state (this route has no auth). |
-| `GET /intel/graph?scope=theater\|all` | bearer | The intel graph (below). Bad scope: 422 `{error:"invalid_scope", scope, allowed}`. |
+| `GET /app/config` | none | `{app:"eye-in-the-sky", version, theater:{id,label,epoch}, chat:{available, model, reason?, provider?:{id,label}}, mcp_path:"/mcp", ui:"built"\|"missing"}`. `theater` is read from the running server, so it follows a runtime switch; `epoch` is its `theater_epoch`. Never the token, never the console key, and never the provider's host, base URL or key state (this route has no auth). |
+| `POST /app/console-claim` | bearer, header only | The console's engagement approval key, once per launch (see [The console key](#the-console-key)). First call: 200 `{console_key}` and an audit row `console_claimed`. Every later call: 409 `{rejected:true, error:"console_already_claimed", message}` and an audit row `console_claim_refused`. The body is not read; `?token=` gets 401; both answers are `no-store`. |
+| `GET /intel/graph?scope=theater\|all[&truth=1]` | bearer | The intel graph (below). `truth=1` is the console's Umpire view of a simulated wargame; without it the answer is the ISR one (or, in a session, the Blue view). Bad scope: 422 `{error:"invalid_scope", scope, allowed}`; a `truth` other than `0`, `1`, `false` or `true`: 422 `{error:"invalid_truth", allowed:["0","1"]}`. |
 | `GET /intel/overlay?truth=0\|1&rev=` | bearer | The map's context features (below). `{rev, unchanged:true}` when `rev` is still current. Any other `truth` value: 422 `{error:"invalid_truth", allowed:["0","1"]}`. |
-| `GET /intel/entity/{id}` | bearer | `{id, type, label, subtitle, status, requested_id?, fields, provenance, related:[{id,type,label,kind,dir}], related_omitted?, caveats, raw?}`, at most 60,000 bytes. Accepts a collapsed duplicate's id or a bare id. Unknown: 404 `{error:"unknown_entity", id}`. |
+| `GET /intel/entity/{id}[?truth=1]` | bearer | `{id, type, label, subtitle, status, requested_id?, fields, provenance, related:[{id,type,label,kind,dir}], related_omitted?, caveats, raw?}`, at most 60,000 bytes. Accepts a collapsed duplicate's id or a bare id. `truth=1` reads the Umpire view (a red force exists only there); bad `truth`: 422 `invalid_truth`. Unknown: 404 `{error:"unknown_entity", id}`. |
 | `GET /intel/events/recent?limit=50` | bearer | `{events:[alarm payload + seq]}`, limit clamped to 1–100. |
 | `GET /chat/status` | bearer | `{available, model, reason?, hint?, effort?, provider:{id, label, kind, model_family, host, key_source, configured}, cost_basis:"anthropic_list"\|"unreliable", settings_rev}`. Never reads a key and never carries one. `reason` is `disabled`, `sdk_missing` or `cli_missing` (the analyst can't run at all), or a provider reason (below). |
 | `POST /chat/sessions` | bearer | `{session_id}`. The CLI is not started until the first message. With 8 sessions open, the least recently active idle one is closed; if none is idle, 409 `{error:"busy", message}`. |
 | `POST /chat/sessions/{sid}/messages` | bearer | Body `{text (1–8000 chars), context?:{focused_ids:[graph id]}}` → 202 `{turn_id}`. 404 `{error:"unknown_session", session_id}`; 409 `{error:"busy", turn_id}` while a turn runs; 503 `{error:"unavailable", reason, hint?}`; 422 `{error:"invalid", message}`. Up to 20 valid `focused_ids` are prefixed to the prompt as `[[id]]` references. |
 | `GET /chat/sessions/{sid}/stream` | bearer or `?token=` | `text/event-stream` (next section). Resume with the `Last-Event-ID` header or `?last_event_id=`. 404 for an unknown session. |
-| `POST /chat/sessions/{sid}/approvals/{approval_id}` | bearer | Body `{decision:"approve"\|"deny"\|"approve_session", note? (≤ 2000)}` → `{ok:true}`. 404 `{error:"unknown_approval", approval_id}` (unknown, expired or already decided); 422 `{error:"not_allowed", message}` for `approve_session` on a class that cannot be granted. |
+| `POST /chat/sessions/{sid}/approvals/{approval_id}` | bearer | Body `{decision:"approve"\|"deny"\|"approve_session", note? (≤ 2000), acknowledged? (JSON `true` or `false` only)}`, optional header `X-Godseye-Console: <console key>` → `{ok:true}`. 404 `{error:"unknown_approval", approval_id}` (unknown, expired or already decided); 422 `{error:"not_allowed", message}` for `approve_session` on a class that cannot be granted. An `engagement` approval is checked in this order: no key configured, or the header missing or not equal (constant-time) → 422 `{error:"console_required", message}` for `approve` and `approve_session`; `approve` without `acknowledged:true` → 422 `{error:"acknowledgement_required", message}`; `approve_session` → 422 `not_allowed`. A deny needs neither. A string `"true"` or a `1` for `acknowledged` fails validation (FastAPI's 422 `{detail}`). |
 | `GET /chat/sessions/{sid}/grants` | bearer | `{grants:[{tool, since_ms}]}`. 404 `{error:"unknown_session", session_id}`. |
 | `DELETE /chat/sessions/{sid}/grants/{tool}` | bearer | `{ok:true}`; idempotent for a known session, 404 `unknown_session` otherwise. |
 | `POST /chat/sessions/{sid}/interrupt` | bearer | `{ok:true}`. Pending approvals resolve as `cancelled`. 404 for an unknown session. |
 | `DELETE /chat/sessions/{sid}` | bearer | `{ok:true}`. Stops the session's CLI. 404 for an unknown session. |
 | `GET /settings/llm`, `PUT /settings/llm`, `POST /settings/llm/test`, `DELETE /settings/llm/providers/{id}/key` | bearer, header only | The analyst's model-provider settings; see [Settings routes](#settings-routes). Same origin only; a key goes in and never comes back out. |
-| `/mcp` | bearer | The godseye MCP server (51 tools, 8 resources; see `TOOL_CONTRACT.md`). A 401 names `http://127.0.0.1:<port>/.well-known/oauth-protected-resource` as its resource metadata; that address is not served (404). |
+| `POST /wargame/session/end` | bearer | Ends the simulated wargame for the operator (the strip's End wargame). The body is not read; the after-action review records `operator`. 200 `{ok:true, aar_id, session_id, resource, revived, simulated:true}`; with no session 409 `{error:"wargame_inactive", message, simulated:true}`, while an end is already running 409 `wargame_ending`, and 500 `wargame_failed` for an unexpected engine error. |
+| `/mcp` | bearer | The godseye MCP server (51 tools, 8 resources; see `TOOL_CONTRACT.md`). With `--wargame-mcp` it also lists the ten simulated `wg_*` tools (61 in all); by default none. A 401 names `http://127.0.0.1:<port>/.well-known/oauth-protected-resource` as its resource metadata; that address is not served (404). |
 | `/api/{path}` | none | 404 `{error:"not_available_in_app_host"}`: GEV's node-only providers exist only under its vite dev server. |
 
 When a module could not be loaded: `/intel/*` answers 503 `{error:"intel_unavailable"}`;
 `GET /chat/status` answers `{available:false, reason:"sdk_missing"|"error", hint, model}` and the
 other `/chat/*` routes 503 `{error:"chat_unavailable"}`. If `llm_settings` fails to load or its
 routes can't be built, `/settings/*` answers 503 `{error:"settings_unavailable"}` and the analyst
-runs on the Claude login. The bridge routes are unchanged; see `BRIDGE_CONTRACT.md`. The chat never
-uses `/control/*`.
+runs on the Claude login. If `wargame_tools` fails to load, `/wargame/*` answers 503
+`{error:"wargame_unavailable"}` and the rest of the app (the console claim included) stays up. The
+bridge routes are unchanged except that `POST /control/command` refuses every `wg_*` tool with 403
+`wargame_tools_not_forwarded`; see `BRIDGE_CONTRACT.md`. The chat never uses `/control/*`.
 
 **`/chat/status` and the provider** (when the settings module loaded):
 
@@ -211,12 +222,26 @@ the epoch; `meta.overlay_rev` is the overlay feed's current `rev`.
 | site | `sit:{theater_id}:{osm_type}/{osm_id}` | A mapped OpenStreetMap feature around the active theater (WG v2 §3.2), context only. The 60 most salient; `group` is the category's sector. Label: the OSM name (bidi-stripped, ≤ 80 characters) or "unnamed {category}"; subtitle "{Category word}  Mapped, not verified". `attrs`: `category`, `subtype`, `osm {type, id}`, `bounds [s,w,n,e]` (null for a point), `tags` (≤ 6 whitelisted, never `name`, values ≤ 60 characters; may be absent after budget trimming), `tags_total`, `protected` (only when true: medical), `source:"osm"`, `register:"mapped"`, `fetched_at_ms`. Status is always `ok` and salience at most 0.5. |
 | alarm | `alarm:{seq}` | the newest 50 |
 | feed | `feed:{name}` | bridge feeds plus `sim`, `real_data` and `theater` |
+| force | `frc:{unit_id}` | Simulated wargame only (M14a): a scenario unit, `unit_id` = `{side}-{prefix}-{n}` (`frc:red-sam-1`); label its designator ("Red SAM 1"). At most 60. See [Simulated wargame (M14a)](#simulated-wargame-m14a). |
+| engagement | `eng:{engagement_id}` | Simulated wargame only: a proposed, authorized, adjudicated, denied or expired engagement. The newest 24. |
+| vector | `vec:axis-{unit_id}` or `vec:cor-{n}` | Simulated wargame only: a red axis of advance or a planned corridor. The newest 12. |
+
+During a session three existing types gain fields: a vehicle the wargame downed carries
+`wargame_state:"lost"`, `wargame_lost_at_ms` and `wargame_lost_by` (the downing unit's `frc:` id,
+null in the Blue view); a scenario contact (a track of a scenario unit) carries `attrs.scenario:true`,
+the generic label (`wargame_tables.label_for_ob`, for example "Surface-to-air, short range") as label
+and `platform`, and the subtitle suffix "Scenario contact (simulated)"; and the after-action review
+is a report node `rpt:aar-<session id>` with `attrs.format:"AAR"`.
 
 Edge kinds: `flying` (vehicle → mission, only while the phase is planning, executing or rtb),
 `tracking` (vehicle → track), `operating_in` (vehicle → theater), `target` and `observes`
 (mission → track), `member_of` (track → unit), `is_a` (track → equipment), `in_theater`
 (track, POI or site → theater), `near` (track → POI within 250 m), `reports_on` (report → track),
-`about` (alarm → vehicle, track or mission). No edge ever points at a site.
+`about` (alarm → vehicle, track or mission). No edge ever points at a site. A simulated wargame
+session adds `attacks` (engagement → its target), `launched_by` (engagement → attacker, when
+shown), `along` (engagement → vector), `ingress` (a corridor's `from` → its `to`) and, in the
+Umpire view only, `axis` (red force → blue force), `threatens` (red force → vehicle or blue force in
+range) and `correlates` (track → force). No wargame edge touches a site, a POI or a theater.
 
 **Sites in the graph.** `meta.sites` is `{total, in_graph, omitted, degraded, reason,
 fetched_at_ms, attribution, caveat}`, plus `tags_trimmed` and `trimmed_for_budget` when the graph
@@ -242,10 +267,13 @@ theater's POIs) and no action, control or damage field. `intel_search` type `sit
                   "simulated": false, "truth": false}}]}
 ```
 
-`rev` is `{theater_epoch}:{sites fetched_at_ms or 0}:{engine revision, 0 in Phase A}:{truth}`.
-Features come most salient first: up to 300 are served (the rest counted in `omitted.site`), and
-the top 40 are `labelled`. `site` is the only kind in Phase A; the map draws an unknown kind as a
-grey point labelled "Unrecognised map item". Without an in-process server the body is an empty
+`rev` is `{theater_epoch}:{sites fetched_at_ms or 0}:{wargame engine revision, else 0}:{truth}`,
+and `meta.overlay_rev` in the graph carries the same engine revision. Site features come most
+salient first: up to 300 are served (the rest counted in `omitted.site`), and the top 40 are
+`labelled`. Outside a wargame session `site` is the only kind; during one the feed adds `force`,
+`force_envelope` (`ring:"threat"|"detection"`), `vector` (`kind_detail:"axis"|"corridor"`) and
+`engagement` (see [Simulated wargame (M14a)](#simulated-wargame-m14a)). The map draws an unknown kind
+as a grey point labelled "Unrecognised map item". Without an in-process server the body is an empty
 collection whose `sites.reason` says so.
 
 Vehicle status: `critical` for a latched BINGO, fuel at or below BINGO, a declared lost link
@@ -266,7 +294,7 @@ events per session are kept for replay.
 | `text_delta` | `{turn_id, text}` |
 | `thinking` | `{turn_id, text}` (summarized thinking) |
 | `tool_call` | `{turn_id, call_id, tool, title, class, args, summary}`; `tool` is the bare name, `args` are shrunk for display |
-| `approval_request` | `{approval_id, call_id, tool, class, title, summary, args, consequences:[str], allow_session, expires_at_ms, vehicle, dry_runnable, grant_scope, acknowledge_required, dry_run?, theater_preview?, time_scale_preview?}`; `theater_preview` is always present for `sim_set_theater` and `time_scale_preview` for `sim_set_time_scale` |
+| `approval_request` | `{approval_id, call_id, tool, class, title, summary, args, consequences:[str], allow_session, expires_at_ms, vehicle, dry_runnable, grant_scope, acknowledge_required, dry_run?, theater_preview?, time_scale_preview?, engagement?}`; `theater_preview` is always present for `sim_set_theater`, `time_scale_preview` for `sim_set_time_scale`, and `engagement` (the engine's preview, `{}` when it couldn't be built) for every `engagement`-class call |
 | `approval_resolved` | `{approval_id, call_id, decision:"approved"\|"denied"\|"expired"\|"cancelled", tool, scope:"once"\|"session", note?}` |
 | `tool_result` | `{call_id, ok, outcome:"ok"\|"rejected"\|"error"\|"busy"\|"not_run", rejected?, error?, busy_with?:{task_id?, mission_id?, tool?}, summary, bytes, truncated, entities:[graph id]}` |
 | `ui` | `{action:"focus", ids, note?}`, `{action:"track", vehicle, reason}`, `{action:"orb"}`, `{action:"inspect", id}`, `{action:"theater", id:"thr:…", label?}` or `{action:"map", ids:[1–50 graph ids], reason}` |
@@ -304,10 +332,31 @@ Details that matter to a client:
   deltas is still caught. If redaction fired during a turn, the CLI is stopped and that session's
   transcript is rewritten without the key before the next turn resumes from it.
 - The stop reason is `max_turns` after 40 model turns in one message.
-- Entity references in assistant text use `[[type:id|label]]` or `[[type:id]]` with the eleven graph
-  prefixes (`veh msn trk unit ob rpt thr poi sit alarm feed`). The console renders them as chips.
-- `acknowledge_required` is true for the `safety_override` class (`analyst_policy.Decision.acknowledge`);
-  the slip then needs its acknowledgement checkbox before Approve works.
+- Entity references in assistant text use `[[type:id|label]]` or `[[type:id]]` with the fourteen
+  graph prefixes (`veh msn trk unit ob rpt thr poi sit frc eng vec alarm feed`; the last three
+  before `alarm` exist only in a simulated wargame session). The console renders them as chips.
+- `acknowledge_required` is true for the `safety_override` and `engagement` classes
+  (`analyst_policy.Decision.acknowledge`); the slip then needs its acknowledgement checkbox before
+  Approve works. For `engagement` the server enforces it too (the approval route's 422s above).
+- **Engagement approvals** (`wg_execute_engagement`, class `engagement`; see
+  [Simulated wargame (M14a)](#simulated-wargame-m14a)). The service treats the tool as an engagement
+  whatever the policy table says: never automatic, never session-grantable, always acknowledged. On
+  an approval that passed the route's checks it calls `server.wargame.authorize(pending_id,
+  approval_id, chat_session=<this chat session>, args=<the call's arguments>)` in a worker thread. If
+  that raises, the call is denied to the model with the engine's refusal ("The simulated engagement
+  was not authorized: …"), and the stream shows `approval_resolved` `approved` followed by a
+  `tool_result` with `outcome:"not_run"`; the pending engagement then waits out its 10-minute TTL.
+  A deny, an expiry and an interrupt each call `server.wargame.deny(pending_id)`, so the engagement's
+  phase becomes `denied` at once.
+- **Mode changes.** The analyst's CLI is built for the server's mode (`server.wargame.mode_key()`:
+  `"isr"` or `"wargame:<session id>"`, anything unreadable counting as ISR). The actor's reconnect key
+  is `(provider, mode)`, so the first message after a session starts or ends reconnects the CLI (the
+  conversation resumes) with the other system prompt and toolbelt, and that message is prefixed
+  "[Mode changed: simulated wargame session {id} is active]" or "[Mode changed: back to ISR]",
+  followed by that mode's identity section (`analyst_prompt_wargame.md` or `analyst_prompt_isr.md`).
+  The identity rides in the conversation because the bundled CLI keeps a resumed conversation's
+  first system prompt: E2E B1 saw the wargame turn's request still carry the ISR system prompt. There
+  is no `mode_changed` event: the console reads `graph.meta.wargame.active`.
 - `theater_preview` and `time_scale_preview` come from `theater_tools.approval_preview(server, tool,
   args)`, which reads caches only and never raises. `{}` (no server, or any error) makes the slip
   Deny-only. `theater_preview` is `{label, place, query, geocoder, center, bbox, half_extent_m,
@@ -326,16 +375,18 @@ Details that matter to a client:
 ## Approval classes
 
 `analyst_policy.classify(tool, args)` is pure and fails closed: a tool it does not know is a
-`command` with no session grant, and an exception inside it also returns `command`.
+`command` with no session grant, and an exception inside it also returns `command` (except for
+`wg_execute_engagement`, which stays an `engagement`: the stricter class).
 
 | Class | Asks the operator | Session grant | Tools |
 |---|---|---|---|
-| `read` | no | – | `uav_get_telemetry`, `uav_list_vehicles`, `uav_task_status`, `mission_status`, `uav_los_check`, `uav_target_report`, `uav_identify_target`, `uav_assess_threat`, `uav_list_ob_classes`, `uav_real_data_status`, `uav_deconflict_airspace`, `uav_list_tracks`, `geo_lookup`, `geo_sites`; the curated `intel_overview`, `intel_search`, `intel_entity`, `read_intel_resource`, `ui_focus`, `ui_track`, `ui_show_orb`, `ui_inspect`, `ui_show_map` |
-| `plan` | no | – | `mission_dry_run`, and `dry_run: true` on a tool that honours it: `uav_mission`, `uav_orbit_poi`, `mission_grid_search`, `mission_recon_route`, `mission_track_target`, `mission_identify_target`, `mission_threat_assessment`, `mission_handoff_track`; `theater_propose` (always, whatever its arguments; it changes nothing) |
+| `read` | no | – | `uav_get_telemetry`, `uav_list_vehicles`, `uav_task_status`, `mission_status`, `uav_los_check`, `uav_target_report`, `uav_identify_target`, `uav_assess_threat`, `uav_list_ob_classes`, `uav_real_data_status`, `uav_deconflict_airspace`, `uav_list_tracks`, `geo_lookup`, `geo_sites`, `wg_session_status`, `wg_list_forces`, `wg_list_classes`; the curated `intel_overview`, `intel_search`, `intel_entity`, `read_intel_resource`, `ui_focus`, `ui_track`, `ui_show_orb`, `ui_inspect`, `ui_show_map` |
+| `plan` | no | – | `mission_dry_run`, and `dry_run: true` on a tool that honours it: `uav_mission`, `uav_orbit_poi`, `mission_grid_search`, `mission_recon_route`, `mission_track_target`, `mission_identify_target`, `mission_threat_assessment`, `mission_handoff_track`; `theater_propose` (always, whatever its arguments; it changes nothing); `wg_plan_corridor` and `wg_propose_strike` (they plan and record a proposal; nothing is fired) |
 | `sensor` | yes | per tool | `uav_get_detections`, `uav_scan_targets`, `uav_capture_image`, `uav_set_gimbal`, `uav_set_fov` |
 | `command` | yes, every call | no | `uav_takeoff`, `uav_land`, `uav_return_to_home`, `uav_goto_gps`, `uav_fly_route`, `uav_hover`, `uav_orbit_poi`, `uav_mission`, `mission_grid_search`, `mission_recon_route`, `mission_track_target`, `mission_identify_target`, `mission_threat_assessment`, `mission_handoff_track`, `uav_handoff_target`, `mission_cancel`, `uav_abort`; any unknown tool |
-| `sim` | yes, every call | no | `sim_set_time`, `sim_set_weather`, `sim_spawn_target`, `sim_move_target`, `sim_set_gps_degradation`, `sim_hydrate_real_data`, `sim_spawn_order_of_battle`, `sim_set_environment`, `sim_set_theater`, `sim_set_time_scale` |
+| `sim` | yes, every call | no | `sim_set_time`, `sim_set_weather`, `sim_spawn_target`, `sim_move_target`, `sim_set_gps_degradation`, `sim_hydrate_real_data`, `sim_spawn_order_of_battle`, `sim_set_environment`, `sim_set_theater`, `sim_set_time_scale`, `wg_session_start`, `wg_session_end`, `wg_generate_scenario`, `wg_spawn_force` |
 | `safety_override` | yes, every call | no | `sim_set_fuel` (clears the BINGO latch), `sim_set_link_state` (can trigger an autonomous return), `sim_reset` (drops in-flight tasks) |
+| `engagement` | yes, every call, with an acknowledgement; approvable only from the console holding the engagement key | no | `wg_execute_engagement` (simulated wargame, M14a); checked before every other rule, and still an engagement if classification itself fails |
 
 Argument rules:
 
@@ -354,10 +405,17 @@ Argument rules:
 - `uav_list_tracks`, `sim_set_environment` and `uav_handoff_target` are classified but not exposed to
   the analyst (see the toolbelt).
 - `theater_propose` is a plan whatever its arguments. The lost-link rule above still applies to
-  `mission_dry_run` and to the dry-runnable tools, but not to the five theater tools: none of them
-  declares `dry_run`, `params` or `lost_link_plan`, and the server drops undeclared arguments.
-- `Decision.acknowledge` is true for `safety_override`; it becomes the event's
+  `mission_dry_run` and to the dry-runnable tools, but not to the five theater tools or the ten
+  `wg_*` tools: none of them declares `dry_run`, `params` or `lost_link_plan`, and the server drops
+  undeclared arguments.
+- `Decision.acknowledge` is true for `safety_override` and `engagement`; it becomes the event's
   `acknowledge_required`.
+- The `wg_*` consequences also come from the arguments only (`analyst_policy.WG_*_NOTE(S)`), for
+  example for `wg_execute_engagement`: "Rolls one simulated outcome for this engagement against a
+  scenario unit.", "Nothing real is fired.", "The outcome stands for the rest of this wargame; only
+  ending the wargame clears it." and "In blue view the outcome stays hidden until a re-look assesses
+  damage." `wg_session_start` warns that red air defence may down drones unless `red_engages` is
+  literally `false` ("Red forces won't fire in this session.").
 - The theater tools' consequences come from the call's arguments only. For `sim_set_theater`, for
   example: "Moves the simulation to Bengaluru centre: a 5.0 × 5.0 km area around 12.97160,
   77.59460.", that every drone is parked, landed, at the new home, that fuel and the BINGO latch
@@ -371,7 +429,9 @@ Argument rules:
 ## Session grants
 
 - Only `sensor` calls can be granted, one tool at a time (`grant_scope` names the tool).
-  `approve_session` on any other class returns 422.
+  `approve_session` on any other class returns 422 (`not_allowed`; for an `engagement` without the
+  console key, `console_required` first). A grant, even a forged one, never lets an engagement run
+  without a slip.
 - A granted tool runs without a slip for the rest of that chat session. The call still appears as a
   `tool_call` and `tool_result`.
 - Grants live in memory with the session. Closing the session, "New session" in the UI, or a host
@@ -423,6 +483,7 @@ Every `approval_request` renders as an order slip inline in the transcript
   the request says `acknowledge_required`.
 - **Deny-only slips.** Approve is not rendered at all (only Deny and a reason line) when:
   - the class is one the console does not know (above);
+  - an engagement slip's own cases (the engagement slip, below);
   - a theater or sim-speed slip's preview is missing, or lacks a required key (`checks`, `center`,
     `bbox`, `home`, `airframe`, `ground_msl_m` for `theater_preview`; `checks`, `from`, `to` for
     `time_scale_preview`): "The console couldn't build this preview, so it can't be approved.";
@@ -444,6 +505,28 @@ Every `approval_request` renders as an order slip inline in the transcript
   approved one at a time." Every row hides when its field is absent.
 - **Sim speed slip** (`sim_set_time_scale`): title "Set sim speed", summary "×N", the consequences
   followed by `time_scale_preview.caveats`, and "Approve change".
+- **Engagement slip** (class `engagement`, `chat/slipEngagement.js`, `validateEngagement.js`): a Sand
+  band with a 45° hatch ("acknowledge, and irreversible"), glyph `flare` and the phrase "Simulates an
+  engagement"; the title "Simulated {strike|engagement} on {target}" with the target's generic
+  label; the fixed line "Simulated. Nothing real is fired. {target} is a scenario unit, not a real
+  place."; "What happens" (the consequences); a "Checks" table (chance of effect, marked notional;
+  the adjudication inputs; the corridor's exposure against a straight route; the preview's rules
+  with ✓ or ✕; when the target was seen; the seed and engine for replay); the caveats; "What can't
+  be undone"; and the box "I understand this rolls a simulated outcome against {target} that can't
+  be undone." Approve stays disabled until the box is checked and arms
+  1600 ms after that (unchecking disarms; under reduced motion "Ready in 2 s"); it reads "Approve
+  simulated strike" when the preview's `verb_kind` is `strike`, else "Approve simulated
+  engagement", with "Engagements are approved one at a time. They can't be allowed for the
+  session." It is **Deny-only**, checked in this order, when the `engagement` preview is missing or
+  lacks `checks`, `target` (with a label), `attacker` or `p_notional` (with a numeric `effect`); when
+  this console doesn't hold the engagement key ("This console can't approve engagements: another
+  client claimed them." after a refused claim, else "… it holds no engagement approval key."); or
+  when it is blocked: a preview check failed, the target isn't a scenario unit or is protected, the
+  session ended or was replaced ("The wargame has ended."), or, in the Umpire view, the target's
+  force is already destroyed. It is **stale** ("Ask for a fresh plan" first, "Approve anyway"
+  second) when the target track moved more than 250 m or sim speed or the weather was approved since
+  the request. Once adjudicated, the filed slip shows "Outcome at {Z}: {outcome} (simulated)." or
+  "Outcome hidden in blue view."
 - **Queue**: several slips are ordered oldest first ("1 of 2"); two waiting slips for the same vehicle
   both warn that the later one will be refused as busy.
 - After a decision the slip is filed as a one-line record (approved, denied with the note, expired,
@@ -540,20 +623,31 @@ that is never green.
 - Not exposed: `uav_list_tracks` (uncapped; the intel tools replace it), `sim_set_environment`
   (legacy; it zeroes the wind) and `uav_handoff_target` (the GEV panel's alias of
   `mission_handoff_track`). Resources are reachable only through `read_intel_resource`, which admits
-  `uav://mission/{id}`, `uav://reports/{id|latest}`, `uav://pattern-of-life/{poi|all}`,
+  `uav://mission/{id}`, `uav://reports/{id|latest}` (which includes a simulated wargame's
+  after-action review, `uav://reports/aar-<session id>`), `uav://pattern-of-life/{poi|all}`,
   `uav://safety/geofence` and `uav://{vehicle}/telemetry`. Sim ground truth (`uav://targets`) and
   camera images are not readable.
 - Curated tools: `intel_overview`, `intel_search`, `intel_entity`, `read_intel_resource`, `ui_focus`,
-  `ui_track`, `ui_show_orb`, `ui_inspect`, `ui_show_map`. That is 57 tools in all (48 proxied,
-  9 curated), counted against the Phase A server's 51.
+  `ui_track`, `ui_show_orb`, `ui_inspect`, `ui_show_map`. That is 57 tools from the server's 51
+  (48 proxied, 9 curated), plus the simulated wargame's tools by mode (below): 60 in ISR mode, 67
+  during a wargame session.
+- **Simulated wargame tools** (M14a) come only from the server's own never-mounted registry
+  `server.wargame_mcp`; any `wg_*` copy on `server.mcp` (under `--wargame-mcp`) is skipped, so each
+  appears once. `build_toolbelt(…, session_id=, mode=)`: in ISR mode (the default, and anything that
+  isn't `"wargame"`) the belt carries only the three entry tools `wg_session_start`,
+  `wg_session_status` and `wg_list_classes`; in `"wargame"` mode all ten. Every `wg_*` proxy calls
+  `server.wargame_mcp.call_tool` inside `wargame.console_call(<chat session id>)`: that context is
+  the only way an authorized engagement executes (a `/mcp` call never has it).
 - `ui_show_map{ids, reason}` (both required) frames 1–50 graph ids on the map and emits
   `ui {action:"map", ids, reason}`. Ids are checked against the chip grammar only (not against the
   graph) and de-duplicated in order; a bad list gets the error `invalid_ids`, which never echoes the
   model's input. `reason` is at most 200 characters.
 - The proxy marks every call it makes as coming from the console
-  (`theater_tools.CALL_VIA = "console"` around `server.mcp.call_tool`, reset afterwards), so a
+  (`theater_tools.CALL_VIA = "console"` around each in-process `call_tool`, reset afterwards), so a
   switch approved in the console records `set_via: "console"`, and a direct `/mcp` call `"mcp"`.
 - `intel_search` takes `site` as a type, and `place`/`places` for theater, POI and site together.
+  Ids the curated tools accept follow the chip grammar with all fourteen prefixes (`frc`, `eng` and
+  `vec` included). The intel tools always read the Blue view: the analyst never passes `truth`.
 - Results are compact JSON capped at 24,000 characters (`intel_entity` at 20,000, `intel_overview`
   at 6,000 bytes from the service). Tools that take `detail` or `top_n` get `detail="summary"` and
   `top_n=10` when the model leaves them unset. Anything cut is marked: lists end in
@@ -564,13 +658,20 @@ that is never green.
   thinking, effort and the child environment depend on the provider (`chat.provider_options`):
   thinking is adaptive with summarized display unless the provider's setting or its full check turned
   it off.
-- The system prompt is `mcp/godseye_uav/analyst_prompt.md` (package data), distilled from the
-  `godseye-uav` skill: ISR-only identity, task → plan → dry-run → execute → monitor → report, server
-  gates win, measured versus assumed, SALUTE and INTREP, and the console's approval and chip rules.
-  Its "Theaters: working anywhere" section teaches the theater flow (`geo_lookup`, then
-  `theater_propose`, then `sim_set_theater` with `set_args` exactly), when to pick the group-3
-  airframe (areas wider than about 6 km), sim speed and its caveats, and that mapped sites are
-  context cited as `[[sit:…|name]]`. The identity is still "ISR only".
+- The system prompt is two package-data files in `mcp/godseye_uav/` (`chat._load_prompt(mode)`):
+  the base `analyst_prompt.md`, distilled from the `godseye-uav` skill (task → plan → dry-run →
+  execute → monitor → report, server gates win, measured versus assumed, SALUTE and INTREP, and the
+  console's approval and chip rules), followed by one identity. In ISR mode that is
+  `analyst_prompt_isr.md`: the ISR-only identity ("## Identity: ISR only", with its refusal line)
+  and a paragraph saying the simulated wargame (M14a) is off and that the analyst may offer to start
+  one with `wg_session_start`. During a session it is `analyst_prompt_wargame.md` ("## Identity:
+  simulated wargame (M14a)": say "simulated", scenario units only, never name real places, drones
+  never deliver effects, propose by track id and execute with `execute_args` exactly, no
+  weaponeering, end with `wg_session_end`). The base's "Theaters: working anywhere" section teaches
+  the theater flow (`geo_lookup`, then `theater_propose`, then `sim_set_theater` with `set_args`
+  exactly), when to pick the group-3 airframe (areas wider than about 6 km), sim speed and its
+  caveats, and that mapped sites are context cited as `[[sit:…|name]]`. A missing base or identity
+  file gives the built-in ISR stub prompt, never a wargame identity.
 - A session's CLI (about 190 MB resident) is disconnected after 10 minutes without a turn; the next
   message reconnects and resumes the conversation. At most 8 sessions are kept.
 
@@ -647,6 +748,7 @@ per reason in `reasons`, joined in `message`) when:
 - "{vehicle}: BINGO latched; refuel with sim_set_fuel first";
 - "{vehicle}: link lost" (also while the link is pending);
 - "a forced RTB is flying";
+- "end the wargame session first" (a simulated wargame session is starting or running);
 - the theater's validation problems, verbatim;
 - "the EGM96 geoid is unavailable".
 
@@ -758,6 +860,291 @@ caveats, which the slip also shows, are:
 `real_data_stale_dropped` (a hydration that finished after a switch), `restart_resume_regated`,
 `restart_resume_regate_failed`, `fuel_restore_airframe_mismatch` and `vehicle_roster_refreshed`. No
 safety violation kind or alarm kind was added.
+
+## Simulated wargame (M14a)
+
+ISR is the default (PLAN.md §4.5a, M14a). An operator-approved **simulated wargame session** adds
+scenario forces, notional engagements between them, red air defence that can down drones, corridors
+and axes, battle-damage re-looks and an after-action review. Nothing real is fired and nothing real
+can be engaged. The ten `wg_*` tools, their arguments, results and refusals are in
+`TOOL_CONTRACT.md` §4.6; this section is the console's side and the rules around them.
+
+**What the server holds, whoever calls** (`wargame.py`, `wargame_tools.py`):
+
+- **Scenario units only.** Forces are units the wargame places (provenance `scenario`, generic
+  designators such as "Red SAM 1"). A track enters a wargame computation (a sensed threat, a
+  corridor target, a strike, a battle-damage look) only through the provenance gate: its sim object
+  is a scenario unit of this session, spawned before the track was first seen, within 300 m of the
+  unit's true position. Mapped sites, theater points, `sim_spawn_*` objects, phantoms and real air
+  traffic always fail it (`not_a_scenario_unit`).
+- **Real places are never targets.** Units are placed at least 500 m from mapped footprints and
+  theater points and, for red, 1 km from home. A target within 500 m of a mapped place or theater
+  point, or within 1 km of a protected one, is refused, re-checked at propose, authorize and execute
+  on the unit's true position and on the track's. Wargame text names no real place: positions are
+  relative to the AO centre and the theater is named by id only.
+- **Notional.** Outcomes are play-balance table draws ("Notional simulation parameters chosen for
+  play balance. Not weapon data."), with no real system names and no weaponeering. Every wargame
+  result, graph row, overlay feature and the after-action review carries `simulated: true`.
+- **Drones never deliver effects.** Shooters are blue scenario units. Drones fly recce and
+  battle-damage re-looks with the ordinary ISR tools, through the ordinary gate and slips.
+- **Every engagement asks the operator**, in the console only (below).
+
+**Starting.** The analyst offers `wg_session_start` (its ISR identity says the wargame is off until
+the operator approves one). It is a `sim` call: the slip reads "Start a simulated wargame" with
+"Approve start", every time. The engine refuses under a real AirSim (`wargame_requires_fake_sim`),
+during a theater switch (`theater_switching`), in every preset theater except `default`
+and in a chat theater within 5 km of one of those presets (`theater_not_cleared`), and in a chat theater whose mapped places couldn't all be loaded
+(`exclusion_incomplete`). `red_engages` (default true) lets red air defence fire on drones;
+`reveal_red` (default false) shows red forces in the Blue view. When the graph's
+`meta.wargame.active` turns true the console shows the session strip and its frame, and the
+analyst's next message runs with the wargame identity and tools.
+
+**While a session runs:**
+
+- `sim_set_theater` is refused ("end the wargame session first") and `sim_reset` is refused
+  (`wargame_active`, "end the wargame first", audited as `sim_reset_refused`).
+- `sim_spawn_target` refuses a duplicate label (`duplicate_name`, also outside sessions) and,
+  during a session, a scenario unit's name (`scenario_name`) or a spot near a scenario unit
+  (`near_scenario_unit`); `sim_move_target` refuses a scenario unit's name, and a route that
+  passes within 150 m of a scenario unit (`near_scenario_unit`). Another object's detections never
+  join a scenario unit's track. See `TOOL_CONTRACT.md`.
+- A drone red air defence downs is **lost**: its task is aborted, it is landed where it is and
+  disarmed, its missions end incomplete ("lost (simulated wargame)"), a forced RTB is dropped, and
+  every command for it is refused with `vehicle_lost` ("{vehicle} was lost in the simulated wargame;
+  it returns when the wargame ends."). The console shows a critical banner "Simulated loss: {vehicle}
+  destroyed by {attacker} at {Z}." (in the Blue view the attacker is "Red air defence (not
+  identified)").
+- `uav://safety/geofence` carries `doctrine:{mode:"wargame", wargame_session:"<id>", wargame_mcp,
+  rule}` (in ISR mode `mode:"isr"` and `wargame_session:null`); `isr_only` is unchanged.
+
+**Ending.** The analyst's `wg_session_end` (a `sim` slip, "Approve end"), or the strip's End wargame:
+a one-step popover ("End the wargame? Scenario units and waiting engagements are cleared. The
+after-action review is kept. Aircraft keep their current tasks.", with Keep playing and End wargame)
+that calls `POST /wargame/session/end`. A refusal reads "Couldn't end the wargame: {error}." with
+Retry; on success the strip goes at once and the screen reader hears "Wargame ended by you at {Z}."
+Ending stops red adjudication, expires waiting engagements, removes the scenario objects and
+their tracks, parks every downed drone at home, landed, files the after-action review as
+`uav://reports/aar-<session id>` (never as `latest`) and deletes `<store>/wargame.json`. The AAR
+records who ended it: `operator` (the route), `analyst` or `mcp`.
+
+**Restart during a session.** `<store>/wargame.json` (the session id, seed, scenario object names and
+track ids) is written when a session starts, on every spawn and on every new scenario track. At the
+next boot `recover_on_boot` deletes that session's tracks, files a partial AAR (`incomplete: true`,
+its timeline taken from the `wargame_event` audit rows), audits
+`wargame_session_aborted_by_restart` and deletes the file. A graceful stop (`Host.close()`) stops the
+engine's thread but leaves the file, so it is recovered the same way; a session never resumes.
+
+### The console key
+
+An engagement can be approved only from the console that holds this launch's **console key**
+(WG v2 §3.5, §3.8):
+
+- `build_host` makes one key per launch (`secrets.token_urlsafe(24)`, `host.ConsoleClaim`) and hands
+  it to `ChatService(console_key=…)`. It is never in `window.__GODSEYE__`, `/app/config`,
+  `mcp.json`, a log line, an audit row or a `repr`, and never on any GET.
+- `POST /app/console-claim` (bearer header) gives it out **once**: of any number of concurrent
+  claims exactly one wins (200 `{console_key}`, audit `console_claimed {claimed_at_ms}`). Every later
+  claim is 409 `console_already_claimed`, audited as `console_claim_refused {attempt,
+  claimed_at_ms}` with a log warning. Nothing un-claims it: a new key needs a restart.
+- The console's holder (`config.js createConsoleKey`) keeps the key in
+  `sessionStorage["godseye.consoleKey"]`, so a reload keeps it and a new window doesn't. Its states
+  are `idle`, `claiming`, `held`, `refused` (409; final until reload), `unsupported` (404, 405 or 501,
+  or a 2xx without a usable key: a host without the route; final) and `failed` (no answer). A valid
+  key already in storage is `held` at once and no claim is sent. Otherwise the console claims at
+  boot; a `failed` claim is retried after 2, 5, 10 and 30 s, then every 30 s (`CLAIM_RETRY_MS`), and
+  again when a session starts. Concurrent claims from one page share one POST. `invalidate()` drops
+  a key the host no longer accepts and claims again. `onChange` and the bus event `console:key`
+  carry `{state, canApprove}`, never the key.
+- A refused claim shows a persistent warn banner, "Another client claimed engagement approvals;
+  restart to re-arm", and every engagement slip is Deny-only.
+- The chat client sends `X-Godseye-Console` on every approval POST once the key is held, and
+  `acknowledged: true` only on an approve whose box is checked (never on a deny).
+
+**Threat model, stated plainly.** The key is never GET-able and a second claim is refused and
+audited. A local process holding the bearer token could win the claim race at launch; the console
+then shows the banner and nothing can be approved from it until a restart. An agent that claims
+after the console gets 409. The key does not defend against code running inside the console page,
+which is out of scope, as it is for the bearer token.
+
+### Engagements: propose, approve, execute
+
+1. The analyst proposes by track id: `wg_propose_strike(shooter_id, target_track_id)`, a `plan` call
+   with no slip, on a contact its sensors reported with at least probable confidence. It records a
+   pending engagement (phase `proposed`; at most 8 wait at once; each expires after 10 minutes) and
+   returns `execute_args`. Nothing is fired.
+2. It calls `wg_execute_engagement(**execute_args)`. The chat service emits `approval_request` with
+   `class:"engagement"`, `acknowledge_required:true` and `engagement`: the engine's preview
+   (`server.wargame.preview(pending_id)`, read in a worker thread; `{}` when it fails, which makes
+   the slip Deny-only). The preview re-runs every gate and reports it in `checks`: "Target is a
+   simulated scenario unit", "More than 500 m from any mapped place or theater point", "Not within
+   1 km of a protected place", "Shooter active with ammunition", "In range", "Engagement still
+   waiting for approval" and "Wargame session active". Its other keys are `id`, `kind`
+   (`blue_strike`), `verb_kind` (`strike` for the air strike package, else `engagement`),
+   `attacker {id, label, wg_class}`, `target {track_id, graph_id, label (generic), perceived_class,
+   confidence, sightings, last_seen_ms, lat, lon, scenario, protected}`, `vector`, `p_notional`,
+   `inputs`, `range_m`, `seed`, `engine`, `caveats`, `expires_at_ms`, `simulated` and `note`.
+3. The operator checks the box and approves on the engagement slip (see
+   [Order-slip rules](#order-slip-rules)). The console POSTs `{decision:"approve",
+   acknowledged:true}` with `X-Godseye-Console`; without either the route answers 422.
+4. The chat service calls `server.wargame.authorize(pending_id, approval_id, chat_session=<this chat
+   session>, args=<the call's arguments>)`. The engine checks that the engagement is still
+   `proposed` and unexpired, that the arguments equal the proposal's, and checks the shooter, the
+   provenance gate, the real-site gate and the range again, then marks it `authorized` for that
+   chat session. A refusal denies the call to the model with the refusal's sentence; a deny,
+   expiry or interrupt marks it `denied`.
+5. The toolbelt runs the call inside `wargame.console_call(<chat session id>)`.
+6. `engine.execute` rolls the one outcome only for an authorized, unexpired engagement, only when
+   `CONSOLE_CALL` equals the authorizing chat session, only with the same arguments, and only after
+   those checks pass once more (a unit moved onto a mapped site after the approval is refused).
+   Otherwise it answers `engagement_requires_console_approval`, audited as
+   `engagement_confirm_refused`, or the failing gate's refusal. The authorization is one-shot; a
+   replayed `idempotency_key` returns the recorded result without drawing again.
+
+`/mcp`, even under `--wargame-mcp`, never carries the console context, and `/control/command`
+answers 403 for any `wg_*` tool, so neither can ever confirm an engagement.
+
+**After a strike.** In the Blue view the outcome stays hidden (`outcome_hidden:true`) until battle
+damage assessment. The analyst plans a re-look with `wg_plan_corridor(relook=true)` and flies
+`mission_recon_route(**recon_args)` (dry run first, then a command slip), then scans with
+`uav_scan_targets`. `bda.state` goes `none`, then `no_change`, `damaged`, `destroyed_probable` (one
+look at a destroyed unit) or `destroyed_confirmed` (two or more). Red adjudication runs on its own
+thread: with `red_engages`, red air defence can down a drone inside its envelope (a `red_shot`
+engagement with `consequence:"own_loss"`), and red ground forces can fire on blue units
+(`red_ground`). Outcomes against your own side are always shown.
+
+### Blue view and Umpire view
+
+- The rail's Wargame section (between Missions and Alarms) offers **Blue view | Umpire view**. A new
+  session starts in Umpire view; the choice is kept per session in `localStorage`
+  (`ic.wargame.view.v1`), and a storage that fails keeps it in memory. Umpire view requests
+  `/intel/graph?scope=…&truth=1`; outside a session the request is exactly the ISR one. The
+  entity route takes `?truth=1` as well. The store asks again at once when a session starts or
+  ends and when the view changes, and drops an answer still in flight for the old view.
+- **Blue view** (the default of every route, and always the analyst's): red forces and red axes are
+  absent unless the session was started with `reveal_red`; the `axis`, `threatens` and `correlates`
+  edges and a force's `correlated[]` never appear; a red attacker is null with
+  `attacker_label:"Red air defence (not identified)"` (or "Red ground forces (not identified)"); a
+  downed drone's `wargame_lost_by` is null; `meta.wargame.counts.red` carries only `seen`. The
+  engine filters first and `intel_scenario` filters again, so no view rests on one check.
+- "What's assumed" on the rail states the view: "Umpire view: red units are where the scenario put
+  them, not where a sensor saw them." or "Blue view: red units appear only as contacts your sensors
+  reported."
+- **The view is a presentation filter, not a secrecy boundary.** Any holder of the bearer token can
+  ask for `truth=1`. The Blue view lets the operator play blue honestly; it does not hide anything
+  from the operator's own machine. The analyst's intel tools, `wg_session_status` and
+  `wg_list_forces` always read the Blue view.
+
+### In the graph and on the map
+
+- **Nodes** (built by the engine's `graph_rows(truth=)`, placed and filtered by `intel_scenario`):
+  - `force` `frc:{unit_id}`: `attrs {side, provenance:"scenario", register:"scenario", wg_class,
+    ob_class, kind_label (a generic class label), state (active, suppressed, damaged, destroyed),
+    state_until_ms, ammo, threat_range_m, threat_ceiling_m (height above the unit),
+    detection_range_m, strike_range_m, mobile, objective, caveats, simulated, correlated (Umpire view
+    only)}`; subtitle "{Red|Blue}  {kind label}  {state}  Scenario". Blue status: active `ok`,
+    suppressed or damaged `warn`, destroyed `critical`. Red status: `critical` when a drone is
+    inside its threat envelope or it fired in the last 60 s, `warn` when a drone or blue
+    unit is inside its detection range, destroyed `stale`, else `ok`.
+  - `engagement` `eng:{id}`: label "Simulated {strike|shot|ground fire} on {target}"; `attrs`
+    include `kind, phase, attacker, attacker_label, target, target_label, vector, p_notional,
+    inputs, outcome, outcome_hidden, consequence, bda (blue strikes), approval_id, seed, draw,
+    engine, proposed_at_ms, fired_at_ms, adjudicated_at_ms, simulated`. Status: own loss `critical`, own damage or
+    waiting `warn`, else `ok`.
+  - `vector` `vec:axis-{unit_id}` or `vec:cor-{n}`: `attrs {kind (axis, corridor), side, from, to,
+    to_point, bearing_deg, length_m, alt_band, corridor_m, speed_mps, eta_s, exposure_s, p_survive,
+    straight, delta_exposure_s, delta_length_m, legs [{exposure (low, moderate, high), exposure_s,
+    length_m}], threat_basis (sensed, truth), proposed, caveats, simulated}`.
+- **Caps**: 60 forces, the newest 24 engagements, the newest 12 vectors; whatever is cut is counted
+  in `meta.wargame.omitted`. Past the 150 KB budget, after the sites have given way, the wargame
+  rows give way in a fixed order, each step counted in `meta.wargame.trimmed_for_budget`: long lists
+  cut to 3 (with `{key}_total`), `threatens` edges beyond 24, null attrs, subtitles, then the oldest
+  settled engagements and vectors (down to 4 and 2, with a caveat). Forces and waiting engagements
+  are never dropped. The inspector reads the rows as they were before trimming.
+- **`meta.wargame`**: with no session `{active:false, last:{session_id, aar_id,
+  ended_at_ms}|null}` (plus `error` and a caveat when the engine couldn't be read); during one
+  `{active:true, session_id, started_at_ms, seed, engine, time_scale, red_engages, reveal_red,
+  truth_view, revision, pending:[eng ids], counts, caveats, step_ms, errors, simulated, omitted?,
+  trimmed_for_budget?}`. `meta.caveats` adds "Scenario forces and engagements are simulated;
+  outcomes are notional adjudications."
+- **Scenario contacts** (tracks of scenario units) show the generic label, never an order-of-battle
+  system name, and stay out of the equipment and unit roll-ups, with no `is_a` or `near` edge.
+  Their inspector body puts the generic label wherever the system name stood, drops the
+  capabilities, ranges, signature cues and the raw row, and says in `provenance` that the
+  order-of-battle text is withheld. The position, times, confidence and sightings stay: they are
+  what the sensor reported.
+- **The after-action review** is the report node `rpt:aar-<session id>` (`attrs.format:"AAR"`); its
+  entity carries `fields.markdown`, which the console's read view renders as text-only Markdown.
+- **The map** (`GET /intel/overlay`) adds `force` points (60), `force_envelope` polygons for red air
+  defence and radar (`ring:"threat"|"detection"`, a terrain-masked fan or a 48-point circle; 80),
+  `vector` lines (20 axes, 6 corridors) and `engagement` points at the target (the newest 24), with
+  coordinates to 6 decimals and bidi-stripped labels. A wargame read that fails leaves the sites
+  standing and adds `wargame.error`. The map draws a wargame kind in its own style only when the
+  feature says `register:"scenario"` and `simulated:true`; anything else is a grey "Unrecognised map
+  item". Outcome rings are screen-space billboards, never ground ellipses.
+
+### What the operator sees
+
+- **The strip.** During a session `.ic-root` carries `data-wargame="on"`: a 28 px strip across the
+  top, "Simulated wargame  Session {id}  {theater}  Started {Z}  Sim time ×{n}  {Umpire view|Blue
+  view}  [End wargame]" (the speed only when it isn't ×1), a 2 px Sand frame round the console, and
+  the honesty line starts "Simulated wargame." In map and tracking modes the map is inset 28 px
+  from the top. Sand is the umpire's ink; red and blue are shown by frame, band and word, never by
+  hue.
+- **The orb.** Scenario forces sit in their own bands (red forces at −41°, blue at −47°,
+  engagements at −61°), drawn with side frames that only scenario forces carry; engagements sit at
+  their target's longitude and vectors at their origin's. Forces are never hidden by crowding.
+- **The rail's Wargame section** (between Missions and Alarms): the view switch, side counts (in the
+  Blue view red shows only "{n} seen"), the engagements waiting for the operator and the recent
+  ones, and the last session's after-action review once it ended.
+- **The inspector.** A force shows its side, class, state, ranges and the fixed line; its actions
+  are Ask about this, Focus, Show on map and, for a red force with `correlated[]` contacts in a
+  session, "Plan a simulated strike", which only drafts a prompt citing the contact by its generic
+  label and never sends it. An engagement has Ask, Focus and Show on map; a vector Ask and Show on
+  map. During a session a mapped site adds "Context only. Real places can't be engaged in the
+  wargame." and still has no engagement action. The after-action review adds "Read in full" for the
+  read view.
+- **Umpire rows.** Adjudications, battle damage and own losses appear in the transcript as rows
+  marked "Umpire  {Z}  Simulated", in designators and generic labels only (a red attacker in the
+  Blue view is always "Red air defence (not identified)", with no chance shown). They are
+  append-only and de-duplicated by engagement, phase and damage state; rows within 10 s fold
+  together, and rows that arrive while a slip waits fold into "{n} umpire events since this
+  request." without scrolling the transcript. A downed drone raises the critical banner "Simulated
+  loss: {vehicle} destroyed by {attacker} at {Z}." (a console banner, not an alarm kind).
+- **Search** gains Forces and Engagements filters, shown before a query only during a session, and
+  matches wargame nodes by side, state, outcome, phase and kind; seeds, draws and ids never match.
+- **The map** (map overview and tracking) draws forces as framed billboards with their designator
+  (bidi-stripped, at most 40 characters), threat envelopes as a draped 6 % fill with a status
+  stroke, detection rings as dashes for the selected force and critical ones (8 at most), axes as
+  arrows in the hostile hue, corridors as draped legs by exposure with a dashed centreline, and
+  engagements as a burst with a ring. Outcome labels read "Destroyed (simulated)" and the like.
+  The map follows the console's view: its overlay asks for `truth=1` only in Umpire view, and red
+  never shows there in Blue view. During a session the map dock's Show row adds Forces,
+  Engagements and Vectors switches, and its Key adds the frames, the burst, the arrow, corridor
+  exposure, "Rings mark outcomes. They are not effect areas." and "Everything on this layer from the
+  wargame is simulated."
+- **Dividers.** The transcript marks the session's edges from the `meta.wargame.active` flip:
+  "Wargame started at {Z}. The analyst now works with wargame tools, and every engagement asks you
+  first." and "Wargame ended by you at {Z}. After-action review: (chip)." ("Wargame ended at {Z}." when
+  the strip's End wargame wasn't the cause). A console opened mid-session doesn't replay the start.
+- **Suggested prompts** during a session come from the session's state (for example "Plan a
+  simulated strike on [[trk:…|Surface-to-air, short range]] and show me the dry run." and "End the
+  wargame and show the after-action review.").
+
+### Opting in for external harnesses, and the audit trail
+
+- `--wargame-mcp` (app flag; `HostConfig.wargame_mcp`, passed to `build_server`) also publishes the
+  ten `wg_*` tools on `/mcp`, 61 tools in all; the startup summary then adds the line "wargame  :
+  --wargame-mcp: simulated wg_* tools are also on /mcp; engagements are still approved in the
+  console only". Without it `/mcp` lists no `wg_*` tool and the startup summary is what it always
+  was. Engagements are never confirmable from `/mcp` either way. The `godseye-uav` skill stays
+  ISR-only and never calls a `wg_*` tool.
+- **Audit rows** added with the wargame: `console_claimed`, `console_claim_refused`,
+  `wargame_session_started`, `wargame_event` (one per timeline event: placements, proposals,
+  authorizations, denials, shots, battle damage, losses), `wargame_session_ended`,
+  `wargame_session_aborted_by_restart`, `engagement_confirm_refused`, `vehicle_lost_simulated`,
+  `vehicle_revived`, `sim_reset_refused`, `wargame_spawn_failed`, `wargame_route_failed`,
+  `wargame_package_eval_failed`, `wargame_recovery_failed` and `wargame_hook_failed` (at most one a
+  minute). No alarm kind was added.
 
 ## Analyst sign-in and Anthropic's policy
 
@@ -960,8 +1347,10 @@ The app flags these interact with (`python -m godseye_uav.app --help`): `--theat
 the theater persisted in the store, else `default`), `--geodata on|off` (default `on`),
 `--real-data off|direct|gev` (default: `GODSEYE_REAL_DATA`, else off) and `--airframe
 quad_suas_electric|group3_fixed_wing` (default: the restored theater's, else `GODSEYE_AIRFRAME`,
-else `quad_suas_electric`). The banner reports the restore, a failed restore, and a `map data`
-line.
+else `quad_suas_electric`), and `--wargame-mcp` (off by default: also publish the simulated
+wargame's `wg_*` tools on `/mcp`; see [Simulated wargame (M14a)](#simulated-wargame-m14a)). The
+banner reports the restore, a failed restore, a `map data` line and, only with `--wargame-mcp`, a
+`wargame` line.
 
 ## Where things are written
 
@@ -970,6 +1359,7 @@ line.
 | Store (tracks, missions, audit, fuel journal) | `--store`, else `~/Library/Application Support/EyeInTheSky/store` on macOS, `$XDG_DATA_HOME/eye-in-the-sky/store` (default `~/.local/share/…`) elsewhere, `%LOCALAPPDATA%\EyeInTheSky\store` on Windows. `start.sh` uses `godseye/.godseye/store`. |
 | Harness config (MCP URL + token, mode 0600) | `<store>/../mcp.json`; usable as a Claude Code `--mcp-config` file. |
 | Running theater | `<store>/theater.json` (atomic writes): the theater, airframe, epoch and who set it; read at boot. See [Runtime theaters and sim speed](#runtime-theaters-and-sim-speed). |
+| Simulated wargame session | `<store>/wargame.json` (atomic writes) while a session runs: its id, seed, theater, scenario object names and track ids, so a restart can clean up. Deleted when the session ends or is recovered at boot. The after-action review (`uav://reports/aar-<session id>`) is kept in memory like every report, until the host stops; the session's timeline also stays in the audit trail as `wargame_event` rows. The console key is never written anywhere. |
 | Map-data cache | `<store>/geodata-cache/`: place lookups (30 days), mapped sites and open-ground searches (24 hours), as JSON files. Memory only for an in-memory store. |
 | Analyst working directory | `<store>/analyst` |
 | Analyst transcripts | The Claude CLI writes every conversation to `<config dir>/projects/<encoded cwd>/<session>.jsonl`, whatever the options say. The encoded cwd is the absolute path of `<store>/analyst` with every character other than a letter or digit replaced by `-`. On the **Claude login** the config dir is `~/.claude` (or a `CLAUDE_CONFIG_DIR` set at launch): for the desktop app's default store that is `~/.claude/projects/-Users-<you>-Library-Application-Support-EyeInTheSky-store-analyst/`. On **every other provider** it is `<store>/analyst/claude-home` (mode 0700), so those transcripts are under `<store>/analyst/claude-home/projects/`. These files hold the full conversation, tool arguments and results. A full check runs its CLI with `<store>/analyst/claude-check` as the config dir (the Claude login's check keeps `~/.claude`) and `<store>/analyst/check-cwd` as the cwd. |
@@ -992,7 +1382,8 @@ Measured on this machine with `claude-opus-5` and the owner's Claude login (no A
 - Tool definitions are roughly half of every model call: the 52 tools measured before
   `uav_handoff_target` was hidden came to 45,322 characters (about 11,000–14,000 tokens), and the
   system prompt adds about 3,000 tokens. WG v2 Phase A brought the analyst's list to 57 tools and
-  lengthened the prompt; that cost has not been re-measured.
+  lengthened the prompt, and Phase B to 60 in ISR mode and 67 in a simulated wargame session (plus
+  an identity file per mode); that cost has not been re-measured.
 - The smallest turn, after the provider settings were added: "Reply with the single word OK." with
   effort `low` took 5.5 s, 24,921 input tokens including cache and 4 output tokens, $0.250.
 
@@ -1044,6 +1435,12 @@ these rules hold everywhere:
   and that threat levels are model outputs for sensor posture only.
 - Display text from the server is stripped of bidi control characters (U+202A–202E, U+2066–2069) in
   the graph, in the approval text and again in the browser.
+- **Simulated is always said.** Every wargame row, feature, result and the after-action review
+  carries `simulated: true`, and the console says "Simulated" in words on the strip, the slip, the
+  umpire rows, the captions and the map's outcome labels. A scenario force is "Set by the wargame,
+  not seen by a sensor." (the Sand Scenario tag): it is never presented as intelligence. Outcomes
+  are notional adjudications, and a blue strike's outcome is not claimed in the Blue view until a
+  re-look assessed it.
 
 ## Known limits
 
@@ -1071,6 +1468,25 @@ these rules hold everywhere:
   analyst's clock stay on wall time; camera captures leave gaps above ×3.
 - **The console's theater checks read the graph**, which is polled every 2 s. The server re-checks
   everything at the switch, so a slip the console showed as ready can still be refused.
+- **The wargame's Blue view is a presentation filter**, not a secrecy boundary: any holder of the
+  bearer token can read `truth=1`. Refusals and outcomes are still decided by the server.
+- **ISR outputs about scenario contacts use the library's numbers.** The ISR tools' answers about a
+  scenario contact (SALUTE, `uav_identify_target`, `uav_assess_threat`, `uav_target_report`, the
+  track lists) name it by its generic label, for example "Air-defence guns (notional)", with a
+  notional capability line and "Scenario contact (simulated)." on the equipment line; no real
+  system name reaches them (D1). Their ranges and ceilings are still the ISR order-of-battle
+  library's, so an ISR standoff can differ from the wargame's notional envelope for the same unit.
+- **The graph budget during a session.** At the specified maximum load (100 tracks, 60 sites, 60
+  forces, 24 engagements, 12 vectors) the Umpire view can exceed the 150 KB target by up to 15 %,
+  because forces are never dropped; every trim is counted in `meta.wargame.trimmed_for_budget`.
+- **The after-action review lives in memory** with the other reports: it is gone after a restart,
+  though the session's `wargame_event` audit rows stay. A session interrupted by a restart gets a
+  partial review at the next boot.
+- **After a refused authorize the slip still reads "Approved by you."** When the operator approves
+  an engagement but the engine's `authorize` refuses it (for example, the target moved onto a mapped
+  place in between), the call is denied with the refusal message, which shows on the tool row as a
+  call that did not run; the filed slip itself keeps "Approved by you at {Z}." because no event
+  carries the refusal to it.
 - **Map imagery keys** (`GOOGLE_MAPS_API_KEY`, `CESIUM_ION_TOKEN`) are read when the UI is built;
   `scripts/build_desktop.sh` leaves them out unless `--bake-keys` is passed.
 - **Fonts load from Google Fonts** (Atkinson Hyperlegible Next and Mono for the console, plus GEV's

@@ -14,6 +14,14 @@
  *
  * Sites are context only: a click reports the site's id to `onPick` listeners
  * (the console opens the inspector); nothing here can task an aircraft.
+ *
+ * Phase B (WG v2 §5.3.12) draws the simulated wargame from the same body:
+ * forces, envelopes, vectors and engagements. `truth` is the console's
+ * Umpire view (it asks `truth=1`, and red shows only then); switching to
+ * Blue view drops red at once, from the body already held, before the
+ * refetch lands. Clicking a force selects it, which shows its detection
+ * ring. Every wargame item is simulated and none of it is a target either:
+ * a click only reports the item's id.
  */
 import * as Cesium from 'cesium';
 import { TRAIL_PREFIX, VEHICLE_PREFIX } from './policy.js';
@@ -22,12 +30,14 @@ import {
   CONTEXT_ERROR_BACKOFF_MS,
   CONTEXT_POLL_MS,
   DEFAULT_VISIBILITY,
+  WARGAME_KINDS,
   contextOverlayUrl,
   kindVisible,
   mergeVisibility,
 } from './contextPolicy.js';
 import {
-  contextEntityOptions,
+  contextEntityList,
+  emptyWargameCounts,
   readContextFeatures,
 } from './contextEntities.js';
 import { createContextIcons } from './contextIcons.js';
@@ -40,7 +50,27 @@ const EMPTY_COUNTS = Object.freeze({
   site: Object.freeze({ served: 0, drawn: 0, capped: 0 }),
   unknown: Object.freeze({ served: 0, drawn: 0 }),
   invalid: 0,
+  ...emptyWargameCounts(),
 });
+
+const EMPTY_META = Object.freeze({
+  theater: null,
+  sites: null,
+  attribution: Object.freeze([]),
+  omitted: Object.freeze({}),
+  wargameError: null,
+});
+
+/** The server's per-kind `omitted` counts for the wargame kinds. */
+function wargameOmitted(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object') return out;
+  for (const kind of WARGAME_KINDS) {
+    const n = raw[kind];
+    if (Number.isInteger(n) && n > 0) out[kind] = n;
+  }
+  return out;
+}
 
 /**
  * Create the context-overlay owner for one layer.
@@ -71,7 +101,9 @@ export function createContextOverlay({ state, services, options }) {
   let inflight = null;
   let generation = 0;
   let counts = EMPTY_COUNTS;
-  let meta = { theater: null, sites: null, attribution: [] };
+  let meta = EMPTY_META;
+  let lastBody = null;
+  let selected = null;
   let clickHandler = null;
   /** entity id -> {id, kind} for everything drawn now. */
   const drawn = new Map();
@@ -111,16 +143,21 @@ export function createContextOverlay({ state, services, options }) {
     const target = ensureCollection();
     if (!target) return 0;
     clearEntities();
-    const read = readContextFeatures(body);
+    lastBody = body ?? null;
+    const read = readContextFeatures(body, { truth, selected });
     for (const item of read.items) {
       try {
-        const icon = item.known ? icons.iconFor(item.category) : null;
-        const entity = target.entities.add(
-          contextEntityOptions(item, { icon }),
-        );
-        entity.show = kindVisible(item.kind, visibility);
-        drawn.set(item.entityId, { id: item.id, kind: item.kind });
-        state.ownedIds.add(item.entityId);
+        for (const options of contextEntityList(item, { icons })) {
+          const entity = target.entities.add(options);
+          entity.show = kindVisible(item.kind, visibility);
+          // A corridor leg, an outcome ring or an envelope reports the id
+          // the console knows (the vector, the engagement, the force).
+          drawn.set(options.id, {
+            id: item.pickId ?? item.id,
+            kind: item.kind,
+          });
+          state.ownedIds.add(options.id);
+        }
       } catch {
         // One malformed feature never costs the rest of the picture.
       }
@@ -135,9 +172,19 @@ export function createContextOverlay({ state, services, options }) {
       attribution: Array.isArray(body?.attribution)
         ? body.attribution.filter((line) => typeof line === 'string')
         : [],
+      omitted: wargameOmitted(body?.omitted),
+      wargameError:
+        typeof body?.wargame?.error === 'string'
+          ? body.wargame.error.slice(0, 200)
+          : null,
     };
     requestRender();
     return drawn.size;
+  }
+
+  /** Draw the held body again (the view or the selection changed). */
+  function redraw() {
+    if (lastBody && collection) apply(lastBody);
   }
 
   /**
@@ -257,6 +304,9 @@ export function createContextOverlay({ state, services, options }) {
    */
   function setVisibility(next) {
     visibility = mergeVisibility(visibility, next);
+    // The console's view may ride along (`{truth}`): Umpire view is a
+    // presentation choice like the per-kind switches.
+    if (typeof next?.truth === 'boolean') setTruth(next.truth);
     for (const [entityId, { kind }] of drawn) {
       const entity = collection?.entities.getById(entityId);
       if (entity) entity.show = kindVisible(kind, visibility);
@@ -265,15 +315,36 @@ export function createContextOverlay({ state, services, options }) {
     return { ...visibility };
   }
 
-  /** Ask for red truth (Phase B umpire view); a change refetches in full. */
+  /**
+   * Ask for red truth (the console's Umpire view, §5.3.3) or not (Blue
+   * view). A change redraws the held body under the new view at once (so
+   * Blue view drops red before anything is fetched) and refetches in full.
+   * @param {boolean} on Umpire view.
+   * @returns {boolean} The view now in force.
+   */
   function setTruth(on) {
-    const next = Boolean(on);
+    const next = on === true;
     if (next === truth) return truth;
     truth = next;
     generation += 1;
     rev = null;
     nextAtMs = 0;
+    redraw();
+    if (active) refresh({ force: true }).catch(() => {});
     return truth;
+  }
+
+  /**
+   * Select a force (`frc:…`, its detection ring shows) or clear (null).
+   * @param {string|null} id Force id.
+   * @returns {string|null} The selection now in force.
+   */
+  function select(id) {
+    const next = typeof id === 'string' && id.startsWith('frc:') ? id : null;
+    if (next === selected) return selected;
+    selected = next;
+    redraw();
+    return selected;
   }
 
   /**
@@ -287,7 +358,9 @@ export function createContextOverlay({ state, services, options }) {
     rev = null;
     nextAtMs = 0;
     counts = EMPTY_COUNTS;
-    meta = { theater: null, sites: null, attribution: [] };
+    meta = EMPTY_META;
+    lastBody = null;
+    selected = null;
     clearEntities();
     requestRender();
     if (active) refresh({ force: true }).catch(() => {});
@@ -337,8 +410,12 @@ export function createContextOverlay({ state, services, options }) {
     } catch {
       return null;
     }
-    if (!picked) return null;
-    const target = pickTarget(services.picking.resolvePickId(picked));
+    const target = picked
+      ? pickTarget(services.picking.resolvePickId(picked))
+      : null;
+    // A force (or its envelope) picked selects it; empty ground clears.
+    if (target?.startsWith('frc:')) select(target);
+    else if (!picked) select(null);
     if (target) emitPick(target);
     return target;
   }
@@ -411,6 +488,17 @@ export function createContextOverlay({ state, services, options }) {
           : null,
       },
       unknown: { ...counts.unknown },
+      // The simulated wargame (§5.3.12): per kind {served, drawn, capped,
+      // hidden (red in Blue view)}, the server's omitted counts, the force
+      // whose detection ring shows, and a wargame read error, if any.
+      wargame: {
+        ...Object.fromEntries(
+          WARGAME_KINDS.map((kind) => [kind, { ...counts[kind] }]),
+        ),
+        omitted: { ...meta.omitted },
+        selected,
+        error: meta.wargameError,
+      },
     };
   }
 
@@ -441,7 +529,9 @@ export function createContextOverlay({ state, services, options }) {
     fetchedAtMs = null;
     nextAtMs = 0;
     counts = EMPTY_COUNTS;
-    meta = { theater: null, sites: null, attribution: [] };
+    meta = EMPTY_META;
+    lastBody = null;
+    selected = null;
     // Pick listeners belong to their subscribers (the tracking port); a layer
     // rebuilt after destroy() keeps reporting to them.
     icons.clear?.();
@@ -456,6 +546,8 @@ export function createContextOverlay({ state, services, options }) {
     isActive: () => active,
     setVisibility,
     setTruth,
+    isTruth: () => truth,
+    select,
     resetForTheater,
     pickTarget,
     handleClick,

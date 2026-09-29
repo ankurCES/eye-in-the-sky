@@ -240,8 +240,11 @@ Collect them before giving a build to anyone.
 
 ---
 
-## ISR-only
+## ISR by default (M14a)
 
-This project is **ISR-only**: it observes, classifies and reports. It contains no kinetic capability
-and none may be added. Threat assessment produces sensor-posture advice only; command authority
-stays with the operator.
+This project observes, classifies and reports. Its default ISR mode contains no kinetic capability,
+and none may be added outside the M14a rule. An opt-in simulated wargame mode adjudicates notional
+outcomes between simulated scenario units only: no real munitions data, no real targets, every
+engagement approved by the operator. Threat assessment produces sensor-posture advice only; command
+authority stays with the operator. Mapped data (OpenStreetMap, ODbL) is context and never an
+engagement target.

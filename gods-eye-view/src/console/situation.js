@@ -27,6 +27,16 @@ import {
   safeText,
   stripBidi,
 } from './orb/placeText.js';
+import {
+  SCENARIO_TAG_TITLE,
+  isWargameType,
+  wargameAssumedLines,
+  wargameGlyphSvg,
+  wargameSection,
+  wargameStatusWord,
+  wargameStripFacts,
+  wargameTone,
+} from './railWargame.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -44,6 +54,7 @@ export const ICON = Object.freeze({
   close: 'close',
   copy: 'content_copy',
   critical: 'error',
+  expand: 'expand_more',
   focus: 'center_focus_weak',
   info: 'info',
   map: 'map',
@@ -51,6 +62,7 @@ export const ICON = Object.freeze({
   recce: 'route',
   retry: 'refresh',
   search: 'search',
+  strike: 'flare',
   track: 'my_location',
   warning: 'warning',
 });
@@ -68,7 +80,20 @@ export const TYPE_WORD = Object.freeze({
   alarm: 'Alarm',
   feed: 'Feed',
   site: 'Site',
+  // The simulated wargame's own types (WG §5.3, M14a).
+  force: 'Force',
+  engagement: 'Engagement',
+  vector: 'Vector',
 });
+
+/**
+ * Whether the panels know how to word and draw a node type: the orb's
+ * types plus the wargame's (force, engagement, vector). Anything else is
+ * the lilac "unrecognised" fail-safe (WG §4.2.1).
+ */
+export function isPanelType(type) {
+  return isKnownType(type) || isWargameType(type);
+}
 
 /** Alarm kind -> label (UX spec §7.2), shared with the orb (orb/text.js).
  *  Unknown kinds are humanized. */
@@ -283,6 +308,8 @@ export function statusWord(node) {
   const type = node?.type;
   const status = node?.status;
   const attrs = node?.attrs || {};
+  // Wargame nodes read their state or phase (WG §5.3.4, §5.3.6).
+  if (isWargameType(type)) return wargameStatusWord(node);
   // A type the console doesn't know: its status is ignored (WG §4.2.1).
   if (!isKnownType(type)) return 'Not assessed';
   // Sites are context: always "Mapped, not verified" (WG §4.2.6).
@@ -319,7 +346,9 @@ export function statusWord(node) {
  * sites are neutral Pencil; a type the console doesn't know is lilac
  * `unknown`. Lets CSS colour by one attribute.
  */
-export function toneOf(type, status) {
+export function toneOf(type, status, node = null) {
+  // Wargame nodes: never green; pending engagements are Sand (WG §5.3).
+  if (isWargameType(type)) return wargameTone({ ...node, type, status });
   const s = NODE_STATUSES.has(status) ? status : 'unknown';
   // An unrecognised type is lilac whatever its status: never green.
   if (!isKnownType(type)) return 'unknown';
@@ -530,7 +559,31 @@ export function icon(name) {
  * draws the lilac "unrecognised" glyph with its status ignored (WG §4.2.1),
  * never another type's glyph; a site draws its category's glyph.
  */
-export function glyph(type, status, size = 16, phase, { category } = {}) {
+export function glyph(
+  type,
+  status,
+  size = 16,
+  phase,
+  { category, side, state, consequence } = {},
+) {
+  // Wargame nodes draw their §5.3.4 frame, burst or arrow (constants only).
+  if (isWargameType(type)) {
+    const el = h('span', {
+      class: 'ic-kit-glyph',
+      'aria-hidden': 'true',
+      'data-type': type,
+      'data-status': NODE_STATUSES.has(status) ? status : 'unknown',
+    });
+    el.innerHTML = wargameGlyphSvg(type, {
+      status,
+      size,
+      phase,
+      side,
+      state,
+      consequence,
+    });
+    return el;
+  }
   const known = isKnownType(type);
   const safeType = known ? type : 'unknown';
   const safeStatus = !known
@@ -559,6 +612,17 @@ export function glyph(type, status, size = 16, phase, { category } = {}) {
   return el;
 }
 
+/** A node's glyph with everything its type draws from (phase, category, side, state). */
+export function nodeGlyph(node, size = 16) {
+  const a = node?.attrs || {};
+  return glyph(node?.type, node?.status, size, a.phase, {
+    category: a.category,
+    side: a.side,
+    state: a.state,
+    consequence: a.consequence,
+  });
+}
+
 /** A button with an optional icon; `key` restores focus across re-renders. */
 export function button(
   text,
@@ -579,17 +643,26 @@ export function button(
   return el;
 }
 
-/** A reading-register tag: "Estimated", "Assumed", "Measured", "Requested". */
+/**
+ * A reading-register tag: "Estimated", "Assumed", "Measured", "Requested",
+ * or the wargame's Sand "Scenario" ("Set by the wargame, not seen by a
+ * sensor.", WG §5.3.1).
+ */
 export function registerTag(register, title) {
   const word = {
     estimated: 'Estimated',
     assumed: 'Assumed',
     measured: 'Measured',
     requested: 'Requested',
+    scenario: 'Scenario',
   }[register];
   return h(
     'span',
-    { class: 'ic-kit-reg', 'data-register': register, title },
+    {
+      class: 'ic-kit-reg',
+      'data-register': register,
+      title: title ?? (register === 'scenario' ? SCENARIO_TAG_TITLE : title),
+    },
     word || humanize(register),
   );
 }
@@ -1551,6 +1624,8 @@ export function createSituation(host, ctx, opts = {}) {
   let lastActiveId = null;
   /** {since, fromId} while `theater.state === 'switching'`, else null. */
   let switching = null;
+  /** The narrow rail's Wargame section is collapsible (WG §5.3.10). */
+  let wargameOpen = false;
 
   strip.addEventListener('click', () => openDrawer());
   drawer.addEventListener('keydown', (event) => {
@@ -2081,6 +2156,22 @@ export function createSituation(host, ctx, opts = {}) {
     );
   }
 
+  /** The Wargame section (WG §5.3.10), or null outside the wargame. */
+  function wargameRail(st) {
+    return wargameSection(st, {
+      kit: { button, icon, glyph, zulu, ICON },
+      emit,
+      store,
+      orb: ctx?.orb,
+      layout,
+      open: wargameOpen,
+      onToggle: () => {
+        wargameOpen = !wargameOpen;
+        render();
+      },
+    });
+  }
+
   function alarmRow(alarm, unviewed) {
     const id = alarmId(alarm);
     const sev = SEVERITY_WORD[alarm.severity] ? alarm.severity : 'info';
@@ -2210,6 +2301,9 @@ export function createSituation(host, ctx, opts = {}) {
       );
     }
     for (const line of honestyLines(meta)) kids.push(textLine(line));
+    // In a wargame: which view this is, and that outcomes are notional.
+    for (const line of wargameAssumedLines(st.graph, st.view))
+      kids.push(textLine(line, 'ic-rail__line ic-rail__wg-assumed'));
     if (!st.graph) kids.push(noGraphLine(st));
     kids.push(
       h(
@@ -2315,6 +2409,21 @@ export function createSituation(host, ctx, opts = {}) {
         ? `${counts.critical} critical ${counts.critical === 1 ? 'alarm' : 'alarms'}`
         : `${alarms.length} ${alarms.length === 1 ? 'alarm' : 'alarms'}`,
     );
+    const wg = wargameStripFacts(st.graph);
+    if (wg) {
+      kids.push(
+        h(
+          'span',
+          {
+            class: 'ic-rail-strip__count ic-rail-strip__wargame',
+            'data-pending': wg.pending ? 'true' : 'false',
+          },
+          h('span', { class: 'ic-rail-strip__num' }, String(wg.pending)),
+          h('span', { class: 'ic-rail-strip__cap' }, 'Waiting'),
+        ),
+      );
+      summary.push(wg.summary);
+    }
     if (caveats) {
       kids.push(
         h(
@@ -2338,13 +2447,17 @@ export function createSituation(host, ctx, opts = {}) {
     if (destroyed) return;
     const key = focusedKey(root);
     const st = state();
-    replaceKids(body, [
-      theaterSection(st),
-      fleetSection(st),
-      missionsSection(st),
-      alarmsSection(st),
-      assumedSection(st),
-    ]);
+    replaceKids(
+      body,
+      [
+        theaterSection(st),
+        fleetSection(st),
+        missionsSection(st),
+        wargameRail(st),
+        alarmsSection(st),
+        assumedSection(st),
+      ].filter(Boolean),
+    );
     if (layout === 'compact') {
       renderStrip(st);
       replaceKids(drawer, [drawerClose, body]);

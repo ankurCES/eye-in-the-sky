@@ -17,8 +17,9 @@ ISR-ONLY (M14). This module reports; command authority stays with the
 operator. The only advisory it emits is `sensor_posture` — where to put the
 SENSOR and how to keep the aircraft alive (standoff, do not overfly, break
 contact). There is no engagement, targeting-for-strike, weaponeering or
-prosecution logic anywhere in godSeye, and none may be added here. The weapon
-ranges consumed from the OB library describe what a contact can do TO the UAV.
+prosecution logic in this module, and none may be added here (M14a keeps
+simulated wargame adjudication in `wargame*.py`). The weapon ranges consumed
+from the OB library describe what a contact can do TO the UAV.
 
 Coordination (M10): hand a track off from one UAV to another so the first can
 return to home / refuel while the track stays under observation. Custody
@@ -34,6 +35,7 @@ from .safety import point_in_polygon
 from .targets import (
     UNCLASSIFIED_STANDOFF_M,
     MIN_STANDOFF_M,
+    SCENARIO_CONTACT_NOTE,
     ObClass,
     PatternOfLife,
     Track,
@@ -473,7 +475,7 @@ def assess_track(track: Track, observer: dict | None = None,
     for item in confidence["evidence"]:
         evidence.append({"component": "confidence", **item})
 
-    return {
+    out = {
         "format": "THREAT_ASSESSMENT",
         "track_id": track.track_id,
         "category": track.category,
@@ -516,6 +518,13 @@ def assess_track(track: Track, observer: dict | None = None,
         # and demo script; new callers should read sensor_posture.
         "recommendation": posture["advisory"],
     }
+    if track.scenario:
+        # M14a (WG §5.2.9): a simulated scenario unit is marked as such. The
+        # assessment itself is unchanged, and stays sensor posture only.
+        out["scenario"] = True
+        out["scenario_note"] = SCENARIO_CONTACT_NOTE
+        out["simulated"] = True
+    return out
 
 
 def _rationale(track: Track, capability: dict, intent: dict, confidence: dict) -> str:

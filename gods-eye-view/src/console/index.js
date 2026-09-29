@@ -21,10 +21,23 @@
  */
 import { h, replaceKids, setHidden } from '../ui/uavDom.js';
 import { createBus } from './bus.js';
-import { resolveBridge } from './config.js';
-import { createApi, formatZulu } from './api.js';
+import { createConsoleKey, resolveBridge } from './config.js';
+import {
+  CONSOLE_CLAIM_PATH,
+  WARGAME_END_PATH,
+  createApi,
+  formatZulu,
+} from './api.js';
 import { createIntelStore } from './intelStore.js';
 import { MAP_COPY, createModeController, theaterGroundFor } from './mode.js';
+import { READ_COPY, createReadView, readDocOf } from './readView.js';
+import {
+  STRIP_COPY,
+  STRIP_H,
+  activeWargame,
+  createWargameStrip,
+  stripModel,
+} from './wargameStrip.js';
 import { createMapDock, mapDockModel } from './mapDock.js';
 import { createOrb, createOrbListView } from './orb/orb.js';
 import { createChatClient } from './chat/client.js';
@@ -70,6 +83,8 @@ const BACK_ONLINE_MS = 5000;
 const LOADING_AFTER_MS = 800;
 const ICON_FONT_CHECK_MS = 3000;
 const TELEMETRY_FROZEN_MS = 5000;
+/** Retry delays for a console-key claim that got no answer (WG §3.5). */
+export const CLAIM_RETRY_MS = Object.freeze([2000, 5000, 10000, 30000]);
 
 /** Material Symbols glyph names reach the DOM only through this map (§11.2). */
 export const ICON = Object.freeze({
@@ -162,6 +177,10 @@ export const COPY = Object.freeze({
       ? `The map didn't start: ${sentence(message)} Tracking isn't available; the orb, search and the analyst still work.`
       : "The map didn't start. Tracking isn't available; the orb, search and the analyst still work.",
   criticalCount: (n) => `${n} critical`,
+  readFailed: (e) =>
+    `Couldn't open the report: ${String(e ?? '')
+      .trim()
+      .replace(/[.!?…]+$/, '')}.`,
 });
 
 /** Analyst availability copy (§10), keyed by `/chat/status.reason`. */
@@ -283,7 +302,8 @@ function nodesOf(graph, type) {
 /**
  * The stage footer's honesty line, built from `meta` (§4.6), e.g.
  * "23 contacts in theater. 20 duplicates merged. 27 outside this theater.
- * Threat assessed for 10 of 12."
+ * Threat assessed for 10 of 12." During a simulated wargame session it
+ * starts "Simulated wargame." (WG §5.3.2); otherwise it is unchanged.
  */
 export function honestyLine(graph) {
   const meta = graph?.meta;
@@ -294,6 +314,7 @@ export function honestyLine(graph) {
   const parts = [
     `${plural(contacts, 'contact', 'contacts')} ${all ? 'across all theaters' : 'in theater'}.`,
   ];
+  if (activeWargame(graph)) parts.unshift(STRIP_COPY.honesty);
   const dup = num(meta.duplicates_collapsed);
   if (dup) parts.push(`${plural(dup, 'duplicate', 'duplicates')} merged.`);
   const out = num(meta.out_of_theater_contacts ?? meta.out_of_theater);
@@ -441,6 +462,8 @@ export function createPortProxy(source) {
   let real = null;
   let offReal = null;
   let offPick = null;
+  // The wargame view asked for before the real port arrived (WG §5.3.3).
+  let overlayTruth = null;
   const changeCbs = new Set();
   const pickCbs = new Set();
   function fanOut(cbs, args) {
@@ -462,6 +485,13 @@ export function createPortProxy(source) {
     if (typeof p.onPick === 'function') {
       const off = p.onPick((...args) => fanOut(pickCbs, args));
       offPick = typeof off === 'function' ? off : null;
+    }
+    if (overlayTruth !== null && typeof p.setOverlayTruth === 'function') {
+      try {
+        p.setOverlayTruth(overlayTruth);
+      } catch (err) {
+        globalThis.console?.error?.(err);
+      }
     }
     return p;
   }
@@ -540,6 +570,15 @@ export function createPortProxy(source) {
     enterOverview: () => optional('enterOverview'),
     exitOverview: () => optional('exitOverview'),
     setOverlayVisibility: (v) => optional('setOverlayVisibility', v),
+    /**
+     * The wargame view for the map's context overlay: true is Umpire view
+     * (red truth), anything else Blue view. Remembered until the port
+     * arrives; a port without it stays in Blue view, the safe side.
+     */
+    setOverlayTruth(on) {
+      overlayTruth = on === true;
+      return optional('setOverlayTruth', overlayTruth) ?? null;
+    },
     /**
      * The overlay's own counts, when the port reports them. GEV's port names
      * it `overlayStatus()` (A18); `overlayStats()` is the older spelling.
@@ -829,8 +868,10 @@ export function mountIntelConsole({
   // ---- shell DOM -------------------------------------------------------------
 
   const dockHooks = {};
-  const el = buildShell(mac, dockHooks);
+  const stripHooks = {};
+  const el = buildShell(mac, dockHooks, stripHooks);
   (root || doc?.body)?.append?.(el.root);
+  const strip = el.wargameStrip;
 
   // ---- ctx -------------------------------------------------------------------
 
@@ -850,10 +891,38 @@ export function mountIntelConsole({
     config?.store ||
     createIntelStore({ api, bus, clock: config?.storeClock || undefined });
   const port = createPortProxy(trackingPort);
+  // The engagement approval key (WG §3.5): claimed once per launch, kept in
+  // sessionStorage, sent only as the approval header. Panels get the holder
+  // (ctx.consoleKey), never the key as a value.
+  const consoleKey =
+    config?.consoleKey ||
+    createConsoleKey({
+      storage: safeStorage('sessionStorage'),
+      claim: () =>
+        typeof api.claimConsole === 'function'
+          ? api.claimConsole()
+          : api.post(CONSOLE_CLAIM_PATH, {}),
+    });
 
   let chat = null;
   try {
-    chat = C.createChatClient({ api, storage: safeStorage('sessionStorage') });
+    chat = C.createChatClient({
+      api,
+      storage: safeStorage('sessionStorage'),
+      // The client reads the key through the holder (never storage), so a
+      // window whose storage fails still approves, and a refused claim says
+      // "another client claimed them" (WG §3.5).
+      consoleKey: () =>
+        typeof consoleKey?.key === 'function' ? consoleKey.key() : null,
+      consoleRefused: () => consoleKey?.refused === true,
+      // A key the host no longer accepts (a tab kept across a restart):
+      // drop it and claim again.
+      onConsoleRejected: () => {
+        Promise.resolve()
+          .then(() => consoleKey?.invalidate?.())
+          .catch((err) => globalThis.console?.error?.(err));
+      },
+    });
   } catch (err) {
     globalThis.console?.error?.(err);
     chat = null;
@@ -886,6 +955,8 @@ export function mountIntelConsole({
   let plateOpen = false;
   let view = 'orb';
   let listView = null;
+  // The wargame view the store last announced ('umpire' | 'blue' | null).
+  let wargameView = null;
   let turnRunning = false;
   let sheetOpen = false;
   let sheetOpener = null;
@@ -907,6 +978,14 @@ export function mountIntelConsole({
   let theaterNotice = null;
   let theaterTimer = null;
   let plateInSheet = false;
+  // Simulated wargame (WG §5.3.2): whether the strip shows, and the session
+  // the operator just ended (the strip goes before the next poll says so).
+  let wargameOn = false;
+  let endedSession = null;
+  // The read view (WG §5.3.11): {returnView, inspecting, opener} while open.
+  let reading = null;
+  let claimTimer = null;
+  let claimTries = 0;
 
   function announce(text, politeness = 'polite') {
     const region =
@@ -960,16 +1039,18 @@ export function mountIntelConsole({
   }
 
   function viewportInset() {
+    // During a simulated wargame the strip sits over the map's top edge.
+    const top = wargameOn ? { top: STRIP_H } : {};
     if (layout === 'narrow') {
       // The dock is a bottom sheet of at most 50vh: GEV's alarm toasts sit
       // above it, never over the composer or the standing approval.
       const sheet = dockCollapsed
         ? 0
         : Math.round((Number(win?.innerHeight) || 0) * 0.5);
-      return { right: 0, bottom: sheet };
+      return { right: 0, bottom: sheet, ...top };
     }
-    if (dockCollapsed || !port.supportsInset()) return { right: 0 };
-    return { right: dockWidth() };
+    if (dockCollapsed || !port.supportsInset()) return { right: 0, ...top };
+    return { right: dockWidth(), ...top };
   }
 
   function stageCentre() {
@@ -1003,6 +1084,11 @@ export function mountIntelConsole({
     mode.setOverlays({ sites: on });
     renderMapDock();
   };
+  // The wargame's switches (WG v2 §5.3.12): forces, engagements, vectors.
+  dockHooks.onWargame = (kinds) => {
+    mode.setOverlays(kinds);
+    renderMapDock();
+  };
 
   const ctx = {
     api,
@@ -1020,6 +1106,10 @@ export function mountIntelConsole({
     },
     announce,
     trackingPort: port,
+    /** The engagement approval key holder (config.js createConsoleKey). */
+    consoleKey,
+    /** Open a report's full Markdown in the read view (WG §5.3.11). */
+    openRead: (target) => requestRead(target),
     get layout() {
       return layout;
     },
@@ -1063,6 +1153,15 @@ export function mountIntelConsole({
   } catch (err) {
     globalThis.console?.error?.(err);
     settingsSheet = null;
+  }
+
+  // The read view (WG §5.3.11): a report's full Markdown in the stage.
+  let readView = null;
+  try {
+    readView = createReadView(el.readHost, { onBack: () => closeRead() });
+  } catch (err) {
+    globalThis.console?.error?.(err);
+    readView = null;
   }
 
   /** Open analyst settings, optionally at one provider (⌘, / Ctrl+,, the
@@ -1454,7 +1553,10 @@ export function mountIntelConsole({
       }
       kids.push(line);
     }
-    const honesty = honestyLine(g);
+    let honesty = honestyLine(g);
+    // The operator just ended the session: the prefix goes with the strip.
+    if (!wargameOn && honesty.startsWith(`${STRIP_COPY.honesty} `))
+      honesty = honesty.slice(STRIP_COPY.honesty.length + 1);
     if (honesty) kids.push(h('p', { class: 'ic-footer__honesty' }, honesty));
     replaceKids(el.footer, kids);
     syncPlateBottom();
@@ -1609,6 +1711,21 @@ export function mountIntelConsole({
     );
   }
 
+  function keyBanner(text, where) {
+    return h(
+      'div',
+      {
+        class: 'ic-banner',
+        role: 'status',
+        'data-tone': 'warn',
+        'data-where': where,
+        'data-kind': 'console-key',
+      },
+      iconEl(ICON.warning),
+      h('p', { class: 'ic-banner__text' }, text),
+    );
+  }
+
   function renderBanners() {
     const tracking = mode.state === 'tracking';
     const model = bannerModel({
@@ -1619,14 +1736,18 @@ export function mountIntelConsole({
     const show = Boolean(model.text);
     const overMap = tracking || mode.state === 'map';
     const target = overMap ? 'map' : layout === 'narrow' ? 'narrow' : 'stage';
+    // A refused console-key claim (WG §3.5): a warn banner until reload.
+    const keyText = consoleKey?.bannerText?.() || null;
     for (const [where, host] of [
       ['stage', el.stageBanner],
       ['narrow', el.narrowBanner],
       ['map', el.mapBanner],
     ]) {
-      const on = show && where === target;
-      replaceKids(host, on ? [bannerNode(model, where)] : []);
-      setHidden(host, !on);
+      const kids = [];
+      if (where === target && show) kids.push(bannerNode(model, where));
+      if (where === target && keyText) kids.push(keyBanner(keyText, where));
+      replaceKids(host, kids);
+      setHidden(host, kids.length === 0);
     }
     // The dock's live alarm badge.
     const n = model.count;
@@ -1719,6 +1840,7 @@ export function mountIntelConsole({
         graph: store.get?.().graph,
         overlay,
         sitesOn: mode.overlays?.sites !== false,
+        wargameOn: mode.overlays || {},
       }),
     );
   }
@@ -1860,9 +1982,13 @@ export function mountIntelConsole({
    */
   function syncNarrowBarHeight() {
     const hgt = el.narrowBar.getBoundingClientRect?.().height;
+    // Sheets at narrow start under the wargame strip too (WG §5.3.2).
+    const stripH = wargameOn
+      ? Number(strip.element.getBoundingClientRect?.().height) || STRIP_H
+      : 0;
     el.root.style?.setProperty?.(
       '--ic-narrowbar-h',
-      `${Math.max(0, Math.round(Number(hgt) || 0))}px`,
+      `${Math.max(0, Math.round((Number(hgt) || 0) + stripH))}px`,
     );
   }
 
@@ -2106,9 +2232,48 @@ export function mountIntelConsole({
       focusBack(opener, { doc });
   }
 
+  // ---- wargame view (WG §5.3.3) -------------------------------------------------------
+
+  /**
+   * Blue view or Umpire view, as the intel store last announced it
+   * (`wargame:view {view, truth}`): the orb and the List view hide or show
+   * red, and the map overlay asks for truth only in Umpire view. Outside a
+   * session (`view` null) the orb keeps its default and the map stays in
+   * Blue view.
+   */
+  function applyWargameView(p) {
+    const v = p?.view === 'umpire' || p?.view === 'blue' ? p.view : null;
+    wargameView = v;
+    if (v) {
+      const umpire = v === 'umpire';
+      try {
+        orb.setView?.({ umpire });
+      } catch (err) {
+        globalThis.console?.error?.(err);
+      }
+      try {
+        listView?.setView?.({ umpire });
+      } catch (err) {
+        globalThis.console?.error?.(err);
+      }
+    }
+    try {
+      port.setOverlayTruth?.(v === 'umpire' && p?.truth === true);
+    } catch (err) {
+      globalThis.console?.error?.(err);
+    }
+  }
+
   // ---- view toggle (Orb | List) --------------------------------------------------------
 
   function setView(next) {
+    // Orb or List from the toggle leaves the read view (§5.3.11).
+    if (reading) {
+      reading = null;
+      readView?.close?.();
+      setHidden(el.readHost, true);
+      el.stage.removeAttribute?.('data-view');
+    }
     const wasInList =
       view === 'list' &&
       next !== 'list' &&
@@ -2132,6 +2297,8 @@ export function mountIntelConsole({
             bus.emit('inspect', { id });
           },
         });
+        if (wargameView)
+          listView?.setView?.({ umpire: wargameView === 'umpire' });
         listView?.setGraph?.(store.get?.().graph);
         if (filterIds) listView?.filter?.((n) => filterIds.has(n?.id ?? n));
       } catch (err) {
@@ -2146,10 +2313,86 @@ export function mountIntelConsole({
       (firstByClass(el.orbA11y, 'ic-orb-twin') || el.viewOrb)?.focus?.();
   }
 
+  // ---- read view (WG §5.3.11) -------------------------------------------------------------
+
+  /** A report to read: `{id, markdown?, title?, node?, entity?}`. Without
+   *  Markdown in hand the entity is fetched for its `fields.markdown`. */
+  function requestRead(target) {
+    if (destroyed || !target || typeof target !== 'object') return;
+    if (readDocOf(target)) {
+      mode.requestRead(target);
+      return;
+    }
+    const id = typeof target.id === 'string' ? target.id : '';
+    // An entity in hand without Markdown has nothing more to fetch.
+    const held = target.entity && typeof target.entity === 'object';
+    if (!id || held || typeof store.entity !== 'function') {
+      announce(READ_COPY.empty, 'polite');
+      return;
+    }
+    Promise.resolve()
+      .then(() => store.entity(id))
+      .then(
+        (entity) => {
+          if (destroyed) return;
+          if (!mode.requestRead({ id, entity, node: nodeById(id) }))
+            announce(READ_COPY.empty, 'polite');
+        },
+        (err) => {
+          if (!destroyed)
+            announce(COPY.readFailed(err?.message || err), 'polite');
+        },
+      );
+  }
+
+  function openRead(docToRead) {
+    if (!readView || destroyed) return;
+    const first = !reading;
+    const prev = reading;
+    const inspecting = first ? inspector?.current?.() || null : null;
+    if (!readView.open(docToRead)) return;
+    reading = first
+      ? {
+          returnView: view,
+          inspecting,
+          opener: rememberFocus(doc?.activeElement),
+        }
+      : prev;
+    if (layout === 'narrow' && tab !== 'orb') setTab('orb');
+    if (inspecting) inspector?.hide?.();
+    setPlate(false);
+    setHidden(el.orbWrap, true);
+    setHidden(el.listHost, true);
+    setHidden(el.readHost, false);
+    el.stage.setAttribute('data-view', 'read');
+    el.viewOrb.setAttribute('aria-pressed', 'false');
+    el.viewList.setAttribute('aria-pressed', 'false');
+    readView.focus();
+  }
+
+  /** Back to the view the read view covered, and the inspector it hid. */
+  function closeRead() {
+    if (!reading) return false;
+    const was = reading;
+    setView(was.returnView);
+    if (was.inspecting) {
+      inspector?.show?.(was.inspecting);
+      setPlate(true);
+    }
+    if (
+      !focusBack(was.opener, { doc }) &&
+      focusStranded(doc?.activeElement, doc)
+    )
+      (view === 'list' ? el.viewList : el.viewOrb)?.focus?.();
+    return true;
+  }
+
   // ---- Esc layer stack -------------------------------------------------------------------
 
   /** Close the innermost layer (§9). Returns whether something closed. */
   function escapeLayer() {
+    // The End wargame popover is the topmost layer (WG §5.3.2).
+    if (strip.escape()) return true;
     if (settingsSheet?.isOpen?.()) {
       settingsSheet.escape();
       return true;
@@ -2184,6 +2427,15 @@ export function mountIntelConsole({
     if (mode.state === 'tracking') {
       mode.exit();
       return true;
+    }
+    if (reading) {
+      // A plate opened over the read view (a search pick) closes first.
+      if (inspector?.current?.() || plateOpen) {
+        inspector?.hide?.();
+        setPlate(false);
+        return true;
+      }
+      return closeRead();
     }
     if (focusState) {
       clearFocus();
@@ -2444,6 +2696,81 @@ export function mountIntelConsole({
     store.noteStageInput?.();
   }
 
+  // ---- simulated wargame (WG §5.3.2) and the console key (§3.5) -----------------------------
+
+  /** The strip, the root's data-wargame and the map's top inset, from meta. */
+  function renderWargame() {
+    const g = store.get?.().graph;
+    // The host caught up with an End (or a new session began): forget it.
+    if (endedSession && activeWargame(g)?.session_id !== endedSession)
+      endedSession = null;
+    const model = stripModel(g, { endedSession });
+    strip.update(model);
+    const on = model != null;
+    if (on === wargameOn) return;
+    wargameOn = on;
+    if (on) el.root.setAttribute('data-wargame', 'on');
+    else el.root.removeAttribute?.('data-wargame');
+    if (overMap()) port.setViewportInset(viewportInset());
+    syncNarrowBarHeight();
+    // A console that couldn't claim at boot tries again when a session starts.
+    if (on && consoleKey.state === 'failed') claimKey();
+  }
+
+  /** Claim the engagement approval key once; retry only an unanswered claim. */
+  function claimKey() {
+    if (destroyed) return;
+    cancel(claimTimer);
+    claimTimer = null;
+    Promise.resolve()
+      .then(() => consoleKey.ensure())
+      .then((state) => {
+        if (destroyed) return;
+        if (state === 'failed') {
+          const delay =
+            CLAIM_RETRY_MS[Math.min(claimTries, CLAIM_RETRY_MS.length - 1)];
+          claimTries += 1;
+          claimTimer = later(() => claimKey(), delay);
+        } else {
+          claimTries = 0;
+        }
+      })
+      .catch((err) => globalThis.console?.error?.(err));
+  }
+
+  /** The operator's End wargame succeeded: the strip goes now, the divider
+   *  (chat/view.js) hears `wargame:ended`, and the picture refreshes. */
+  function onWargameEnded(info) {
+    if (destroyed) return;
+    endedSession = info?.session_id || null;
+    const z = formatZulu(info?.ended_at_ms, { seconds: true });
+    const hadFocus = contains(strip.element, doc?.activeElement);
+    renderWargame();
+    renderFooter();
+    if (z) announce(STRIP_COPY.endedByYou(z), 'polite');
+    bus.emit('wargame:ended', {
+      by: 'operator',
+      session_id: info?.session_id ?? null,
+      aar_id: info?.aar_id ?? null,
+      ended_at_ms: info?.ended_at_ms ?? null,
+    });
+    try {
+      store.refresh?.();
+    } catch (err) {
+      globalThis.console?.error?.(err);
+    }
+    if (hadFocus || focusStranded(doc?.activeElement, doc))
+      (mode.state === 'orb' ? el.stage : el.analystBody)?.focus?.();
+  }
+
+  stripHooks.end = () =>
+    typeof api.endWargame === 'function'
+      ? api.endWargame()
+      : api.post(WARGAME_END_PATH, {});
+  stripHooks.onEnded = (info) => onWargameEnded(info);
+  stripHooks.announce = (text, politeness) => announce(text, politeness);
+  stripHooks.now = () => time.now();
+
   // ---- event wiring ------------------------------------------------------------------------
 
   el.skipSearch.addEventListener('click', () => openSearch());
@@ -2584,6 +2911,18 @@ export function mountIntelConsole({
     bus.on('abort:request', (p) => {
       if (p?.vehicle) C.confirmAbort?.(ctx, p.vehicle);
     }),
+    // Read in full (the report inspector, WG §5.3.11). The inspector's
+    // after-action review says `read:open {id, title, markdown}`.
+    bus.on('read:request', (p) => requestRead(p)),
+    bus.on('read:open', (p) => requestRead(p)),
+    // The rail's "Show all" engagements: the List view (its search:filter
+    // came first).
+    bus.on('view:request', (p) => {
+      if (p?.view === 'list' || p?.view === 'orb') setView(p.view);
+    }),
+    // The wargame view (intelStore, WG §5.3.3): the orb, the List view and
+    // the map's context overlay follow it.
+    bus.on('wargame:view', (p) => applyWargameView(p)),
     bus.on('settings:open', (p) => {
       openSettings({
         provider: typeof p?.provider === 'string' ? p.provider : null,
@@ -2636,6 +2975,7 @@ export function mountIntelConsole({
             globalThis.console?.error?.(err);
           }
           listView?.setGraph?.(st.graph);
+          renderWargame();
           renderFooter();
         }
         if (diff?.status || diff?.first) {
@@ -2692,6 +3032,14 @@ export function mountIntelConsole({
   }
 
   offs.push(
+    mode.onRead((d) => openRead(d)),
+    consoleKey.onChange?.(({ state }) => {
+      renderBanners();
+      // Slips re-check Deny-only (chat/view.js); the key itself never travels.
+      bus.emit('console:key', { state, canApprove: state === 'held' });
+      if (state === 'refused')
+        announce(consoleKey.bannerText?.() || '', 'polite');
+    }),
     mode.onNotice((list) => renderNotices(list)),
     mode.onChange(({ mode: m, prev }) => {
       if (m === 'tracking') {
@@ -2851,6 +3199,9 @@ export function mountIntelConsole({
     globalThis.console?.error?.(err);
   }
   checkAnalyst();
+  renderWargame();
+  // At boot (WG §3.5): a key kept by this tab, else one claim POST.
+  claimKey();
 
   function setMode(next, opts = {}) {
     if (next === 'orb') mode.backToConsole();
@@ -2886,6 +3237,8 @@ export function mountIntelConsole({
       situation,
       listView,
       settingsSheet,
+      readView,
+      strip,
     ]) {
       try {
         panel?.destroy?.();
@@ -2919,7 +3272,15 @@ export function mountIntelConsole({
 // Shell markup
 // ---------------------------------------------------------------------------
 
-function buildShell(mac, dockHooks = {}) {
+function buildShell(mac, dockHooks = {}, stripHooks = {}) {
+  // The simulated wargame's session strip (WG §5.3.2): hidden, and building
+  // nothing, until a session is active. The shell fills in what End does.
+  const wargameStrip = createWargameStrip({
+    endWargame: () => stripHooks.end?.(),
+    onEnded: (info) => stripHooks.onEnded?.(info),
+    announce: (text, politeness) => stripHooks.announce?.(text, politeness),
+    now: () => stripHooks.now?.() ?? Date.now(),
+  });
   const livePolite = h('div', {
     class: 'ic-live',
     role: 'status',
@@ -3061,6 +3422,8 @@ function buildShell(mac, dockHooks = {}) {
   const orbA11y = h('div', { class: 'ic-orba11y' });
   const orbWrap = h('div', { class: 'ic-orbwrap' }, canvas, orbA11y);
   const listHost = h('div', { class: 'ic-listhost', hidden: true });
+  // The read view (WG §5.3.11) takes the orb's place in the stage.
+  const readHost = h('div', { class: 'ic-readhost', hidden: true });
   const caption = h('div', {
     class: 'ic-caption',
     role: 'status',
@@ -3088,6 +3451,7 @@ function buildShell(mac, dockHooks = {}) {
     status,
     orbWrap,
     listHost,
+    readHost,
     stageBottom,
   );
   const main = h('div', { class: 'ic-main' }, rail, stage);
@@ -3138,6 +3502,7 @@ function buildShell(mac, dockHooks = {}) {
     onBack: () => dockHooks.onBack?.(),
     onTrack: (v) => dockHooks.onTrack?.(v),
     onSites: (on) => dockHooks.onSites?.(on),
+    onWargame: (kinds) => dockHooks.onWargame?.(kinds),
   });
   const mapSheet = h('div', { class: 'ic-mapsheet', hidden: true });
   const analystBody = h('div', { class: 'ic-analyst__body', tabindex: '-1' });
@@ -3274,6 +3639,7 @@ function buildShell(mac, dockHooks = {}) {
     skips,
     livePolite,
     liveAssertive,
+    wargameStrip.element,
     narrowBar,
     main,
     analyst,
@@ -3313,6 +3679,8 @@ function buildShell(mac, dockHooks = {}) {
     orbA11y,
     orbWrap,
     listHost,
+    readHost,
+    wargameStrip,
     caption,
     plate,
     footer,

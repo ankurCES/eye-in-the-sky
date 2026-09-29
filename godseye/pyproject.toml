@@ -104,9 +104,12 @@ where = ["mcp"]
 # relative to the installed godseye_uav/ package, so a wheel built without this
 # entry installs a package whose primary geoid source is a missing file.
 [tool.setuptools.package-data]
-# analyst_prompt.md is the analyst's system prompt, read at runtime from next
-# to the installed package (godseye_uav.chat).
-godseye_uav = ["data/*.tif", "analyst_prompt.md"]
+# analyst_prompt.md is the base of the analyst's system prompt; the ISR identity
+# (analyst_prompt_isr.md, the default) or the simulated wargame addendum
+# (analyst_prompt_wargame.md, M14a, session only) completes it.  All three are
+# read at runtime from next to the installed package (godseye_uav.chat).
+godseye_uav = ["data/*.tif", "analyst_prompt.md", "analyst_prompt_isr.md",
+               "analyst_prompt_wargame.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

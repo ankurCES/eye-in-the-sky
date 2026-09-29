@@ -90,6 +90,10 @@ Fidelity model (what this fake does and does NOT model)
 * **Runtime origin (WG A2):** `relocate_origin(geo)` moves the NED origin and
   parks every vehicle at it; scene objects keep their lat/lon/alt and routed
   objects keep their geodetic paths.
+* **Downed vehicles (M14a):** the simulated wargame's `down_vehicle(name)`
+  puts a drone on the ground where it is, disarmed, with `collision=True`,
+  and holds it there until `park_vehicle(name)` restores it at home. Nothing
+  here models how it was downed; that is a notional wargame outcome.
 * **Randomness:** all sim noise draws from an injectable/seedable
   `random.Random` (`FakeAirSim(seed=...)` / :meth:`FakeAirSim.seed`).
 
@@ -327,6 +331,9 @@ class _Vehicle:
     landed: bool = True
     task: _Task = field(default_factory=lambda: _Task("none"))
     collision: bool = False
+    #: Downed by the simulated wargame (M14a, `down_vehicle`): held on the
+    #: ground, disarmed, whatever a late RPC asks, until `park_vehicle`.
+    downed: bool = False
     # Smoothed attitude (deg) so the cockpit chase-cam banks into turns
     # instead of snapping to the instantaneous velocity vector each tick.
     heading_deg: float = 0.0
@@ -483,6 +490,9 @@ class FakeAirSim:
         Computing one ground velocity per tick and integrating exactly it is
         what makes both of those unrepresentable rather than merely fixed.
         """
+        if v.downed:
+            self._hold_down(v)
+            return
         t = v.task
         # M15: the air mass moves over the ground at `wind`, and it carries
         # any AIRBORNE, ARMED vehicle with it — parked or unarmed, nothing.
@@ -1342,6 +1352,7 @@ class FakeAirSim:
         v.landed, v.armed = True, False
         v.wind_limited = False
         v.collision = False
+        v.downed = False
         v.pitch_deg = v.roll_deg = 0.0
 
     def relocate_origin(self, geo: GeoPoint | HomeGeoPoint) -> dict:
@@ -1405,6 +1416,41 @@ class FakeAirSim:
             return {"vehicle": key, "latitude": g.latitude,
                     "longitude": g.longitude, "altitude": g.altitude,
                     "landed": True}
+
+    def down_vehicle(self, name: str) -> dict:
+        """The simulated wargame downed this vehicle (M14a, WG §5.2.12).
+
+        Under `_lock`: it is put on the ground where it is (NED z 0, the
+        launch datum: the fake has no terrain), disarmed, idle, with
+        `collision=True`, and held there (`downed`) until `park_vehicle`
+        revives it. A running maneuver is cancelled so its waiter unblocks.
+        An unknown name raises KeyError rather than minting a vehicle.
+        """
+        key = _s(name) or "Drone1"
+        with self._lock:
+            v = self._vehicles.get(key)
+            if v is None or key in self._objects:
+                raise KeyError(f"no vehicle named {key!r}")
+            v.downed = True
+            self._hold_down(v)
+            g = ned_to_geodetic(v.ned, self.home_geo)
+            return {"vehicle": key, "latitude": g.latitude,
+                    "longitude": g.longitude, "altitude": g.altitude,
+                    "landed": True, "collision": True}
+
+    def _hold_down(self, v: _Vehicle) -> None:
+        """Keep a downed vehicle on the ground, disarmed and still. Caller
+        holds `_lock` (or is the physics tick, which does)."""
+        if not v.task.done:
+            v.task.cancelled = True
+        if v.task.kind != "none" or not v.task.done:
+            v.task = _Task("none", done=True)
+        v.ned = NedPoint(v.ned.x, v.ned.y, 0.0)
+        v.vel = NedPoint(0.0, 0.0, 0.0)
+        v.air_vel = NedPoint(0.0, 0.0, 0.0)
+        v.landed, v.armed = True, False
+        v.wind_limited = False
+        v.collision = True
 
     def environment(self) -> dict:
         """One-call environment summary (INTREP 'sensor conditions', PLAN 4.7)."""

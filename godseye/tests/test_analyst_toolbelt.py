@@ -17,6 +17,8 @@ from contextlib import contextmanager
 import airsim
 import pytest
 from godseye_uav import analyst_toolbelt as tb
+from godseye_uav import wargame as wg
+from godseye_uav import wargame_tools as wt
 from godseye_uav.analyst_policy import (
     COMMAND,
     CURATED_TOOLS,
@@ -182,8 +184,15 @@ def build(server, intel=None, emitted=None):
 
 # --------------------------------------------------------------- catalog --
 
+class _McpOnly:
+    """A server object WITHOUT `wargame_mcp` (the pre-M14a shape, WG v2 §6)."""
+
+    def __init__(self, srv):
+        self.mcp = srv.mcp
+
+
 def test_every_server_tool_is_proxied_except_the_excluded(listing_server):
-    belt = build(listing_server)
+    belt = build(_McpOnly(listing_server))
     server_names = {t.name for t in asyncio.run(listing_server.mcp.list_tools())}
     names = set(belt.tool_names)
     assert names == (server_names - set(EXCLUDED_TOOLS)) | set(CURATED)
@@ -783,3 +792,169 @@ def test_a_direct_mcp_call_keeps_the_default_source(listing_server):
         return theater_tools.CALL_VIA.get()
 
     assert asyncio.run(main()) == "mcp"
+
+
+# ------------------------------------------------ WG v2 Phase B (unit B8) --
+# The simulated wargame's tools (M14a): only from `server.wargame_mcp`, only
+# the entry tools outside a session, and every `wg_*` proxy inside
+# `wargame.console_call(<its chat session>)` (WG v2 §3.8, §5.2.11, §6).
+
+WG_NAMES = set(wt.TOOL_NAMES)
+
+
+def _server_names(srv):
+    return {t.name for t in asyncio.run(srv.mcp.list_tools())}
+
+
+def test_phase_b_isr_toolbelt_adds_only_the_three_entry_tools(listing_server):
+    belt = build(listing_server)
+    server_names = _server_names(listing_server)
+    assert not any(n.startswith("wg_") for n in server_names)  # default /mcp: none
+    assert belt.mode == "isr"
+    assert set(belt.tool_names) == ((server_names - set(EXCLUDED_TOOLS)) | set(CURATED)
+                                    | tb.WG_ENTRY_TOOLS)
+    for name in WG_NAMES - tb.WG_ENTRY_TOOLS:
+        assert name not in belt.tool_names
+    # ISR mode changes only the tool list (WG v2 §5.0): the exclusions are as before.
+    assert belt.excluded == sorted(EXCLUDED_TOOLS)
+
+
+def test_phase_b_wargame_toolbelt_adds_every_wargame_tool(listing_server):
+    belt = asyncio.run(build_toolbelt(listing_server, None, lambda d: None, FakeSdk,
+                                      session_id="chat-1", mode="wargame"))
+    server_names = _server_names(listing_server)
+    wargame_names = {t.name for t in asyncio.run(listing_server.wargame_mcp.list_tools())}
+    assert wargame_names == WG_NAMES
+    assert belt.mode == "wargame"
+    assert set(belt.tool_names) == ((server_names - set(EXCLUDED_TOOLS)) | set(CURATED)
+                                    | wargame_names)
+    assert len(belt.tool_names) == len(set(belt.tool_names))
+    assert not any(n.startswith(f"{TOOL_PREFIX}wg_") for n in belt.disallowed_tools)
+    for name in WG_NAMES:
+        assert belt.defaults[name] == tb.schema_defaults(
+            next(t for t in asyncio.run(listing_server.wargame_mcp.list_tools())
+                 if t.name == name).input_schema)
+    odd = asyncio.run(build_toolbelt(listing_server, None, lambda d: None, FakeSdk,
+                                     mode="umpire"))
+    assert odd.mode == "isr" and set(odd.tool_names) & WG_NAMES == tb.WG_ENTRY_TOOLS
+
+
+def test_phase_b_entry_tools_are_the_registry_and_policy_sets():
+    from godseye_uav import analyst_policy
+
+    assert tb.WG_ENTRY_TOOLS == wt.ENTRY_TOOLS == {
+        "wg_session_start", "wg_session_status", "wg_list_classes"}
+    if hasattr(analyst_policy, "WG_ENTRY_TOOLS"):
+        assert frozenset(analyst_policy.WG_ENTRY_TOOLS) == tb.WG_ENTRY_TOOLS
+
+
+def test_phase_b_wargame_descriptions_keep_the_approval_hint(listing_server):
+    belt = _tools(asyncio.run(build_toolbelt(listing_server, None, lambda d: None, FakeSdk,
+                                             mode="wargame")))
+    execute = belt["wg_execute_engagement"].description
+    assert execute.startswith("SIMULATION (M14a):")
+    assert execute.endswith("[Console: waits for the operator to approve it.]")
+    for name in WG_NAMES:
+        hinted = "[Console:" in belt[name].description
+        assert hinted is (not classify(name, {}).auto), name
+
+
+def test_phase_b_the_flagged_server_gets_one_copy_of_each_tool_from_its_own_registry(
+        tmp_path):
+    store = Store(tmp_path)
+    try:
+        srv = GodseyeUavServer(None, store, wargame_mcp=True)
+        assert {n for n in _server_names(srv) if n.startswith("wg_")} == WG_NAMES
+        calls = []
+        for label, reg in (("mcp", srv.mcp), ("wargame_mcp", srv.wargame_mcp)):
+            async def spy(name, args, context=None, _real=reg.call_tool, _label=label):
+                calls.append((_label, name, wg.CONSOLE_CALL.get()))
+                return await _real(name, args)
+            reg.call_tool = spy
+        isr = asyncio.run(build_toolbelt(srv, None, lambda d: None, FakeSdk,
+                                         session_id="chat-7"))
+        assert set(isr.tool_names) & WG_NAMES == tb.WG_ENTRY_TOOLS
+        belt = asyncio.run(build_toolbelt(srv, None, lambda d: None, FakeSdk,
+                                          session_id="chat-7", mode="wargame"))
+        assert len(belt.tool_names) == len(set(belt.tool_names))
+        assert set(belt.tool_names) & WG_NAMES == WG_NAMES
+        out = _payload(asyncio.run(_tools(belt)["wg_session_status"].handler({})))
+        assert out["simulated"] is True
+        assert calls == [("wargame_mcp", "wg_session_status", "chat-7")]
+        assert wg.CONSOLE_CALL.get() is None
+    finally:
+        store.close()
+
+
+class _WgRegistry:
+    """Records the console-call context and call source each call sees."""
+
+    def __init__(self, names):
+        self.names = list(names)
+        self.seen: list[tuple] = []
+
+    async def list_tools(self):
+        return [_ListedInfo(n) for n in self.names]
+
+    async def call_tool(self, name, args):
+        from godseye_uav import theater_tools
+
+        self.seen.append((name, wg.CONSOLE_CALL.get(), theater_tools.CALL_VIA.get()))
+        await asyncio.sleep(0)
+        return type("R", (), {"content": [type("B", (), {"text": '{"ok": true}'})()],
+                              "is_error": False})()
+
+
+class _WgServer:
+    def __init__(self):
+        # A stray `wg_*` on /mcp (the `--wargame-mcp` copy) is never proxied from there.
+        self.mcp = _WgRegistry(["uav_get_telemetry", "wg_session_start"])
+        self.wargame_mcp = _WgRegistry(list(wt.TOOL_NAMES))
+
+
+@pytest.mark.parametrize("session_id", ["chat-1", None])
+def test_phase_b_wargame_proxies_run_inside_their_sessions_console_call(session_id):
+    server = _WgServer()
+
+    async def main():
+        belt = await build_toolbelt(server, None, lambda d: None, FakeSdk,
+                                    session_id=session_id, mode="wargame")
+        assert [n for n in belt.tool_names if n.startswith("wg_")] == list(wt.TOOL_NAMES)
+        tools = _tools(belt)
+        await tools["wg_execute_engagement"].handler({"x": 1})
+        await tools["uav_get_telemetry"].handler({"x": 1})
+        await tools["wg_session_start"].handler({"x": 1})
+        return wg.CONSOLE_CALL.get()
+
+    assert asyncio.run(main()) is None  # reset after every call
+    assert server.wargame_mcp.seen == [("wg_execute_engagement", session_id, "console"),
+                                       ("wg_session_start", session_id, "console")]
+    assert server.mcp.seen == [("uav_get_telemetry", None, "console")]
+
+
+def test_phase_b_entity_ids_accept_the_wargame_prefixes():
+    for gid in ("frc:blue-artillery-1", "eng:WG-3fa9c1-E7", "vec:cor-2", "frc:red-sam-1"):
+        assert tb._ENTITY_ID.match(gid), gid
+    for bad in ("force:red-sam-1", "frc:", "eng:a|b", "vec:[x]"):
+        assert not tb._ENTITY_ID.match(bad), bad
+    payload = {"attacker": {"id": "frc:blue-artillery-1"},
+               "engagement": {"id": "eng:WG-3fa9c1-E7"}, "vector": {"id": "vec:cor-2"},
+               "target": {"track_id": "TRK-a-0001", "label": XSS}}
+    assert extract_entities(payload) == ["frc:blue-artillery-1", "eng:WG-3fa9c1-E7",
+                                         "vec:cor-2", "trk:TRK-a-0001"]
+    assert tb.map_ids(["frc:red-sam-1", "vec:cor-2"]) == (None, ["frc:red-sam-1", "vec:cor-2"])
+
+
+def test_phase_b_the_aar_report_is_allowlisted_and_read_in_process(listing_server):
+    uri = "uav://reports/aar-WG-3fa9c1"
+    assert any(rx.match(uri) for rx in tb.RESOURCE_ALLOWLIST)
+    listing_server.reports["aar-WG-3fa9c1"] = {
+        "report_type": "AAR", "id": "aar-WG-3fa9c1", "session_id": "WG-3fa9c1",
+        "markdown": "# After-action review (simulated)", "simulated": True}
+    belt = _tools(build(listing_server))
+    out = _payload(asyncio.run(belt["read_intel_resource"].handler({"uri": uri})))
+    assert out["report_type"] == "AAR" and out["simulated"] is True
+    for bad in ("uav://reports/aar-WG-3fa9c1/x", "uav://reports/../aar-WG-3fa9c1",
+                "uav://aar/WG-3fa9c1", "uav://reports/aar WG"):
+        res = asyncio.run(belt["read_intel_resource"].handler({"uri": bad}))
+        assert _payload(res)["error"]["code"] == "resource_not_allowed", bad

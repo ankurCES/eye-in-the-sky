@@ -14,10 +14,18 @@
  */
 import { h, replaceKids, setHidden } from '../ui/uavDom.js';
 import { SITE_CATEGORIES, siteCategoryKey } from './orb/glyphPaths.js';
-import { isKnownType } from './orb/glyphs.js';
 import { siteCountLabel, siteWord, sitePlural } from './orb/placeText.js';
 import { cleanSubtitle, typeLabel } from './orb/text.js';
 import { siteKeyTag } from './inspectorPlaces.js';
+import {
+  CONSEQUENCE_WORD,
+  ENGAGEMENT_PHASE_WORD,
+  FORCE_STATE_WORD,
+  OUTCOME_WORD,
+  SIDE_WORD,
+  isWargameType,
+  wargameActive,
+} from './railWargame.js';
 import {
   ICON,
   TYPE_WORD,
@@ -26,7 +34,10 @@ import {
   feedSummary,
   glyph,
   icon,
+  isPanelType,
+  nodeGlyph,
   num,
+  registerTag,
   segments,
   statusWord,
   toneOf,
@@ -47,6 +58,14 @@ export const TYPE_FILTERS = Object.freeze([
   }),
   Object.freeze({ key: 'vehicles', label: 'Vehicles', types: ['vehicle'] }),
   Object.freeze({ key: 'missions', label: 'Missions', types: ['mission'] }),
+  // WG §5.3 (M14a): the simulated wargame's forces and engagements. Their
+  // chips show only in a session, or when they match.
+  Object.freeze({ key: 'forces', label: 'Forces', types: ['force'] }),
+  Object.freeze({
+    key: 'engagements',
+    label: 'Engagements',
+    types: ['engagement'],
+  }),
   // WG §4.2.6: mapped sites are places.
   Object.freeze({
     key: 'places',
@@ -122,6 +141,42 @@ export const ATTR_REASON = Object.freeze({
     subtype: 'Category',
     tags: 'Tags',
   }),
+  // WG §5.3: a force matches on its side, kind and state; an engagement on
+  // its outcome, phase and the designators involved.
+  force: Object.freeze({
+    side: 'Side',
+    state: 'State',
+    kind_label: 'Kind',
+    wg_class: 'Kind',
+  }),
+  engagement: Object.freeze({
+    outcome: 'Outcome',
+    phase: 'Phase',
+    consequence: 'Outcome',
+    kind: 'Kind',
+    attacker_label: 'Attacker',
+    target_label: 'Target',
+  }),
+  vector: Object.freeze({ side: 'Side', kind: 'Kind', alt_band: 'Kind' }),
+});
+
+/** The wargame keys a query may match, with the console's words for their values. */
+const WARGAME_MATCH = Object.freeze({
+  force: Object.freeze({
+    side: SIDE_WORD,
+    state: FORCE_STATE_WORD,
+    kind_label: null,
+    wg_class: null,
+  }),
+  engagement: Object.freeze({
+    outcome: OUTCOME_WORD,
+    phase: ENGAGEMENT_PHASE_WORD,
+    consequence: CONSEQUENCE_WORD,
+    kind: null,
+    attacker_label: null,
+    target_label: null,
+  }),
+  vector: Object.freeze({ side: SIDE_WORD, kind: null, alt_band: null }),
 });
 
 /** The match reason for an attribute key of a node type. */
@@ -150,6 +205,9 @@ const CONFIDENCE_WORDS = new Set([
   'possible',
   'unrated',
 ]);
+
+/** Filter chips that belong to the simulated wargame. */
+const WARGAME_FILTERS = new Set(['forces', 'engagements']);
 
 const ASK_LIMIT = 10;
 const MAX_ROWS = 8;
@@ -200,6 +258,16 @@ function attrEntries(node) {
   const attrs = node?.attrs || {};
   const site = node?.type === 'site';
   const out = [];
+  // Wargame nodes match only their words (never seeds, draws or ids).
+  if (isWargameType(node?.type)) {
+    for (const [key, words] of Object.entries(WARGAME_MATCH[node.type])) {
+      const value = attrs[key];
+      if (typeof value !== 'string' || !value) continue;
+      out.push([key, value]);
+      if (words && Object.hasOwn(words, value)) out.push([key, words[value]]);
+    }
+    return out;
+  }
   for (const [key, value] of Object.entries(attrs)) {
     if (site && SITE_QUIET_ATTRS.has(key)) continue;
     if (typeof value === 'string' || typeof value === 'number') {
@@ -422,7 +490,7 @@ export function siteCategoryCounts(matches) {
 
 /** The words a search row states for a node type: "Contact", "Unrecognised (force)". */
 export function typeWordOf(type) {
-  return isKnownType(type) ? TYPE_WORD[type] || 'Entity' : typeLabel(type);
+  return isPanelType(type) ? TYPE_WORD[type] || 'Entity' : typeLabel(type);
 }
 
 // ---------------------------------------------------------------------------
@@ -669,9 +737,12 @@ export function createSearch(host, ctx, opts = {}) {
 
   function renderChips(withCounts) {
     const counts = withCounts ? filterCounts(matches) : null;
+    // Forces and Engagements show before a query only in a wargame (WG §5.3).
+    const session = wargameActive(state().graph);
     const kids = [];
     for (const f of TYPE_FILTERS) {
       if (counts && f.key !== 'all' && !counts[f.key]) continue;
+      if (!counts && WARGAME_FILTERS.has(f.key) && !session) continue;
       const b = h(
         'button',
         {
@@ -747,8 +818,9 @@ export function createSearch(host, ctx, opts = {}) {
     // (and already says Up/Down, so no second status word).
     const word = feed ? '' : statusWord(node);
     const where = outsideWords(node);
-    const known = isKnownType(node.type);
+    const known = isPanelType(node.type);
     const site = node.type === 'site';
+    const wargame = isWargameType(node.type);
     // WG §4.2.6: "Site  Airfield  Mapped, not verified  ICAO OIFM".
     const keyTag = site ? siteKeyTag(node) : '';
     const meta = h(
@@ -775,7 +847,7 @@ export function createSearch(host, ctx, opts = {}) {
               {
                 class: 'ic-search__status',
                 'data-status': node.status,
-                'data-tone': toneOf(node.type, node.status),
+                'data-tone': toneOf(node.type, node.status, node),
               },
               feedSummary(node, now()),
             )
@@ -798,11 +870,13 @@ export function createSearch(host, ctx, opts = {}) {
                   ? 'ic-kit-notassessed'
                   : 'ic-search__status',
               'data-status': node.status,
-              'data-tone': toneOf(node.type, node.status),
+              'data-tone': toneOf(node.type, node.status, node),
             },
             word,
           )
         : null,
+      // A force is set by the wargame, not seen by a sensor (WG §5.3.1).
+      node.type === 'force' ? registerTag('scenario') : null,
       keyTag ? h('span', { class: 'ic-search__tag' }, keyTag) : null,
     );
     const li = h(
@@ -813,14 +887,16 @@ export function createSearch(host, ctx, opts = {}) {
         id: optionId(i),
         'aria-selected': i === active ? 'true' : 'false',
         'data-status': node.status || 'unknown',
-        'data-tone': toneOf(node.type, node.status),
+        'data-tone': toneOf(node.type, node.status, node),
         'data-type': known ? node.type : 'unknown',
         'data-id': node.id,
         'data-kind': 'result',
       },
-      glyph(node.type, node.status, 16, node.attrs?.phase, {
-        category: node.attrs?.category,
-      }),
+      wargame
+        ? nodeGlyph(node, 16)
+        : glyph(node.type, node.status, 16, node.attrs?.phase, {
+            category: node.attrs?.category,
+          }),
       h(
         'span',
         { class: 'ic-search__main' },

@@ -949,7 +949,7 @@ function placesGraph() {
     node('thr:dyn-k', 'theater', 'Kherson', {
       attrs: { place: 'Kherson, Ukraine', active: true },
     }),
-    node('frc:red-sam-1', 'force', 'Kherson red SAM', { status: 'ok' }),
+    node('gzm:gizmo-1', 'gizmo', 'Kherson gizmo', { status: 'ok' }),
   );
   return g;
 }
@@ -958,13 +958,13 @@ test('Places covers theaters, POIs and sites; an unknown type is under All only'
   const places = TYPE_FILTERS.find((f) => f.key === 'places');
   assert.deepEqual(places.types, ['theater', 'poi', 'site']);
   assert.equal(filterKeyOf('site'), 'places');
-  assert.equal(filterKeyOf('force'), null);
+  assert.equal(filterKeyOf('gizmo'), null);
   const matches = rankNodes(placesGraph(), 'kherson');
   const counts = filterCounts(matches);
   assert.equal(counts.places, 3, 'two sites and the theater');
-  assert.equal(counts.all, 4, 'the unknown force counts under All');
+  assert.equal(counts.all, 4, 'the unknown gizmo counts under All');
   assert.equal(typeWordOf('site'), 'Site');
-  assert.equal(typeWordOf('force'), 'Unrecognised (force)');
+  assert.equal(typeWordOf('gizmo'), 'Unrecognised (gizmo)');
 });
 
 test('site matches: category words and tags, with type-keyed reasons', () => {
@@ -1074,17 +1074,15 @@ test('Places shows category chips when sites match; a chip narrows to that categ
   assert.equal(bus.last('search:filter').ids.length, 3);
 });
 
-test('an unrecognised type lists under All as "Unrecognised (force)", lilac, never green', () => {
+test('an unrecognised type lists under All as "Unrecognised (gizmo)", lilac, never green', () => {
   const { search, input } = mount({ state: { graph: placesGraph() } });
   input.fire('focus');
-  type(input, 'red sam');
-  const row = options(search).find(
-    (o) => o.attrs['data-id'] === 'frc:red-sam-1',
-  );
+  type(input, 'kherson gizmo');
+  const row = options(search).find((o) => o.attrs['data-id'] === 'gzm:gizmo-1');
   assert.ok(row);
   assert.equal(row.attrs['data-type'], 'unknown');
   assert.equal(row.attrs['data-tone'], 'unknown');
-  assert.equal(text(byCls(row, 'ic-search__type')[0]), 'Unrecognised (force)');
+  assert.equal(text(byCls(row, 'ic-search__type')[0]), 'Unrecognised (gizmo)');
   assert.match(text(row), /Not assessed/);
   const g = findAll(row, (e) => hasCls(e, 'ic-kit-glyph'))[0];
   assert.doesNotMatch(String(g.innerHTML), /#5DD39B/i);
@@ -1115,4 +1113,138 @@ test('XSS and bidi fixtures in a site name and tags render as text in search res
   assert.ok(label.includes(XSS));
   assert.doesNotMatch(label, /[‪-‮⁦-⁩]/);
   assert.match(text(row), /ICAO <img src=x…/);
+});
+
+// ---- the simulated wargame: Forces and Engagements (WG §5.3) ---------------------------
+
+function wargameGraph(active = true) {
+  const g = graph();
+  g.nodes.push(
+    node('frc:red-sam-1', 'force', 'Red SAM 1', {
+      status: 'warn',
+      subtitle: 'Red  Surface-to-air, short range  Destroyed  Scenario',
+      attrs: {
+        side: 'red',
+        state: 'destroyed',
+        kind_label: 'Surface-to-air, short range',
+        wg_class: 'ad_short',
+        provenance: 'scenario',
+        seed: 4417,
+      },
+    }),
+    node('frc:blue-artillery-1', 'force', 'Blue artillery 1', {
+      attrs: {
+        side: 'blue',
+        state: 'active',
+        kind_label: 'Artillery battery',
+        provenance: 'scenario',
+      },
+    }),
+    node('eng:WG-1-E7', 'engagement', 'Engagement E7', {
+      attrs: {
+        kind: 'blue_strike',
+        phase: 'adjudicated',
+        outcome: 'suppressed',
+        attacker_label: 'Blue artillery 1',
+        target_label: 'Air-defence guns',
+        seed: 4417,
+        draw: 3,
+      },
+    }),
+    node('eng:WG-1-E8', 'engagement', 'Engagement E8', {
+      attrs: {
+        kind: 'blue_strike',
+        phase: 'proposed',
+        target_label: `${XSS}`,
+      },
+    }),
+  );
+  g.meta = {
+    ...(g.meta || {}),
+    wargame: active
+      ? { active: true, session_id: 'WG-1' }
+      : { active: false, last: null },
+  };
+  return g;
+}
+
+test('Forces and Engagements are filter chips with their words; vectors list under All', () => {
+  assert.equal(filterKeyOf('force'), 'forces');
+  assert.equal(filterKeyOf('engagement'), 'engagements');
+  assert.equal(filterKeyOf('vector'), null);
+  assert.equal(typeWordOf('force'), 'Force');
+  assert.equal(typeWordOf('engagement'), 'Engagement');
+  assert.equal(typeWordOf('vector'), 'Vector');
+  assert.equal(attrReason('force', 'side'), 'Side');
+  assert.equal(attrReason('force', 'state'), 'State');
+  assert.equal(attrReason('engagement', 'outcome'), 'Outcome');
+  assert.equal(ATTR_REASON.site.category, 'Category', 'Phase A reasons kept');
+});
+
+test('reasons: side, state and outcome match by value and by the console word', () => {
+  const g = wargameGraph();
+  const byId = (id) => g.nodes.find((n) => n.id === id);
+  assert.deepEqual(matchNode(byId('frc:blue-artillery-1'), 'active'), {
+    tier: TIER.attribute,
+    reason: 'State',
+    ranges: [],
+  });
+  assert.equal(matchNode(byId('frc:red-sam-1'), 'blue'), null);
+  assert.equal(matchNode(byId('frc:blue-artillery-1'), 'blue').reason, 'Label');
+  assert.equal(matchNode(byId('eng:WG-1-E7'), 'suppressed').reason, 'Outcome');
+  assert.equal(
+    matchNode(byId('eng:WG-1-E8'), 'waiting for you').reason,
+    'Phase',
+  );
+  assert.equal(matchNode(byId('eng:WG-1-E7'), '4417'), null, 'never the seed');
+  const counts = filterCounts(rankNodes(g, 'destroyed'));
+  assert.equal(counts.forces, 1);
+  assert.deepEqual(
+    applyTypeFilter(rankNodes(g, 'blue'), 'forces').map((m) => m.id),
+    ['frc:blue-artillery-1'],
+  );
+});
+
+test('the wargame chips show before a query only in a session', () => {
+  let m = mount({ state: { graph: graph() } });
+  m.input.fire('focus');
+  const chipKeys = (search) =>
+    findAll(search.element, (el) => el.attrs?.['data-filter']).map(
+      (el) => el.attrs['data-filter'],
+    );
+  assert.ok(!chipKeys(m.search).includes('forces'), 'ISR: unchanged');
+  assert.ok(!chipKeys(m.search).includes('engagements'));
+  m = mount({ state: { graph: wargameGraph() } });
+  m.input.fire('focus');
+  assert.ok(chipKeys(m.search).includes('forces'));
+  assert.ok(chipKeys(m.search).includes('engagements'));
+});
+
+test('a force row: its frame, the side and state words, the Scenario tag, never green', () => {
+  const { search, input } = mount({ state: { graph: wargameGraph() } });
+  input.fire('focus');
+  type(input, 'blue artillery');
+  const row = options(search).find(
+    (o) => o.attrs['data-id'] === 'frc:blue-artillery-1',
+  );
+  assert.ok(row);
+  assert.equal(row.attrs['data-type'], 'force');
+  assert.equal(row.attrs['data-tone'], 'low');
+  assert.equal(text(byCls(row, 'ic-search__type')[0]), 'Force');
+  assert.match(text(row), /Active/);
+  assert.ok(findAll(row, (e) => e.attrs?.['data-register'] === 'scenario')[0]);
+  const g = findAll(row, (e) => hasCls(e, 'ic-kit-glyph'))[0];
+  assert.match(String(g.innerHTML), /M2\.5 6\.5H21\.5V17\.5H2\.5Z/);
+  assert.doesNotMatch(String(g.innerHTML), /#5DD39B/i);
+});
+
+test('XSS in a wargame label renders as text in search results (§3.11)', () => {
+  const { search, input } = mount({ state: { graph: wargameGraph() } });
+  input.fire('focus');
+  type(input, 'engagement e8');
+  const row = options(search).find((o) => o.attrs['data-id'] === 'eng:WG-1-E8');
+  assert.ok(row);
+  assert.equal(findAll(row, (e) => e.tag === 'img').length, 0);
+  assert.equal(row.attrs['data-tone'], 'sand');
+  assert.match(text(row), /Waiting for you/);
 });

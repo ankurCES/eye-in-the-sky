@@ -1872,7 +1872,8 @@ test('showOnMapRequest: a bbox, else a 1 km box on a point, else null', () => {
 
 test('unknown types and sites in the kit: lilac, never green; sites are Pencil context', () => {
   globalThis.document = stubDom();
-  const el = glyph('force', 'ok', 16);
+  // `force` became a known (wargame) type in Phase B; `gizmo` never will be.
+  const el = glyph('gizmo', 'ok', 16);
   assert.equal(el.attrs['data-type'], 'unknown');
   assert.equal(el.attrs['data-status'], 'unknown');
   assert.doesNotMatch(String(el.innerHTML), /#5DD39B/i, 'never the ok green');
@@ -1880,8 +1881,8 @@ test('unknown types and sites in the kit: lilac, never green; sites are Pencil c
   const site = glyph('site', 'ok', 16, undefined, { category: 'airfield' });
   assert.equal(site.attrs['data-type'], 'site');
   assert.doesNotMatch(String(site.innerHTML), /#5DD39B/i);
-  assert.equal(statusWord({ type: 'force', status: 'ok' }), 'Not assessed');
-  assert.equal(toneOf('force', 'ok'), 'unknown');
+  assert.equal(statusWord({ type: 'gizmo', status: 'ok' }), 'Not assessed');
+  assert.equal(toneOf('gizmo', 'ok'), 'unknown');
   assert.equal(
     statusWord({ type: 'site', status: 'ok' }),
     'Mapped, not verified',
@@ -1891,4 +1892,243 @@ test('unknown types and sites in the kit: lilac, never green; sites are Pencil c
     displayLabel({ id: 'sit:x', type: 'site', label: BIDI }),
     'evil',
   );
+});
+
+// ---- the simulated wargame (WG §5.3.10) ------------------------------------------------
+
+const section = (root, name) =>
+  find(root, (el) => el.attrs?.['data-section'] === name);
+const sectionOrder = (root) =>
+  findAll(root, (el) => el.tag === 'section' && el.attrs?.['data-section']).map(
+    (el) => el.attrs['data-section'],
+  );
+
+function wgEngagement(id, phase, extra = {}) {
+  return {
+    id,
+    type: 'engagement',
+    label: id,
+    status: phase === 'proposed' ? 'warn' : 'ok',
+    ts_ms: NOW - 5000,
+    attrs: {
+      kind: 'blue_strike',
+      phase,
+      attacker: 'frc:blue-artillery-1',
+      attacker_label: 'Blue artillery 1',
+      target: 'trk:TRK-9',
+      target_label: 'Air-defence guns',
+      p_notional: 0.62,
+      approval_id: phase === 'proposed' ? 'apr-7' : null,
+      simulated: true,
+      ...extra,
+    },
+  };
+}
+
+function wgGraph(wargame = {}, extraNodes = []) {
+  const g = graph();
+  g.nodes.push(...extraNodes);
+  g.meta.wargame = {
+    active: true,
+    session_id: 'WG-3fa9c1',
+    truth_view: true,
+    pending: [],
+    counts: {
+      blue: { units: 3, active: 3, suppressed: 0, damaged: 0, destroyed: 0 },
+      red: { units: 2, active: 1, destroyed: 1, seen: 1 },
+    },
+    caveats: [],
+    ...wargame,
+  };
+  return g;
+}
+
+test('ISR mode: the rail has no Wargame section and no wargame words', () => {
+  const { rail } = mount();
+  assert.deepEqual(sectionOrder(rail.element), [
+    'theater',
+    'fleet',
+    'missions',
+    'alarms',
+    'assumed',
+  ]);
+  assert.doesNotMatch(text(rail.element), /Wargame|Simulated|Umpire/);
+});
+
+test('in a session the Wargame section sits between Missions and Alarms, tagged Simulated', () => {
+  const g = wgGraph({ pending: ['eng:1'] }, [
+    wgEngagement('eng:1', 'proposed'),
+    wgEngagement('eng:2', 'adjudicated', {
+      outcome: 'destroyed',
+      adjudicated_at_ms: NOW - 60_000,
+    }),
+  ]);
+  const { rail, store, bus, ctx } = mount({
+    state: { graph: g, view: 'umpire' },
+  });
+  const set = [];
+  store.setView = (v) => set.push(v);
+  rail.render();
+  assert.deepEqual(sectionOrder(rail.element), [
+    'theater',
+    'fleet',
+    'missions',
+    'wargame',
+    'alarms',
+    'assumed',
+  ]);
+  const wg = section(rail.element, 'wargame');
+  assert.match(text(wg), /^WargameSimulated/);
+  assert.equal(
+    find(wg, (el) => el.attrs?.['data-register'] === 'simulated') != null,
+    true,
+  );
+  // The view control: Umpire pressed; pressing Blue asks the store.
+  assert.equal(byKey(wg, 'wargame:view:umpire').attrs['aria-pressed'], 'true');
+  assert.equal(byKey(wg, 'wargame:view:blue').attrs['aria-pressed'], 'false');
+  byKey(wg, 'wargame:view:blue').fire('click');
+  assert.deepEqual(set, ['blue']);
+  // Side lines: zero segments omitted.
+  const sides = byCls(wg, 'ic-rail__wg-side').map((el) => text(el));
+  assert.deepEqual(sides, [
+    'Blue, 3 units, 3 active',
+    'Red, 2 units, 1 active, 1 destroyed',
+  ]);
+  // Waiting for you: Review scrolls to the slip.
+  assert.match(text(wg), /Waiting for youSimulated strike on Air-defence guns/);
+  byKey(wg, 'wargame:review:eng:1').fire('click');
+  assert.deepEqual(bus.last('approval:review'), {
+    id: 'eng:1',
+    approval_id: 'apr-7',
+  });
+  byKey(wg, 'wargame:pending:eng:1').fire('click');
+  assert.deepEqual(bus.last('inspect'), { id: 'eng:1' });
+  // Recent: attacker, target, Z, outcome and the notional chance.
+  const recent = byKey(wg, 'wargame:eng:eng:2');
+  assert.equal(
+    text(recent),
+    'Blue artillery 1 engaged Air-defence guns, 14:05Z, Destroyed, ≈ 0.62',
+  );
+  byKey(wg, 'wargame:all').fire('click');
+  assert.deepEqual(bus.last('search:filter'), {
+    ids: ['eng:1', 'eng:2'],
+    query: 'Engagements',
+    source: 'situation',
+  });
+  assert.deepEqual(bus.last('view:request'), {
+    view: 'list',
+    source: 'situation',
+  });
+  assert.equal(ctx.orb.calls.at(-1)[0], 'filter');
+  // What's assumed states the view and that outcomes are notional.
+  const assumed = text(section(rail.element, 'assumed'));
+  assert.match(
+    assumed,
+    /Umpire view: red units are where the scenario put them/,
+  );
+  assert.match(
+    assumed,
+    /Outcomes are simulated adjudications; probabilities are notional\./,
+  );
+});
+
+test('Blue view: red reads as seen, and the fog names no attacker', () => {
+  const g = wgGraph(
+    {
+      truth_view: false,
+      counts: { blue: { units: 1, active: 1 }, red: { seen: 2 } },
+    },
+    [
+      wgEngagement('eng:3', 'adjudicated', {
+        kind: 'red_shot',
+        attacker: null,
+        attacker_label: null,
+        target: 'veh:Drone1',
+        target_label: 'Drone1',
+        outcome: 'missed',
+        adjudicated_at_ms: NOW - 1000,
+      }),
+    ],
+  );
+  const { rail } = mount({ state: { graph: g, view: 'blue' } });
+  const wg = section(rail.element, 'wargame');
+  assert.match(text(wg), /Red, 2 seen/);
+  assert.match(
+    text(byKey(wg, 'wargame:eng:eng:3')),
+    /^Red air defence \(not identified\) engaged Drone1/,
+  );
+  assert.match(
+    text(section(rail.element, 'assumed')),
+    /Blue view: red units appear only as contacts your sensors reported\./,
+  );
+});
+
+test('after the session: "No wargame running." and the after-action review chip', () => {
+  const g = graph();
+  g.meta.wargame = {
+    active: false,
+    last: { session_id: 'WG-1', aar_id: 'aar-WG-1', ended_at_ms: NOW },
+  };
+  const { rail, bus } = mount({ state: { graph: g } });
+  const wg = section(rail.element, 'wargame');
+  assert.match(text(wg), /No wargame running\./);
+  byKey(wg, 'wargame:aar').fire('click');
+  assert.deepEqual(bus.last('inspect'), { id: 'rpt:aar-WG-1' });
+  assert.equal(byKey(wg, 'wargame:view:blue'), null, 'no view control');
+  assert.doesNotMatch(text(section(rail.element, 'assumed')), /Umpire view/);
+});
+
+test('compact: side lines and the pending count only; the strip counts what waits', () => {
+  const g = wgGraph({ pending: ['eng:1'] }, [
+    wgEngagement('eng:1', 'proposed'),
+  ]);
+  const { rail } = mount({ state: { graph: g }, layout: 'compact' });
+  const wg = section(rail.element, 'wargame');
+  assert.match(text(wg), /1 engagement waiting for you/);
+  assert.equal(byKey(wg, 'wargame:review:eng:1'), null);
+  assert.equal(byKey(wg, 'wargame:view:umpire'), null);
+  const strip = byCls(rail.element, 'ic-rail-strip__wargame')[0];
+  assert.equal(strip.attrs['data-pending'], 'true');
+  assert.equal(text(strip), '1Waiting');
+  const label = find(rail.element, (el) => hasCls(el, 'ic-rail-strip')).attrs[
+    'aria-label'
+  ];
+  assert.match(label, /Simulated wargame: Blue 3 units 3 active/);
+});
+
+test('narrow: the section collapses, but a waiting engagement stays in view', () => {
+  const g = wgGraph({ pending: ['eng:1'] }, [
+    wgEngagement('eng:1', 'proposed'),
+  ]);
+  const { rail } = mount({ state: { graph: g }, layout: 'narrow' });
+  let wg = section(rail.element, 'wargame');
+  const toggle = byKey(wg, 'wargame:toggle');
+  assert.equal(toggle.attrs['aria-expanded'], 'false');
+  assert.equal(byCls(wg, 'ic-rail__wg-side').length, 0);
+  assert.ok(byKey(wg, 'wargame:review:eng:1'), 'still reviewable');
+  toggle.fire('click');
+  wg = section(rail.element, 'wargame');
+  assert.equal(byKey(wg, 'wargame:toggle').attrs['aria-expanded'], 'true');
+  assert.equal(byCls(wg, 'ic-rail__wg-side').length, 2);
+});
+
+test('XSS and bidi fixtures in wargame labels render as text in the rail (§3.11)', () => {
+  const g = wgGraph({ pending: ['eng:1'] }, [
+    wgEngagement('eng:1', 'proposed', { target_label: `${BIDI}${XSS}` }),
+    wgEngagement('eng:2', 'adjudicated', {
+      attacker_label: XSS,
+      target_label: `${XSS}${BIDI}`,
+      outcome: 'missed',
+    }),
+  ]);
+  const { rail } = mount({ state: { graph: g } });
+  const wg = section(rail.element, 'wargame');
+  assert.equal(findAll(wg, (e) => e.tag === 'img').length, 0);
+  assert.equal(
+    findAll(wg, (e) => Object.keys(e.attrs || {}).some((k) => /^on/i.test(k)))
+      .length,
+    0,
+  );
+  assert.ok(text(wg).includes(XSS), 'the literal angle-bracket text');
+  assert.doesNotMatch(text(wg), BIDI_RE);
 });

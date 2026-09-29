@@ -1485,3 +1485,251 @@ def test_without_an_origin_holder_no_listener_is_added_so_a_switch_is_refused(tm
         assert len(srv.theater_listeners) == 1 and srv.origin_holders == [host.adapter]
     finally:
         host.close()
+
+
+# ---------------------------------------------------------------------------
+# M14a (WG v2 §3.5, §5.2.12 B11): the console key and the wargame routes
+# ---------------------------------------------------------------------------
+
+#: `secrets.token_urlsafe(24)`, and what the console's `isConsoleKey` accepts.
+CONSOLE_KEY_SHAPE = r"[A-Za-z0-9_-]{32}"
+
+
+def _claim(c: TestClient, *, token: str | None = TOKEN, **kw):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    return c.post(hostmod.CONSOLE_CLAIM_PATH, headers=headers, **kw)
+
+
+def _store_bytes(store_dir: Path) -> bytes:
+    """Everything the store wrote (audit, tasks, theater, wargame, ...)."""
+    return b"".join(p.read_bytes() for p in sorted(store_dir.rglob("*")) if p.is_file())
+
+
+def test_no_get_answer_carries_the_console_key(live):
+    """V3: the key is never GET-able: not in the page's injected config,
+    `/app/config`, a status answer, or the host's repr; a GET of the claim
+    path does not claim it either."""
+    import re as _re
+
+    key = live.host.console.key
+    assert _re.fullmatch(CONSOLE_KEY_SHAPE, key) and key != TOKEN
+    with live.client(auth=False) as c:
+        for path in ("/", "/index.html", "/app/config", "/health",
+                     hostmod.CONSOLE_CLAIM_PATH):
+            r = c.get(path)
+            assert (key in r.text) is False, path
+            assert "console_key" not in r.text and "consoleKey" not in r.text, path
+        assert c.get(hostmod.CONSOLE_CLAIM_PATH).status_code in (404, 405)
+        page = c.get("/").text
+        assert page.count("window.__GODSEYE__=") == 1
+        assert f'window.__GODSEYE__={{"bridgeUrl":"","token":"{TOKEN}"}}' in page
+    with live.client() as c:
+        for path in ("/chat/status", "/snapshot", "/intel/graph"):
+            r = c.get(path)
+            assert (key in r.text) is False, path
+    assert live.host.console.claimed is False           # nothing above claimed it
+    assert (key in repr(live.host.console)) is False
+    assert (key in repr(live.host.config)) is False
+
+
+def test_the_console_key_is_claimed_once_then_refused_and_audited(tmp_path):
+    """First claim: 200 `{console_key}` + `console_claimed`. Every later one:
+    409 `console_already_claimed` + `console_claim_refused` (the console's
+    banner signal). The bearer is required and a refused call never claims.
+    The real ChatService holds the same key; nothing on disk does."""
+    import re as _re
+
+    from godseye_uav import chat
+
+    host = _boot(tmp_path, ui_dir=_make_ui(tmp_path), mcp_port=False, start_loops=False)
+    try:
+        key = host.console.key
+        with TestClient(host.app, base_url="http://127.0.0.1") as c:
+            assert _claim(c, token=None).status_code == 401
+            assert _claim(c, token="wrong-token").status_code == 401
+            assert c.post(f"{hostmod.CONSOLE_CLAIM_PATH}?token={TOKEN}").status_code == 401
+            assert host.console.claimed is False and _audits(host, "console_claimed") == []
+
+            first = _claim(c, json={})
+            assert first.status_code == 200
+            assert first.json() == {"console_key": key}
+            assert _re.fullmatch(CONSOLE_KEY_SHAPE, first.json()["console_key"])
+            assert "no-store" in first.headers["cache-control"]
+            for _ in range(2):
+                again = _claim(c, json={"anything": "ignored"})
+                assert again.status_code == 409
+                assert again.json()["error"] == "console_already_claimed"
+                assert again.json()["rejected"] is True and again.json()["message"]
+                assert (key in again.text) is False
+            for path in ("/", "/app/config"):
+                assert (key in c.get(path).text) is False, path
+
+        claimed = _audits(host, "console_claimed")
+        refused = _audits(host, "console_claim_refused")
+        assert len(claimed) == 1 and claimed[0]["claimed_at_ms"] == host.console.claimed_at_ms
+        assert [r["attempt"] for r in refused] == [1, 2]
+        assert host.console.refused == 2
+        # The analyst's approval router checks the header against this key.
+        assert host.chat is not None and host.chat.console_key == key
+        assert chat.console_matches(host.chat.console_key, key) is True
+        wrong = key[:-1] + ("A" if key[-1] != "A" else "B")
+        assert chat.console_matches(host.chat.console_key, wrong) is False
+        assert (key in json.dumps(host.chat.status())) is False
+        # Never persisted: not in the audit trail or any other store file.
+        assert (key.encode() in _store_bytes(host.store_dir)) is False
+    finally:
+        host.close()
+
+
+def test_each_launch_makes_its_own_console_key(tmp_path):
+    keys = []
+    for name in ("a", "b"):
+        host = _boot(tmp_path / name, ui_dir=None, mcp_port=False, start_loops=False)
+        try:
+            keys.append(host.console.key)
+            assert host.console.key not in (TOKEN, host.token)
+        finally:
+            host.close()
+    assert keys[0] != keys[1]
+
+
+def test_concurrent_claims_have_exactly_one_winner():
+    claim = hostmod.ConsoleClaim()
+    gate = threading.Barrier(24)
+    got: list = []
+
+    def race() -> None:
+        gate.wait()
+        got.append(claim.claim())
+
+    threads = [threading.Thread(target=race) for _ in range(24)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    winners = [k for k, _ in got if k is not None]
+    assert winners == [claim.key]
+    assert sorted(n for k, n in got if k is None) == list(range(1, 24))
+    assert (claim.key in repr(claim)) is False
+
+
+def test_the_chat_service_receives_the_console_key(tmp_path, fake_modules):
+    rec = fake_modules()
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, chat=True)
+    try:
+        assert rec.chat_kwargs["console_key"] == host.console.key
+        with TestClient(host.app, base_url="http://127.0.0.1") as c:
+            assert _claim(c).json() == {"console_key": rec.chat_kwargs["console_key"]}
+            assert _claim(c).status_code == 409
+    finally:
+        host.close()
+
+
+def _wg_names(registry) -> set[str]:
+    return {t.name for t in asyncio.run(registry.list_tools()) if t.name.startswith("wg_")}
+
+
+def test_the_wargame_end_route_is_mounted_behind_the_bearer(tmp_path):
+    """`POST /wargame/session/end` rides on the app (outside create_app): 401
+    without the bearer, 409 with no session, 200 with the AAR, then 409. The
+    host's close stops the engine's thread and pools."""
+    from godseye_uav import wargame as wg
+
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, start_loops=False)
+    srv = host.server
+    try:
+        assert host.wargame_error is None
+        srv.wargame.run_thread = False                  # no step thread in this test
+        bearer = {"Authorization": f"Bearer {TOKEN}"}
+        with TestClient(host.app, base_url="http://127.0.0.1") as c:
+            assert c.post("/wargame/session/end").status_code == 401
+            assert c.post(f"/wargame/session/end?token={TOKEN}").status_code == 401
+            r = c.post("/wargame/session/end", headers=bearer)
+            assert r.status_code == 409
+            assert r.json()["error"] == "wargame_inactive" and r.json()["simulated"] is True
+            tool = srv.wargame_mcp._tool_manager._tools["wg_session_start"].fn
+            started = asyncio.run(tool(seed=4417, red_engages=False))
+            assert started["simulated"] is True and srv.wargame.active is True
+            r = c.post("/wargame/session/end", headers=bearer,
+                       json={"reason": "<img src=x onerror=alert(1)>"})
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["ok"] is True and body["simulated"] is True
+            assert body["aar_id"] == f"aar-{started['session_id']}"
+            assert srv.reports[body["aar_id"]]["reason"] == "operator"
+            assert srv.wargame.active is False
+            assert c.post("/wargame/session/end", headers=bearer).status_code == 409
+    finally:
+        calls = []
+        real_close = srv.wargame.close
+        srv.wargame.close = lambda: (calls.append(1), real_close())
+        host.close()
+        assert calls == [1]
+    assert isinstance(srv.wargame, wg.WargameEngine)
+
+
+def test_the_wargame_mcp_flag_reaches_the_server(tmp_path, monkeypatch):
+    """`HostConfig.wargame_mcp` (`app.py --wargame-mcp`) -> `build_server(
+    wargame_mcp=)`: only then does `/mcp` list `wg_*`. The analyst's own
+    wargame registry has them either way."""
+    from godseye_uav import launch, wargame_tools
+
+    seen: list[dict] = []
+    real_build = launch.build_server
+
+    def spy(t, backend, store, **kw):
+        seen.append(kw)
+        return real_build(t, backend, store, **kw)
+
+    monkeypatch.setattr(launch, "build_server", spy)
+    assert HostConfig(theater=None).wargame_mcp is False
+    host = _boot(tmp_path / "isr", ui_dir=None, mcp_port=False, start_loops=False)
+    try:
+        assert seen[-1]["wargame_mcp"] is False
+        assert host.server.wargame_mcp_enabled is False
+        assert _wg_names(host.server.mcp) == set()
+        assert _wg_names(host.server.wargame_mcp) == set(wargame_tools.TOOL_NAMES)
+    finally:
+        host.close()
+    host = _boot(tmp_path / "flag", ui_dir=None, mcp_port=False, start_loops=False,
+                 wargame_mcp=True)
+    try:
+        assert seen[-1]["wargame_mcp"] is True
+        assert host.server.wargame_mcp_enabled is True
+        assert _wg_names(host.server.mcp) == set(wargame_tools.TOOL_NAMES)
+        # MCP's own DNS-rebinding check wants the port in the Host header.
+        with TestClient(host.app, base_url=f"http://127.0.0.1:{host.port}") as c:
+            listed = c.post(hostmod.MCP_PATH, json={
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                headers={"Authorization": f"Bearer {TOKEN}",
+                         "Content-Type": "application/json",
+                         "Accept": "application/json, text/event-stream"})
+            assert listed.status_code == 200, listed.text[:200]
+            names = {t["name"] for t in _rpc_result(listed)["tools"]}
+            assert "wg_execute_engagement" in names
+            # Still no key anywhere a GET reaches, flag or not.
+            assert (host.console.key in c.get("/app/config").text) is False
+    finally:
+        host.close()
+
+
+
+def test_a_broken_wargame_module_leaves_the_rest_of_the_app_up(tmp_path, monkeypatch):
+    from godseye_uav import wargame_tools
+
+    def boom(srv, auth):
+        raise RuntimeError("wargame boom")
+
+    monkeypatch.setattr(wargame_tools, "wargame_router", boom)
+    host = _boot(tmp_path, ui_dir=None, mcp_port=False, start_loops=False)
+    try:
+        assert "wargame boom" in host.wargame_error
+        bearer = {"Authorization": f"Bearer {TOKEN}"}
+        with TestClient(host.app, base_url="http://127.0.0.1") as c:
+            assert c.post("/wargame/session/end").status_code == 401
+            r = c.post("/wargame/session/end", headers=bearer)
+            assert r.status_code == 503 and r.json() == {"error": "wargame_unavailable"}
+            assert c.get("/health").status_code == 200
+            assert _claim(c).status_code == 200          # the console key is unaffected
+    finally:
+        host.close()

@@ -475,7 +475,7 @@ test('the graph fixture is contract-shaped and sized as asked', () => {
   }
 });
 
-test('band latitudes are pinned: the ISR bands as before, plus the site band and the lower belt top (WG §4.2.6)', () => {
+test('band latitudes are pinned: the ISR bands as before, plus the site band, the lower belt top and the session bands (WG §4.2.6, §5.3.5)', () => {
   const lat = Object.fromEntries(
     Object.entries(BANDS).map(([key, band]) => [key, band.lat]),
   );
@@ -489,8 +489,11 @@ test('band latitudes are pinned: the ISR bands as before, plus the site band and
     track: 6,
     other: -31,
     unit: -36,
+    force_red: -41,
     equipment: -46,
+    force_blue: -47,
     report: -58,
+    engagement: -61,
     alarm: -74,
   });
   assert.equal(BANDS.theater.ringLat, 85);
@@ -511,8 +514,11 @@ test('band latitudes are pinned: the ISR bands as before, plus the site band and
     'track',
     'other',
     'unit',
+    'force_red',
     'equipment',
+    'force_blue',
     'report',
+    'engagement',
     'alarm',
   ]);
   assert.equal(GRATICULE_PARALLELS.beltTop, 38.5, 'moved from 44');
@@ -533,7 +539,8 @@ test('band latitudes are pinned: the ISR bands as before, plus the site band and
 test('an unknown node type goes to the Other band (fail-safe, WG §4.2.1)', () => {
   const layout = computeLayout({
     nodes: [
-      { id: 'frc:red-sam-1', type: 'force', status: 'critical' },
+      { id: 'stk:1', type: 'strike_package', status: 'critical' },
+      { id: 'band:1', type: 'force_red' },
       { id: 'zzz:1', type: 'zzz' },
       { id: 'x:proto', type: '__proto__' },
     ],
@@ -543,7 +550,8 @@ test('an unknown node type goes to the Other band (fail-safe, WG §4.2.1)', () =
     assert.equal(layout.band[layout.index.get(id)], 'other');
     assert.ok(Math.abs(at(layout, id).lat - BANDS.other.lat) < 1e-4);
   }
-  assert.equal(layout.counts.other, 3);
+  assert.equal(layout.counts.other, 4, 'a band key is not a node type');
+  assert.equal(layout.profile, 'isr');
 });
 
 const theaterGraph = (active, all = true) => ({

@@ -68,6 +68,15 @@
   --ic-class-sim-slip: #5a4812;
   --ic-class-override: #ff7b7b;
   --ic-class-override-slip: #8f1a14;
+  --ic-class-engagement: #cdbc8c;
+  --ic-class-engagement-slip: #5a4812;
+
+  /* Simulated wargame (WG §5.3.1): Sand is the umpire's ink; red and blue
+     are never hues in the console. */
+  --ic-sand: #cdbc8c;
+  --ic-sand-slip: #5a4812;
+  --ic-strip: #30383b;
+  --ic-strip-h: 28px;
 
   /* Type (§2.4) */
   --ic-font-sans:
@@ -125,6 +134,9 @@
   --ic-t-camera: 320ms;
   --ic-t-travel: 600ms;
   --ic-t-arm: 800ms;
+  /* The engagement slip's arm after its box is checked; a safety delay, so
+     reduced motion keeps it. */
+  --ic-t-arm-engage: 1600ms;
   --ic-t-ripple: 900ms;
   --ic-t-notice: 3000ms;
   --ic-t-fade: 200ms;
@@ -140,6 +152,9 @@
   --ic-z-rail: 25;
   --ic-z-sheet: 30;
   --ic-z-toast: 40;
+  /* The wargame strip and frame: over everything, never taking input but
+     the strip's own controls. */
+  --ic-z-frame: 45;
 
   /* Layout variables: only the root switches them (§3). */
   --ic-rail-w: clamp(248px, 17vw, 320px);
@@ -178,8 +193,10 @@
   z-index: 1100;
   display: grid;
   grid-template-columns: minmax(0, 1fr) var(--ic-analyst-w);
-  grid-template-rows: auto minmax(0, 1fr);
+  /* The strip row is empty (0 px) unless a simulated wargame is running. */
+  grid-template-rows: auto auto minmax(0, 1fr);
   grid-template-areas:
+    'strip strip'
     'top top'
     'main analyst';
   overflow: hidden;
@@ -318,6 +335,12 @@
     var(--ic-panel);
   color: var(--ic-film);
   font: var(--ic-type-small);
+}
+
+.ic-banner[data-tone='warn'] {
+  border-left-color: var(--ic-warn);
+  background:
+    linear-gradient(var(--ic-warn-tint), var(--ic-warn-tint)), var(--ic-panel);
 }
 
 .ic-banner__text {
@@ -759,6 +782,36 @@
   font: var(--ic-type-small);
 }
 
+/* The simulated wargame's Show row and Key (WG v2 §5.3.12): a session only. */
+.ic-mapdock__wgshow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 12px;
+}
+
+.ic-mapdock__wgshow[hidden],
+.ic-mapdock__wgkey[hidden] {
+  display: none;
+}
+
+.ic-mapdock__swatch {
+  display: inline-block;
+  width: 16px;
+  height: 6px;
+  border: 1px solid var(--ic-film);
+  border-radius: 2px;
+  background: var(--ic-pencil);
+}
+
+.ic-mapdock__swatch[data-exposure='moderate'] {
+  background: var(--ic-warn);
+}
+
+.ic-mapdock__swatch[data-exposure='high'] {
+  background: var(--ic-critical);
+}
+
 /* A pick's inspector: its host moves here, and the inspector (a sheet at
    compact) covers the dock column from the top. */
 .ic-mapsheet {
@@ -878,6 +931,70 @@
 
 .ic-popover__title {
   font: var(--ic-type-title);
+}
+
+/* The read view (WG §5.3.11): a report's full Markdown where the orb was;
+   the footer's room is kept, as in the list. */
+.ic-read {
+  max-width: var(--ic-measure);
+  margin-inline: auto;
+}
+
+/* Focus lands on the view itself when it opens; the ring clears the text. */
+.ic-read:focus-visible {
+  outline-offset: 8px;
+}
+
+.ic-read__body {
+  font: var(--ic-type-body);
+}
+
+/* A timeline cell keeps its words whole; a narrow table scrolls instead. */
+.ic-read__body :where(th, td) {
+  overflow-wrap: normal;
+}
+
+.ic-read__head {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--ic-s-2);
+  margin-bottom: var(--ic-s-5);
+  padding-bottom: var(--ic-s-4);
+  border-bottom: 1px solid var(--ic-hairline);
+}
+
+.ic-read__id {
+  font: var(--ic-type-data-row);
+}
+
+.ic-read__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ic-s-3);
+  color: var(--ic-pencil);
+  font: var(--ic-type-caption);
+}
+
+.ic-read__title {
+  font: var(--ic-type-heading);
+  letter-spacing: var(--ic-heading-tracking);
+}
+
+/* The read view replaces the orb (WG §5.3.11): the orb's caption and its
+   empty-orb invitation step aside; the honesty line stays. */
+.ic-stage[data-view='read'] .ic-caption,
+.ic-stage[data-view='read'] .ic-footer__invite {
+  display: none;
+}
+
+.ic-readhost {
+  grid-row: 4;
+  grid-column: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--ic-s-5) var(--ic-inset) 80px;
 }
 
 .ic-searchband {
@@ -1126,6 +1243,94 @@
   color: var(--ic-film);
 }
 
+/* The simulated wargame's session strip (WG §5.3.2): 28 px over every mode,
+   a Sand bar and mark on the strip's own grey; the frame is the root's
+   ::after. Words carry the meaning, never a hue. */
+.ic-wgstrip {
+  grid-area: strip;
+  position: relative;
+  z-index: var(--ic-z-frame);
+  display: flex;
+  align-items: center;
+  gap: var(--ic-s-6);
+  min-width: 0;
+  height: var(--ic-strip-h);
+  padding: 0 var(--ic-s-3) 0 0;
+  border-bottom: 2px solid var(--ic-sand);
+  background: var(--ic-strip);
+  color: var(--ic-pencil);
+  font: var(--ic-type-caption);
+  white-space: nowrap;
+}
+
+.ic-wgstrip__bar {
+  flex: none;
+  align-self: stretch;
+  width: 6px;
+  background: var(--ic-sand);
+}
+
+/* The long middle gives way first: ellipsis, never a wrapped strip. */
+.ic-wgstrip__details {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ic-wgstrip__end {
+  flex: none;
+  min-height: 22px;
+  padding: 1px 10px;
+  border: 1px solid var(--ic-edge);
+  border-radius: var(--ic-r-control);
+  background: transparent;
+  color: var(--ic-film);
+  font: inherit;
+  cursor: pointer;
+}
+
+.ic-wgstrip__end:hover,
+.ic-wgstrip__end[aria-expanded='true'] {
+  border-color: var(--ic-film);
+  background: var(--ic-raised);
+}
+
+.ic-wgstrip__item + .ic-wgstrip__item {
+  /* 24 px with the space between items. */
+  margin-left: calc(var(--ic-s-6) - 0.25em);
+}
+
+.ic-wgstrip__mark {
+  flex: none;
+  margin-left: calc(var(--ic-s-4) * -1);
+  color: var(--ic-sand);
+  font-weight: 600;
+}
+
+.ic-wgstrip__mono {
+  color: var(--ic-film);
+  font: var(--ic-type-data-row);
+}
+
+.ic-wgstrip__pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: var(--ic-s-3);
+  width: min(360px, calc(100vw - 32px));
+  white-space: normal;
+}
+
+.ic-wgstrip__status {
+  color: var(--ic-film);
+  font: var(--ic-type-small);
+}
+
+.ic-wgstrip__view {
+  flex: none;
+  color: var(--ic-film);
+}
+
 /* Reading registers (§2.6), shared by every panel. */
 
 .ic-reg-assumed {
@@ -1160,6 +1365,13 @@
   border-radius: var(--ic-r-chip);
   color: var(--ic-pencil);
   font: var(--ic-type-caption);
+}
+
+/* The read view's Simulated tag is the umpire's Sand (after .ic-reg-tag,
+   whose grey it overrides at the same specificity). */
+.ic-read__tag {
+  border-color: var(--ic-sand);
+  color: var(--ic-sand);
 }
 
 .ic-segs {
@@ -1208,6 +1420,38 @@
 
 .ic-root[data-icons='off'] :where(.ic-icon, .material-symbols-outlined) {
   display: none;
+}
+
+/* A simulated wargame session (WG §5.3.2): a 2 px Sand frame inside the
+   viewport, in orb, map and tracking alike, that never takes input. */
+.ic-root[data-wargame='on']::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: var(--ic-z-frame);
+  border: 2px solid var(--ic-sand);
+  pointer-events: none;
+}
+
+/* Whatever sits at the root's top edge starts under the strip. */
+:where(.ic-root[data-wargame='on']) .ic-mapbanner {
+  top: var(--ic-strip-h);
+}
+
+:where(.ic-root[data-wargame='on']) .ic-backfloat {
+  top: calc(12px + var(--ic-strip-h));
+}
+
+:where(.ic-root[data-wargame='on']) .ic-skips {
+  top: calc(8px + var(--ic-strip-h));
+}
+
+:where(.ic-root[data-wargame='on']) .ic-mapsheet {
+  --ic-inspector-top: var(--ic-strip-h);
+}
+
+:where(.ic-root[data-wargame='on']) .ic-settings {
+  top: var(--ic-strip-h);
 }
 
 /* 7. Container queries ------------------------------------------------------- */
@@ -1264,6 +1508,11 @@
   --ic-analyst-w: 0px;
 }
 
+/* The compact inspector sheet leaves the strip uncovered too. */
+.ic-root[data-wargame='on']:where([data-layout='compact']) {
+  --ic-inspector-top: calc(var(--ic-header-h) + var(--ic-strip-h));
+}
+
 .ic-root[data-layout='narrow'] {
   --ic-rail-w: 0px;
   --ic-analyst-w: 0px;
@@ -1275,6 +1524,7 @@
   --ic-searchbar-h: 44px;
   grid-template-columns: minmax(0, 1fr);
   grid-template-areas:
+    'strip'
     'top'
     'main';
 }
@@ -1312,6 +1562,20 @@
 .ic-root[data-mode='tracking']:where([data-layout='narrow'])
   :where(.ic-mapbanner) {
   top: 64px;
+}
+
+/* …and under the wargame strip above it. */
+.ic-root[data-wargame='on']:where([data-layout='narrow'])
+  :where(.ic-mapbanner) {
+  top: calc(64px + var(--ic-strip-h));
+}
+
+.ic-root[data-layout='narrow'] :where(.ic-wgstrip) {
+  gap: var(--ic-s-4);
+}
+
+.ic-root[data-layout='narrow'] :where(.ic-wgstrip__mark) {
+  margin-left: 0;
 }
 
 /* Before the first measurement: the same breakpoints as media queries. */

@@ -96,7 +96,30 @@ export const ERROR_WORDS = Object.freeze({
   json_required: 'the host only accepts JSON here',
   too_large: 'the request was too large',
   token_in_url: 'the access token must not be in the address',
+  // Simulated wargame (WG §3.5, §3.4).
+  wargame_inactive: 'no wargame is running',
+  console_already_claimed:
+    'another client already claimed engagement approvals',
+  console_required: "this console doesn't hold the engagement approval key",
+  acknowledgement_required: 'the acknowledgement box has to be checked first',
+  wargame_tools_not_forwarded: "wargame tools aren't sent through the bridge",
+  engagement_requires_console_approval:
+    'an engagement needs your approval in the console first',
 });
+
+/** One-time console claim (WG §3.5): 200 `{console_key}`, then 409. */
+export const CONSOLE_CLAIM_PATH = '/app/console-claim';
+/** Operator's End wargame (WG §3.5): `{ok, aar_id}`, 409 with no session. */
+export const WARGAME_END_PATH = '/wargame/session/end';
+
+/**
+ * `/intel/graph` for a scope; `truth` (Umpire view, WG §3.2, §5.3.3) adds
+ * `truth=1`. Without it the path is exactly the ISR one.
+ */
+export function intelGraphPath({ scope = 'theater', truth = false } = {}) {
+  const value = scope === 'all' ? 'all' : 'theater';
+  return `/intel/graph?scope=${value}${truth === true ? '&truth=1' : ''}`;
+}
 
 /** A `{error: "snake_case_code"}` body's code, or null. */
 export function errorCode(body) {
@@ -504,5 +527,36 @@ export function createApi({
     });
   }
 
-  return { base, token, url, get, post, put, del, sse, abortVehicle };
+  /**
+   * Claim this launch's engagement approval key (WG §3.5), once. Resolves
+   * with `{console_key}`; a second claim is an HttpError 409
+   * (`console_already_claimed`). The key is never logged or echoed.
+   */
+  function claimConsole() {
+    return post(CONSOLE_CLAIM_PATH, {});
+  }
+
+  /**
+   * End the simulated wargame (the strip's End wargame). Resolves with
+   * `{ok, aar_id}`; with no session it is an HttpError 409
+   * (`wargame_inactive`).
+   */
+  function endWargame({ reason } = {}) {
+    const text = typeof reason === 'string' ? reason.trim() : '';
+    return post(WARGAME_END_PATH, text ? { reason: text.slice(0, 200) } : {});
+  }
+
+  return {
+    base,
+    token,
+    url,
+    get,
+    post,
+    put,
+    del,
+    sse,
+    abortVehicle,
+    claimConsole,
+    endWargame,
+  };
 }

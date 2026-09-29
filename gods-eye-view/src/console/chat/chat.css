@@ -1464,3 +1464,151 @@
     accent-color: auto;
   }
 }
+
+/* ---- the simulated wargame (WG spec §5.3.1, §5.3.7, §5.3.8; M14a) ------------ */
+
+/* Class `engagement`: Sand, the umpire's ink. The band is 6 px; a 6 px Sand
+   45° hatch on top means "acknowledge, and irreversible". Red and blue are
+   never hues here. The tokens fall back when console.css lacks them. */
+:where(.ic-root) .ic-row[data-class='engagement'],
+:where(.ic-root) .ic-swatch[data-class='engagement'] {
+  --ic-row-ink: var(--ic-sand, var(--ic-class-sim, #cdbc8c));
+}
+
+:where(.ic-root) .ic-slip[data-class='engagement'] {
+  --ic-slip-band: var(--ic-sand-slip, var(--ic-class-sim-slip, #5a4812));
+}
+
+:where(.ic-root) .ic-slip__hatch {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 6px;
+  border-radius: var(--ic-r-slip, 3px) var(--ic-r-slip, 3px) 0 0;
+  background: repeating-linear-gradient(
+    45deg,
+    var(--ic-slip-band) 0 3px,
+    transparent 3px 6px
+  );
+  pointer-events: none;
+}
+
+/* Approve fills over the longer engagement arm (1600 ms). */
+:where(.ic-root)
+  .ic-slip[data-class='engagement']
+  .ic-slip__approve[data-arming]::after {
+  animation-duration: var(--ic-t-arm-engage, 1600ms);
+}
+
+:where(.ic-root) .ic-slip__fixed {
+  font: var(--ic-type-small);
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-slip__outcome {
+  margin: 0;
+  font: var(--ic-type-small);
+}
+
+:where(.ic-root) .ic-slip__outcome[data-hidden='true'] {
+  font-style: italic;
+}
+
+:where(.ic-root) .ic-slip__outcome[data-tone='unknown'],
+:where(.ic-root) .ic-umpire__text[data-tone='unknown'] {
+  color: var(--ic-unknown, #bba7e0);
+}
+
+/* The Scenario register: a Sand tag ("Set by the wargame, not seen by a
+   sensor."), on the slip and in the transcript. */
+:where(.ic-root) .ic-slip .ic-tag[data-register='scenario'] {
+  border-color: var(--ic-sand-slip, var(--ic-class-sim-slip, #5a4812));
+  color: var(--ic-sand-slip, var(--ic-class-sim-slip, #5a4812));
+}
+
+:where(.ic-root) .ic-umpire .ic-tag[data-register='scenario'] {
+  border-color: var(--ic-sand, var(--ic-class-sim, #cdbc8c));
+  color: var(--ic-sand, var(--ic-class-sim, #cdbc8c));
+}
+
+/* Umpire rows: a Sand square marker and "Umpire  {Z}  Simulated". */
+:where(.ic-root) .ic-umpire {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ic-s-1, 2px);
+  padding-left: var(--ic-s-4, 12px);
+  border-left: 2px solid var(--ic-sand, var(--ic-class-sim, #cdbc8c));
+}
+
+:where(.ic-root) .ic-umpire[data-tone='warn'] {
+  border-left-color: var(--ic-warn, #f2b544);
+}
+
+:where(.ic-root) .ic-umpire[data-tone='critical'] {
+  border-left-color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-umpire__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--ic-s-4, 12px);
+  margin: 0;
+  color: var(--ic-pencil, #a3b0ba);
+  font: var(--ic-type-caption);
+}
+
+:where(.ic-root) .ic-umpire__mark {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  background: var(--ic-sand, var(--ic-class-sim, #cdbc8c));
+}
+
+:where(.ic-root) .ic-umpire__who {
+  color: var(--ic-sand, var(--ic-class-sim, #cdbc8c));
+  font-weight: 600;
+}
+
+:where(.ic-root) .ic-umpire__text {
+  margin: 0;
+  font: var(--ic-type-small);
+  overflow-wrap: anywhere;
+}
+
+:where(.ic-root) .ic-umpire__text[data-tone='critical'] {
+  color: var(--ic-critical, #ff7b7b);
+}
+
+:where(.ic-root) .ic-umpire__rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ic-s-3, 8px);
+  margin-top: var(--ic-s-2, 4px);
+}
+
+/* The simulated loss banner: critical, UI-only (not an alarm). */
+:where(.ic-root) .ic-chat__banner[data-tone='critical'] {
+  border-left-color: var(--ic-critical, #ff7b7b);
+  color: var(--ic-critical, #ff7b7b);
+}
+
+@media (forced-colors: active) {
+  :where(.ic-root) .ic-slip__hatch {
+    background: repeating-linear-gradient(
+      45deg,
+      CanvasText 0 3px,
+      transparent 3px 6px
+    );
+    forced-color-adjust: none;
+  }
+
+  :where(.ic-root) .ic-umpire__mark {
+    background: CanvasText;
+    forced-color-adjust: none;
+  }
+
+  :where(.ic-root) .ic-umpire {
+    border-left-color: CanvasText;
+  }
+}

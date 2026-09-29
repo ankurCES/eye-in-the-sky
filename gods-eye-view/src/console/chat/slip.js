@@ -26,8 +26,18 @@
  * theater or speed slip whose preview is missing or incomplete, or one that
  * is blocked (a failing check, or `assessment.theater.ok === false`) shows
  * only [Deny], with the reason on a line above it. No Approve element exists.
- * `denyOnlyOf(approval, assessment)` is the single decision point.
- * deps:  { decide(decision, note) → Promise, revalidate() → assessment,
+ * `denyOnlyOf(approval, assessment, access)` is the single decision point.
+ *
+ * Engagement (WG spec §5.3.7, M14a): a Sand hatch over the band, the body
+ * from slipEngagement.js, the acknowledgement box always, Approve armed
+ * 1600 ms after the box is ticked (unticking disarms), and `decide` gets
+ * `{acknowledged}`. Deny-only also when the preview is incomplete, when
+ * this console holds no engagement key (`model.console` or
+ * `deps.consoleAccess()`: `{held, refused}`), or when `assessEngagement`
+ * finds it blocked. The model adds `console` and `outcome` (the filed
+ * slip's live outcome line).
+ * deps:  { decide(decision, note, {acknowledged}) → Promise,
+ *          revalidate() → assessment, consoleAccess() → {held, refused},
  *          announce(text, {assertive}), clock:{setTimeout, clearTimeout, now},
  *          raf, caf, ResizeObserver, getRect(el), doc }
  */
@@ -80,6 +90,19 @@ import {
   theaterPlace,
   timeScaleInfoNodes,
 } from './slipTheater.js';
+import {
+  engagementDenyOnly,
+  engagementPreviewOf,
+  isEngagement,
+} from './validateEngagement.js';
+import {
+  ENGAGEMENT_SLIP_COPY,
+  ENGAGE_ARM_MS,
+  engagementAck,
+  engagementInfoNodes,
+  engagementTitle,
+  verbKindOf,
+} from './slipEngagement.js';
 
 // Titles, summaries, consequences and args carry analyst- and map-sourced
 // text: no bidi control reaches the slip (see format.js stripBidi).
@@ -99,6 +122,7 @@ export const SLIP_NOTES = Object.freeze({
     'The dry run failed the gate. Re-plan, dry-run again and show me the gate.',
   freshDryRun:
     'Conditions changed since the dry run. Dry-run this again and show me the gate.',
+  freshPlan: ENGAGEMENT_SLIP_COPY.freshPlanNote,
 });
 
 const KNOWN_GATE_KEYS = new Set([
@@ -167,6 +191,10 @@ function distanceText(m) {
 /** Which button set the slip shows. */
 export function slipVariant(approval, assessment) {
   if (!approval) return 'normal';
+  // A stale engagement (target moved, sim speed or weather changed) offers
+  // Ask for a fresh plan first; Approve anyway stays boxed and re-armed.
+  if (isEngagement(approval))
+    return assessment?.state === 'stale' ? 'stale' : 'normal';
   if (isDryRunnable(approval)) {
     const state = assessment?.state;
     if (state === 'none') return 'no_dry_run';
@@ -184,6 +212,12 @@ export function grantPhrase(approval) {
   return listWords(scope.map((t) => toolTitle(t)));
 }
 
+/** The slip's title: an engagement names its target (WG spec §5.3.7). */
+export function slipTitle(approval) {
+  if (isEngagement(approval)) return engagementTitle(approval);
+  return approval?.title ?? '';
+}
+
 /** The one-line audit record of a decided slip (spec §6.8). */
 export function filedText(approval) {
   const a = approval || {};
@@ -196,7 +230,7 @@ export function filedText(approval) {
       if (a.scope === 'session') {
         return `Approved by you${at}, with ${grantPhrase(a)} allowed until you start a new session.`;
       }
-      return `Approved by you${at}. ${a.title}${filedObject(a, vehicle)}.`;
+      return `Approved by you${at}. ${slipTitle(a)}${filedObject(a, vehicle)}.`;
     case 'denied':
       return `Denied by you${at}.${a.note ? ` Your note: “${a.note}”` : ''}`;
     case 'expired': {
@@ -224,6 +258,7 @@ export function filedText(approval) {
 
 /** What a filed approval acted on: the vehicle, the theater or the speed. */
 function filedObject(a, vehicle) {
+  if (isEngagement(a)) return '';
   if (a.tool === 'sim_set_theater') {
     const place = theaterPlace(a);
     return place ? `, ${place}` : '';
@@ -236,18 +271,33 @@ function filedObject(a, vehicle) {
 }
 
 /**
- * Why a slip can only be denied, or null (WG spec §3.6, §4.2.1, §4.2.2):
- * an unknown class, a missing or incomplete preview, or a blocked theater or
- * speed change. A Deny-only slip has no Approve element in the DOM.
- * @returns {{kind:'unknown'|'preview'|'blocked', line:string, note:string|null}|null}
+ * Why a slip can only be denied, or null (WG spec §3.5, §3.6, §4.2.1,
+ * §4.2.2, §5.3.7): an unknown class, a missing or incomplete preview, a
+ * blocked theater, speed or engagement request, or an engagement this
+ * console holds no approval key for (`access` is the chat client's
+ * `{held, refused}`; missing access counts as no key). A Deny-only slip has
+ * no Approve element in the DOM.
+ * @returns {{kind:'unknown'|'preview'|'blocked'|'console', line:string, note:string|null}|null}
  */
-export function denyOnlyOf(approval, assessment) {
+export function denyOnlyOf(approval, assessment, access = null) {
   const a = approval || {};
   if (!classApprovable(a.klass)) {
     return {
       kind: 'unknown',
       line: unknownLine(a.rawClass),
       note: unknownDenyNote(a.rawClass),
+    };
+  }
+  if (isEngagement(a)) {
+    const only = engagementDenyOnly(a, assessment, access);
+    if (!only) return null;
+    return {
+      kind: only.kind,
+      line:
+        only.kind === 'preview'
+          ? PREVIEW_MISSING
+          : only.line || "This can't be approved here.",
+      note: null,
     };
   }
   if (a.klass === 'sim' && isPreviewTool(a.tool)) {
@@ -346,6 +396,14 @@ function undoLine(tool) {
     return 'Set the weather back with another simulation change, which also needs your approval.';
   if (tool === 'sim_set_time')
     return 'Set the time back with another simulation change, which also needs your approval.';
+  // The wargame's sim tools (M14a): there is no despawn; only ending the
+  // wargame removes scenario units.
+  if (tool === 'wg_session_start')
+    return 'End the wargame with another change, which also needs your approval.';
+  if (tool === 'wg_session_end')
+    return "Start a new simulated wargame with another change, which also needs your approval. This session's scenario units don't come back.";
+  if (tool === 'wg_generate_scenario' || tool === 'wg_spawn_force')
+    return 'Only ending the wargame removes scenario units. That also needs your approval.';
   return 'Reverse it with another simulation change, which also needs your approval.';
 }
 
@@ -574,8 +632,13 @@ export function createSlip(initialModel, deps = {}) {
   const titleEl = h(
     'h3',
     { class: 'ic-slip__title', id: titleId, tabindex: '-1' },
-    approval0.title,
+    slipTitle(approval0),
   );
+  // Engagement (WG spec §5.3.1): a 6 px Sand 45° hatch on top of the band,
+  // meaning "acknowledge, and irreversible".
+  const hatch = isEngagement(approval0)
+    ? h('div', { class: 'ic-slip__hatch', 'aria-hidden': 'true' })
+    : null;
   const infoEl = h('div', { class: 'ic-slip__info' });
 
   const requestBtn = h(
@@ -644,14 +707,18 @@ export function createSlip(initialModel, deps = {}) {
   });
   const actionsEl = h('div', { class: 'ic-slip__actions' });
   const policyEl = h('p', { class: 'ic-slip__policy' });
+  // An engagement's box comes straight after "What can't be undone", before
+  // the request and note links (WG spec §5.3.7).
+  const ackFirst = isEngagement(approval0);
   const pendingEl = h(
     'div',
     { class: 'ic-slip__pending' },
+    ackFirst ? ackEl : null,
     extras,
     requestPanel,
     notePanel,
     grantEl,
-    ackEl,
+    ackFirst ? null : ackEl,
     errorEl,
     denyLineEl,
     actionsEl,
@@ -668,6 +735,7 @@ export function createSlip(initialModel, deps = {}) {
       'data-class': approval0.klass,
       'data-state': 'pending',
     },
+    hatch,
     band,
     classLine,
     titleEl,
@@ -680,18 +748,30 @@ export function createSlip(initialModel, deps = {}) {
   let buttons = [];
 
   // ---- arming ----
+  // An engagement always needs the box, whatever the event says (§5.3.7).
   const ackOffered = () =>
     classApprovable(model.approval.klass) &&
     (model.approval.klass === 'safety_override' ||
+      isEngagement(model.approval) ||
       model.approval.acknowledgeRequired === true);
   const needsAck = () => ackOffered() && ackBox.checked !== true;
-  const denyOnly = () => denyOnlyOf(model.approval, model.assessment);
+  const consoleAccess = () =>
+    typeof deps.consoleAccess === 'function'
+      ? deps.consoleAccess()
+      : (model.console ?? null);
+  const denyOnly = () =>
+    denyOnlyOf(model.approval, model.assessment, consoleAccess());
+  // Engagements arm 1600 ms after the box is ticked; everything else 800 ms.
+  const armMs = () => (isEngagement(model.approval) ? ENGAGE_ARM_MS : ARM_MS);
   const isPending = () =>
     !filed &&
     (model.approval.state === 'pending' || model.approval.state === 'deciding');
 
   function approveLabel(base) {
-    if (!armed && !needsAck() && model.reducedMotion) return 'Ready in 1 s';
+    if (!armed && !needsAck() && model.reducedMotion)
+      return isEngagement(model.approval)
+        ? ENGAGEMENT_SLIP_COPY.readyIn
+        : 'Ready in 1 s';
     return base;
   }
 
@@ -729,7 +809,7 @@ export function createSlip(initialModel, deps = {}) {
         if (destroyed || !isPending()) return;
         armed = true;
         applyArm();
-      }, ARM_MS);
+      }, armMs());
     }
     applyArm();
   }
@@ -801,10 +881,14 @@ export function createSlip(initialModel, deps = {}) {
     if (deciding || !isPending() || model.approval.state === 'deciding') return;
     const typed = noteText();
     const note = preset ? (typed ? `${preset} ${typed}` : preset) : typed;
+    // The server requires `acknowledged:true` on an engagement approval
+    // (WG spec §3.5); it is sent only when the box is actually ticked.
+    const acknowledged =
+      decision !== 'deny' && ackOffered() && ackBox.checked === true;
     deciding = true;
     applyArm();
     try {
-      await deps.decide?.(decision, note || null);
+      await deps.decide?.(decision, note || null, { acknowledged });
     } catch {
       // The view folds the failure into the model (approval.error).
     } finally {
@@ -825,7 +909,7 @@ export function createSlip(initialModel, deps = {}) {
       if (
         fresh &&
         (fresh.state !== model.assessment?.state ||
-          denyOnlyOf(model.approval, fresh) != null)
+          denyOnlyOf(model.approval, fresh, consoleAccess()) != null)
       ) {
         model = { ...model, assessment: fresh };
         render(true);
@@ -950,7 +1034,9 @@ export function createSlip(initialModel, deps = {}) {
     const offered = grantOffered(a) && grantBox.checked === true;
     const verb = offered
       ? 'Approve and allow for session'
-      : approveVerb(a.tool, a.klass);
+      : approveVerb(a.tool, a.klass, {
+          verbKind: verbKindOf(engagementPreviewOf(a)),
+        });
     const list = [];
     const only = denyOnly();
     if (only) {
@@ -985,6 +1071,20 @@ export function createSlip(initialModel, deps = {}) {
         makeButton('approve', 'Approve without a dry run', {
           action: 'approve-anyway',
         }),
+      );
+    } else if (v === 'stale' && isEngagement(a)) {
+      // WG spec §5.3.7: [Deny] [Ask for a fresh plan], and Approve anyway
+      // as an outline button that is still boxed and re-armed.
+      list.push(makeButton('deny', denyLabel(), { action: 'deny' }));
+      list.push(
+        makeButton('deny', ENGAGEMENT_SLIP_COPY.freshPlan, {
+          primary: true,
+          action: 'ask-fresh-plan',
+          preset: SLIP_NOTES.freshPlan,
+        }),
+      );
+      list.push(
+        makeButton('approve', 'Approve anyway', { action: 'approve-anyway' }),
       );
     } else if (v === 'stale') {
       list.push(makeButton('deny', denyLabel(), { action: 'deny' }));
@@ -1339,6 +1439,12 @@ export function createSlip(initialModel, deps = {}) {
     // Unknown class: only what the server sent, as text (WG spec §4.2.1).
     if (!classApprovable(a.klass))
       return unknownInfoNodes(a, { h, segmentNodes });
+    if (isEngagement(a))
+      return engagementInfoNodes({
+        approval: a,
+        assessment: model.assessment,
+        tag,
+      });
     if (a.klass === 'sim' && isPreviewTool(a.tool)) {
       const ctx = {
         approval: a,
@@ -1443,9 +1549,14 @@ export function createSlip(initialModel, deps = {}) {
         );
       }
     }
-    const ack = ackOffered();
+    // A Deny-only slip has nothing to acknowledge: no box without Approve.
+    const ack = ackOffered() && !denyOnly();
     setHidden(ackEl, !ack);
-    if (ack) setText(ackTextEl, ackCopy(a.tool, vehicle));
+    if (ack)
+      setText(
+        ackTextEl,
+        isEngagement(a) ? engagementAck(a) : ackCopy(a.tool, vehicle),
+      );
     const policy = policyLine(a.klass, a.tool);
     setText(policyEl, policy);
     setHidden(policyEl, !policy);
@@ -1467,6 +1578,20 @@ export function createSlip(initialModel, deps = {}) {
       icon(FILED_ICON[a.state] || ICON.info, 'ic-slip__recordglyph'),
       h('span', {}, filedText(a)),
     );
+    // An approved engagement's outcome, live from the graph (§5.3.7).
+    const outcome =
+      isEngagement(a) && a.state === 'approved' ? model.outcome : null;
+    const outcomeEl = outcome?.text
+      ? h(
+          'p',
+          {
+            class: 'ic-slip__outcome',
+            'data-hidden': outcome.hidden ? 'true' : 'false',
+            'data-tone': outcome.tone || null,
+          },
+          outcome.text,
+        )
+      : null;
     const details = h(
       'button',
       {
@@ -1480,7 +1605,10 @@ export function createSlip(initialModel, deps = {}) {
       detailsOpen = !detailsOpen;
       renderFiled();
     });
-    replaceKids(filedEl, [line, details]);
+    replaceKids(
+      filedEl,
+      outcomeEl ? [line, outcomeEl, details] : [line, details],
+    );
     setHidden(infoEl, !detailsOpen);
     setHidden(classLine, !detailsOpen);
     setHidden(titleEl, !detailsOpen);
@@ -1497,6 +1625,7 @@ export function createSlip(initialModel, deps = {}) {
         model.approval.dry_run,
         model.approval.theaterPreview,
         model.approval.timeScalePreview,
+        model.approval.engagementPreview,
         model.approval.rawClass,
         model.assessment,
         model.fleet,
@@ -1523,7 +1652,7 @@ export function createSlip(initialModel, deps = {}) {
     const pending = a.state === 'pending' || a.state === 'deciding';
     el.setAttribute('data-class', a.klass);
     el.setAttribute('data-validity', model.assessment?.state || 'none');
-    setText(titleEl, a.title);
+    setText(titleEl, slipTitle(a));
     const q = model.queue;
     setText(queueEl, q && q.total > 1 ? `${q.index} of ${q.total}` : '');
     if (pending) {
